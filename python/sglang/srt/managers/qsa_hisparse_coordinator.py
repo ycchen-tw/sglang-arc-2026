@@ -1727,6 +1727,7 @@ class QSAHiSparseSnapshots:
     def __init__(
         self, coord: QSAHiSparseCoordinator, config: QSAHiSparseSnapshotConfig
     ):
+        self.coord = coord
         self.consensus = coord.consensus
         pool = coord.req_to_token_pool
         if not isinstance(pool, HybridReqToTokenPool):
