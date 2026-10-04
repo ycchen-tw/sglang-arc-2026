@@ -172,7 +172,12 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         max_context_len = req_to_token_pool.max_context_len
         max_blocks = -(-max_context_len // layout.block_tokens)
         self.mem_pool_host = QSAPlanarHostPool(
-            device_pool=pool, num_blocks=layout.host_blocks(max_context_len)
+            device_pool=pool,
+            num_blocks=(
+                session_host_blocks(layout)
+                if session_resume
+                else layout.host_blocks(max_context_len)
+            ),
         )
 
         layer_num = pool.layer_num
@@ -909,6 +914,20 @@ def create_qsa_hisparse_coordinator(model_runner) -> QSAHiSparseCoordinator:
             "hisparse_config.qsa_session_resume needs --radix-cache-backend "
             f"qsa_hisparse_session (M1b h09), got {get_memory().radix_cache_backend!r}"
         )
+    snapshot = _snapshot_config(user, num_reqs)
+    if session_resume:
+        # M1b h09: register the session cache backend (build_kv_cache comes next)
+        # and check the host budget of what the records park before pinning it.
+        import sglang.srt.mem_cache.qsa_hisparse_session_cache  # noqa: F401
+
+        if snapshot is None:
+            raise ValueError(
+                "hisparse_config.qsa_session_resume needs qsa_snapshot_interval (h08): "
+                "a session resumes from its latest GDN snapshot"
+            )
+        _check_session_host_budget(
+            pool, user, snapshot, model_runner.req_to_token_pool.mamba_pool
+        )
     return QSAHiSparseCoordinator(
         req_to_token_pool=model_runner.req_to_token_pool,
         token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
@@ -919,7 +938,46 @@ def create_qsa_hisparse_coordinator(model_runner) -> QSAHiSparseCoordinator:
         # one token per request (no spec), so graph rows = its max batch size
         max_decode_rows=int(decode_graph.max_bs or 0),
         session_resume=session_resume,
-        snapshot=_snapshot_config(user, num_reqs),
+        snapshot=snapshot,
+    )
+
+
+def session_host_blocks(layout) -> int:
+    """M1b design §5.1, §11.9: host blocks follow L (L / bt), plus one page of
+    slack per request slot. Every owner holds no more host pages than logical
+    pages, so the host pool never runs out before the logical one."""
+    return layout.logical_tokens // layout.block_tokens + layout.num_slabs * layout.page_blocks
+
+
+def _check_session_host_budget(pool, user: dict, snapshot, mamba_pool) -> None:
+    """Fail at startup unless the host KV pool and the GDN buffers fit next to
+    hisparse_config.host_reserve_gib (RAM for the OS, agents, page cache; R3)."""
+    import psutil
+
+    reserve = user.get("host_reserve_gib")
+    if isinstance(reserve, bool) or not isinstance(reserve, (int, float)) or reserve < 0:
+        raise ValueError(
+            "the QSA HiSparse session cache needs hisparse_config.host_reserve_gib >= 0, "
+            f"got {reserve!r}"
+        )
+    kv = session_host_blocks(pool.layout) * pool.layer_num * pool.plane_spec.record_bytes
+    gdn = snapshot.host_buffers * mamba_pool.host_slot_nbytes()
+    need = kv + gdn + int(reserve * (1 << 30))
+    available = psutil.virtual_memory().available
+    if need > available:
+        raise ValueError(
+            f"QSA HiSparse session cache: host KV pool {kv / (1 << 30):.2f} GiB (L = "
+            f"{pool.layout.logical_tokens} tokens) + GDN buffers {gdn / (1 << 30):.2f} GiB + "
+            f"reserve {reserve} GiB exceed the {available / (1 << 30):.2f} GiB available; "
+            "lower hisparse_config.qsa_logical_tokens or qsa_snapshot_host_buffers"
+        )
+    logger.info(
+        "QSA HiSparse session host budget: KV %.2f GiB + GDN %.2f GiB + reserve %.1f GiB "
+        "of %.2f GiB available",
+        kv / (1 << 30),
+        gdn / (1 << 30),
+        reserve,
+        available / (1 << 30),
     )
 
 

@@ -1393,11 +1393,24 @@ class QSAHiSparsePoolConfigurator(DefaultPoolConfigurator):
         self._device = kvc.device
         from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
-        self._hot_override = parse_hisparse_config().sparse_extra_config.get(
-            "qsa_hot_blocks"
-        )
+        extra = parse_hisparse_config().sparse_extra_config
+        self._hot_override = extra.get("qsa_hot_blocks")
         if self._hot_override is not None and not isinstance(self._hot_override, int):
             raise ValueError(f"qsa_hot_blocks must be an integer, got {self._hot_override!r}")
+        # arc-forge M1b h09 (design §5.1): with the session cache L is a budget
+        # (qsa_logical_tokens, default R * C) and the host-prefix landing zone
+        # (h07, one layer of K/V per token of ceil_page(C + 4)) takes VRAM.
+        self._logical_override = extra.get("qsa_logical_tokens")
+        if self._logical_override is not None and (
+            not isinstance(self._logical_override, int)
+            or isinstance(self._logical_override, bool)
+        ):
+            raise ValueError(
+                f"qsa_logical_tokens must be an integer, got {self._logical_override!r}"
+            )
+        self._session_resume = extra.get("qsa_session_resume", False) is True
+        if self._logical_override is not None and not self._session_resume:
+            raise ValueError("qsa_logical_tokens needs qsa_session_resume (M1b)")
 
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
@@ -1407,8 +1420,13 @@ class QSAHiSparsePoolConfigurator(DefaultPoolConfigurator):
         requested = get_schedule().max_running_requests
         if requested is None:
             raise ValueError("QSA HiSparse needs --max-running-requests")
+        logical = (
+            ceil_align(requested * self._context_len, page_size)
+            if self._logical_override is None
+            else self._logical_override
+        )
         return MemoryPoolConfig(
-            max_total_num_tokens=ceil_align(requested * self._context_len, page_size),
+            max_total_num_tokens=logical,
             hisparse_budget_bytes=max(available_bytes, 0),
         )
 
@@ -1431,6 +1449,14 @@ class QSAHiSparsePoolConfigurator(DefaultPoolConfigurator):
         if chunk is None or chunk <= 0:
             raise ValueError("QSA HiSparse needs chunked prefill (--chunked-prefill-size > 0)")
         page_size = get_schedule().page_size
+        # the zone holds ceil_page(max_context_len) tokens; max_context_len = C + 4
+        # without spec, so C + page is an upper bound
+        landing_zone_bytes = (
+            ceil_align(self._context_len + page_size, page_size)
+            * (self._kv_cell // self._num_layers)
+            if self._session_resume
+            else 0
+        )
         plan = plan_qsa_hisparse(
             budget_bytes=config.hisparse_budget_bytes,
             context_len=self._context_len,
@@ -1446,6 +1472,8 @@ class QSAHiSparsePoolConfigurator(DefaultPoolConfigurator):
             smem_optin=torch.cuda.get_device_properties(
                 self._device
             ).shared_memory_per_block_optin,
+            logical_tokens=self._logical_override,
+            landing_zone_bytes=landing_zone_bytes,
         )
         config.max_total_num_tokens = plan.logical_tokens
         config.hisparse_hot_blocks = plan.hot_blocks
@@ -1454,7 +1482,7 @@ class QSAHiSparsePoolConfigurator(DefaultPoolConfigurator):
         logger.info(
             "QSA HiSparse sizing: budget %.2f GiB, R=%d, C=%d -> logical %d tokens, "
             "prefill area %d tokens, B=%d blocks (%d fit, %.1fx top-k), device rows %d; "
-            "KV %d B/token, index %d B/token",
+            "KV %d B/token, index %d B/token, landing zone %d B",
             config.hisparse_budget_bytes / (1 << 30),
             config.max_running_requests,
             self._context_len,
@@ -1466,6 +1494,7 @@ class QSAHiSparsePoolConfigurator(DefaultPoolConfigurator):
             plan.device_tokens,
             self._kv_cell,
             self._index_cell,
+            landing_zone_bytes,
         )
         return config
 

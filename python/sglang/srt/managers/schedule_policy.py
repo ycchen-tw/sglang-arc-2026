@@ -651,6 +651,20 @@ class PrefillAdder:
                     f"scheduler page_size {page_size} != QSA HiSparse layout page_size "
                     f"{self.token_to_kv_pool_allocator.layout.page_size}"
                 )
+        # arc-forge h09 (M1b R15): before 0030 a prefill batch packs every
+        # context whole per QSA layer. With the session cache, resumed prompts
+        # plus a chunked continuation's context stay within resume_context_cap
+        # (2 C) per batch, except that the first request of a batch always runs;
+        # fresh prompts add only their extend (the chunk budget).
+        self.resume_context_cap = None
+        self.resume_context_tokens = 0
+        if self.is_qsa_hisparse:
+            from sglang.srt.mem_cache.qsa_hisparse_session_cache import (
+                QSAHiSparseSessionCache,
+            )
+
+            if isinstance(tree_cache, QSAHiSparseSessionCache):
+                self.resume_context_cap = tree_cache.resume_context_cap
 
         self.rem_swa_token_offset = 0
 
@@ -1249,6 +1263,17 @@ class PrefillAdder:
             self._charge_prefill_area(prefix_len, cand_extend_input_len)
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
+        if self.is_qsa_hisparse and truncated:
+            # arc-forge h09 (h06 note 2): a logical-limited chunk still ends on a
+            # page, so the next chunk's prefix meets QSA's prefix % ratio == 0.
+            new_len = min(
+                cand_extend_input_len,
+                max(self.page_size, new_len // self.page_size * self.page_size),
+            )
+            truncated = new_len < cand_extend_input_len
+        if self.resume_context_cap is not None:
+            # a continuation's context (prefix + chunk) is packed like a resumed one
+            self.resume_context_tokens += len(req.prefix_indices) + new_len
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
         self.can_run_list.append(req)
         self._update_prefill_budget(
@@ -1472,6 +1497,8 @@ class PrefillAdder:
             )
             if isinstance(admission, AddReqResult):
                 return admission
+            if self._resume_context_rejects(req, admission):
+                return AddReqResult.OTHER
 
             # A rejected candidate must not report prefillable or queue H2D.
             if (self.prefill_delayer_single_pass is not None) and (
@@ -1628,10 +1655,21 @@ class PrefillAdder:
 
         return _PrefillAdmission(prefix_len, extend_len, max_new_tokens, is_chunked)
 
+    def _resume_context_rejects(self, req: Req, admission: _PrefillAdmission) -> bool:
+        if self.resume_context_cap is None or req.hisparse_resume is None:
+            return False
+        context = admission.prefix_len + admission.extend_len
+        return (
+            bool(self.can_run_list)
+            and self.resume_context_tokens + context > self.resume_context_cap
+        )
+
     def _commit_prefill_admission(
         self, req: Req, admission: _PrefillAdmission, mamba_gap_reserve: int
     ) -> None:
         assert len(req.prefix_indices) == admission.prefix_len
+        if self.resume_context_cap is not None and req.hisparse_resume is not None:
+            self.resume_context_tokens += admission.prefix_len + admission.extend_len
         req.set_extend_range(
             admission.prefix_len, admission.prefix_len + admission.extend_len
         )

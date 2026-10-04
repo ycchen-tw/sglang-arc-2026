@@ -157,6 +157,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     MMInputsProcessError,
     OpenSessionReqInput,
+    OpenSessionReqOutput,
     PauseGenerationReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
@@ -1262,6 +1263,17 @@ class Scheduler(
 
     def init_hisparse_coordinator(self) -> None:
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
+        # arc-forge QSA HiSparse h09: the session cache (--radix-cache-backend
+        # qsa_hisparse_session) when that is the tree cache, else None.
+        from sglang.srt.mem_cache.qsa_hisparse_session_cache import (
+            QSAHiSparseSessionCache,
+        )
+
+        self._qsa_session_cache = (
+            self.tree_cache
+            if isinstance(self.tree_cache, QSAHiSparseSessionCache)
+            else None
+        )
         if not self.enable_hisparse:
             return
 
@@ -2111,6 +2123,8 @@ class Scheduler(
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
+        if self._qsa_session_cache is not None:  # arc-forge h09: idle session records
+            self._qsa_session_cache.reap_idle(now)
 
         for recv_req in recv_reqs:
             vmm_errors = None
@@ -3224,6 +3238,10 @@ class Scheduler(
             req.staged_prefetch_plan = None
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
+                if is_retracted and self._qsa_session_cache is not None:
+                    # arc-forge h09: a re-queued retracted owner rejected here
+                    # leaves; its claim on the session goes with it.
+                    self._release_aborted_request(req)
                 return
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
@@ -4182,6 +4200,11 @@ class Scheduler(
                 # Member rows were freed inside retract_decode; the group only
                 # has to leave the live set.
                 self.beam_coordinator.retire_group(req)
+                if self._qsa_session_cache is not None:
+                    # arc-forge h09: release_req ran with to_finish set but not
+                    # finished(), so the cache took it for a retract and kept
+                    # the claim; the request leaves here.
+                    self._release_aborted_request(req)
 
             msg_prefix = (
                 "KV cache pool is full. Retract requests. "
@@ -4809,13 +4832,25 @@ class Scheduler(
             # QSA HiSparse (arc-forge h05, R3): the pool counters above are
             # skipped for hisparse; check pools and tables once per idle period,
             # i.e. once after any forward since the last check.
+            # arc-forge h09: parked session records hold pages, host blocks and
+            # GDN buffers while idle (M1a R3 + parked ledger); a close or reap
+            # while idle changes that ledger, so it is checked again then.
+            idle_key = (
+                self.forward_ct,
+                None
+                if self._qsa_session_cache is None
+                else self._qsa_session_cache.ledger_version,
+            )
             if (
                 self.enable_hisparse
                 and self._qsa_hisparse
-                and self._hisparse_idle_checked_ct != self.forward_ct
+                and self._hisparse_idle_checked_ct != idle_key
             ):
-                self.hisparse_coordinator.check_idle_invariants()
-                self._hisparse_idle_checked_ct = self.forward_ct
+                if self._qsa_session_cache is not None:
+                    self._qsa_session_cache.check_idle_invariants()
+                else:
+                    self.hisparse_coordinator.check_idle_invariants()
+                self._hisparse_idle_checked_ct = idle_key
                 logger.info(
                     "QSA HiSparse idle invariants hold (forward %d)", self.forward_ct
                 )
@@ -5684,7 +5719,17 @@ class Scheduler(
         return ExpertDistributionReqOutput()
 
     def open_session(self, recv_req: OpenSessionReqInput):
-        output = self.session_controller.open(recv_req)
+        if self._qsa_session_cache is not None:
+            # arc-forge h09: the QSA HiSparse session cache serves radix-native
+            # sessions only (session_id in the body); refuse streaming ones.
+            logger.warning(
+                "open_session %s refused: --radix-cache-backend qsa_hisparse_session "
+                "has no streaming sessions",
+                recv_req.session_id,
+            )
+            output = OpenSessionReqOutput(session_id=recv_req.session_id, success=False)
+        else:
+            output = self.session_controller.open(recv_req)
         if output.success and self.enable_session_radix_cache:
             self.tree_cache.open_radix_session(recv_req.session_id)
         if self.ps.pp_rank == 0 and self.ps.tp_rank == 0 and self.ps.attn_cp_rank == 0:

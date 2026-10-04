@@ -158,7 +158,11 @@ def validate_qsa_hisparse(server_args: ServerArgs) -> None:
     from sglang.srt.environ import envs
 
     view = resolved_view(server_args)
+    # arc-forge M1b h09: the session cache is the one prefix reuse QSA HiSparse has.
+    session = view.radix_cache_backend == QSA_HISPARSE_SESSION_BACKEND
     need = {
+        f"no --radix-cache-backend other than {QSA_HISPARSE_SESSION_BACKEND}": view.radix_cache_backend
+        in (None, QSA_HISPARSE_SESSION_BACKEND),
         "--tp-size 1": view.tp_size == 1,
         "--pp-size 1": view.pp_size == 1,
         "--dp-size 1 and no DP attention": view.dp_size == 1
@@ -166,7 +170,9 @@ def validate_qsa_hisparse(server_args: ServerArgs) -> None:
         "no context parallelism (--dcp-size / --attn-cp-size 1)": view.dcp_size == 1
         and view.attn_cp_size == 1,
         "--disable-radix-cache": bool(view.disable_radix_cache),
-        "no --enable-session-radix-cache": not view.enable_session_radix_cache,
+        (
+            "--enable-session-radix-cache with the session cache, not without"
+        ): bool(view.enable_session_radix_cache) == session,
         "no speculative decoding": view.speculative_algorithm is None,
         "no ReplaySSM (--enable-linear-replayssm[-spec])": not view.enable_linear_replayssm
         and not view.enable_linear_replayssm_spec,
@@ -180,6 +186,8 @@ def validate_qsa_hisparse(server_args: ServerArgs) -> None:
         "no page-major KV layout": not view.enable_page_major_kv_layout,
         "no post-capture KV sizing": not envs.SGLANG_ENABLE_POST_CAPTURE_KV_SIZING.get(),
     }
+    if session:
+        need.update(_qsa_session_needs(view))
     missing = [what for what, ok in need.items() if not ok]
     if missing:
         raise ValueError(
@@ -188,6 +196,40 @@ def validate_qsa_hisparse(server_args: ServerArgs) -> None:
     tree = verify_qsa_hisparse_manifest()
     # warning: resolution runs before the server configures log levels
     logger.warning("ARC_HISPARSE_QSA_TREE=%s", tree)
+
+
+QSA_HISPARSE_SESSION_BACKEND = "qsa_hisparse_session"
+
+
+def _qsa_session_needs(view) -> dict:
+    """M1b h09: session cache (design §6 hisparse_hook row). The snapshot interval T
+    must be a multiple of the 64-token page (resume points are page aligned, §4.2),
+    and the host reserve is stated, not guessed (R3)."""
+    import json
+
+    user = json.loads(view.hisparse_config) if view.hisparse_config else {}
+    t = user.get("qsa_snapshot_interval")
+    reserve = user.get("host_reserve_gib")
+    return {
+        # the registry would wrap the cache in a StreamingSession
+        "no --enable-streaming-session": not view.enable_streaming_session,
+        # cache-aware policies call match_prefix outside init_next_round_input
+        "--schedule-policy fcfs / lof / random / priority / routing-key": view.schedule_policy
+        not in ("lpm", "dfs-weight", "hrrn"),
+        "hisparse_config qsa_session_resume true": user.get("qsa_session_resume") is True,
+        "hisparse_config qsa_snapshot_interval a positive multiple of 64": isinstance(t, int)
+        and not isinstance(t, bool)
+        and t > 0
+        and t % 64 == 0,
+        "hisparse_config host_reserve_gib >= 0 (host RAM left to the OS and agents)": isinstance(
+            reserve, (int, float)
+        )
+        and not isinstance(reserve, bool)
+        and reserve >= 0,
+        "no --enable-dynamic-chunking": not view.enable_dynamic_chunking,
+        # it frees output KV below kv_committed_len, where a record's P can sit
+        "no --strip-thinking-cache": not view.strip_thinking_cache,
+    }
 
 
 def verify_qsa_hisparse_manifest() -> str:

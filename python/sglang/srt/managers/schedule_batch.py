@@ -1337,6 +1337,9 @@ class Req(ReqDllmMixin):
 
         # For hisparse
         self.hisparse_staging = False
+        # arc-forge QSA HiSparse h09: the session record match_prefix found for
+        # this request to resume from, until adopt_resumed_prefixes takes it
+        self.hisparse_resume = None
 
         # Snapshot of the scheduler prefill-token counter taken at waiting_queue entry; used by HRRN aging.
         self.arrival_processed_tokens: int = 0
@@ -2684,6 +2687,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
             self
         )
+        # arc-forge QSA HiSparse h09: resumed session prefixes (record logical
+        # slots, now in req_to_token) take their host blocks before the forward.
+        resumed = [r for r in reqs if r.hisparse_resume is not None]
+        if resumed:
+            self.tree_cache.adopt_resumed_prefixes(resumed)
 
         # Set fields
         input_embeds = []

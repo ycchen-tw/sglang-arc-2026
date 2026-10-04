@@ -10,6 +10,11 @@ Worst-case static sizing from the KV budget V left after weights and mamba:
 fixed = L * index + R_pf * kv + L / bt * 8 (mapping) + R * (ceil(C / bt) + page_blocks) * 8
 (host map); layers * 10 is tokens int32 + locs int32 + lru int16 per slot and layer.
 Same numbers as arc-forge work/qsa_hisparse/capacity.py, which checks this file.
+
+M1b h09 (session cache, design §5.1): L is a budget, not R * C: logical_tokens sets
+it (parked sessions and running requests share it; retract is the last resort), and
+the host-prefix landing zone (one layer of K/V for ceil_page(C) tokens) joins fixed.
+The host pool follows L (L / bt + R * page_blocks blocks, the coordinator's check).
 """
 
 from __future__ import annotations
@@ -59,6 +64,8 @@ def plan_qsa_hisparse(
     top_k: int,
     hot_override: Optional[int] = None,
     smem_optin: Optional[int] = None,
+    logical_tokens: Optional[int] = None,
+    landing_zone_bytes: int = 0,
 ) -> QSAHiSparsePlan:
     r, c, kv, bt = max_running_requests, context_len, kv_bytes_per_token, block_tokens
     if min(r, c, chunked_prefill_size, kv, num_layers, top_k) <= 0:
@@ -71,6 +78,15 @@ def plan_qsa_hisparse(
     page_blocks = page_size // bt
     ctx_blocks = -(-c // bt)
     logical = _round_up(r * c, page_size)
+    if logical_tokens is not None:
+        if logical_tokens % page_size or logical_tokens < _round_up(c, page_size):
+            raise ValueError(
+                f"qsa_logical_tokens={logical_tokens} must be a multiple of page_size "
+                f"{page_size} holding at least one context of {c} tokens"
+            )
+        logical = logical_tokens
+    if landing_zone_bytes < 0:
+        raise ValueError(f"landing_zone_bytes must be >= 0, got {landing_zone_bytes}")
     # h06 admits a prompt only when its whole rest fits the prefill area, and raises for a
     # prompt that could never fit: the area must hold the longest prompt, C rounded to pages.
     prefill = _round_up(c + chunked_prefill_size, page_size)
@@ -81,6 +97,7 @@ def plan_qsa_hisparse(
         + prefill * kv
         + logical // bt * 8
         + r * (ctx_blocks + page_blocks) * 8
+        + landing_zone_bytes
     )
     per_slot = r * (bt * kv + num_layers * TABLE_BYTES_PER_SLOT_LAYER)
     if budget_bytes <= fixed:
