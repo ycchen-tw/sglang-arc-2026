@@ -9,13 +9,21 @@ from __future__ import annotations
 import os
 
 
+_checked: set[str] = set()  # export directories already found to exist
+
+
 def drafter_dir() -> str | None:
-    """The DFlash drafter export directory, or None when DFlash is off."""
+    """The DFlash drafter export directory, or None when DFlash is off.
+
+    The scheduler asks every decode cycle (overlap_utils), and the export usually sits on a network volume where one
+    stat costs ~1 ms of host time the GPU waits for: each path is checked once per process."""
     path = os.environ.get("ARC_DFLASH_DRAFTER")
     if not path:
         return None
-    if not os.path.isdir(path):
-        raise RuntimeError(f"ARC_DFLASH_DRAFTER={path!r} is not a drafter export directory")
+    if path not in _checked:
+        if not os.path.isdir(path):
+            raise RuntimeError(f"ARC_DFLASH_DRAFTER={path!r} is not a drafter export directory")
+        _checked.add(path)
     return path
 
 
