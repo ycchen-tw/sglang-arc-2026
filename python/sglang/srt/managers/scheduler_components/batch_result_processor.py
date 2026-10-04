@@ -924,6 +924,11 @@ class SchedulerBatchResultProcessor:
     ):
         if result.copy_done is not None:
             result.copy_done.synchronize()
+        if result.accept_lens is not None and self.hisparse_coordinator is not None:
+            from sglang.srt.managers.qsa_hisparse_coordinator import QSAHiSparseCoordinator
+            if isinstance(self.hisparse_coordinator, QSAHiSparseCoordinator):
+                self.hisparse_coordinator.agree_spec_result(
+                    batch.reqs, result.accept_lens, result.hisparse_track_slots, result.hisparse_verify_overflow)
         if result.hisparse_verify_overflow is not None:
             # arc-forge M5 h16: raise before any of this step's tokens is sent
             from sglang.srt.managers.qsa_hisparse_coordinator import (

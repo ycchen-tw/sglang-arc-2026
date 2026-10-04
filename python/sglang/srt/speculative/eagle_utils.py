@@ -796,7 +796,9 @@ def eagle_sample(
             topk=verify_input.tree_topk,
         )
 
-        if _is_hip:
+        from sglang.srt.mem_cache.qsa_hisparse_distributed import distributed_spec_enabled
+        if _is_hip or distributed_spec_enabled():
+            # h29 also agrees TP2 accepted decisions before ownership commits.
             # On ROCm, the per-rank draft tokens can differ, so ranks accept a
             # different number of drafts, desynchronize the committed seq_lens, and
             # deadlock the next TP collective. Broadcast from rank 0 to ensure

@@ -15,23 +15,24 @@ def distributed_hisparse_enabled() -> bool:
 
 
 def distributed_shape_needs(view) -> dict[str, bool]:
-    """Only the initial four-L4, non-speculative serving shape is admitted."""
+    """Admit h25 fallback or the explicitly gated h29 NEXTN3 shape."""
     user = json.loads(view.hisparse_config) if view.hisparse_config else {}
-    return {
+    spec = distributed_spec_enabled()
+    needs = {
         "ARC_HISPARSE_DISTRIBUTED: --tp-size 4 --ep-size 4":
             view.tp_size == 4 and view.ep_size == 4,
         "ARC_HISPARSE_DISTRIBUTED: --dp-size 2 --enable-dp-attention":
             view.dp_size == 2 and view.enable_dp_attention,
         "ARC_HISPARSE_DISTRIBUTED: one node": view.nnodes == 1,
         "ARC_HISPARSE_DISTRIBUTED: no speculative decoding":
-            view.speculative_algorithm is None,
+            spec or view.speculative_algorithm is None,
         "ARC_HISPARSE_DISTRIBUTED: --mamba-ssm-dtype float16":
             view.mamba_ssm_dtype == "float16",
         "ARC_HISPARSE_DISTRIBUTED: --dtype bfloat16": view.dtype == "bfloat16",
         "ARC_HISPARSE_DISTRIBUTED: no packed GDN state":
             os.environ.get("ARC_GDN_STATE_FMT", "fp16") == "fp16",
         "ARC_HISPARSE_DISTRIBUTED: no ReplaySSM-spec":
-            not view.enable_linear_replayssm_spec,
+            spec or not view.enable_linear_replayssm_spec,
         "ARC_HISPARSE_DISTRIBUTED: even --max-running-requests":
             view.max_running_requests is not None
             and view.max_running_requests > 0 and view.max_running_requests % 2 == 0,
@@ -39,6 +40,9 @@ def distributed_shape_needs(view) -> dict[str, bool]:
             view.radix_cache_backend != "qsa_hisparse_session"
             or user.get("qsa_session_idle_timeout_s") == 0,
     }
+    if spec:
+        needs.update(distributed_spec_shape_needs(view, user))
+    return needs
 
 
 def host_admission_totals(records) -> tuple[int, int, int, int]:
@@ -113,3 +117,90 @@ class AttentionTPConsensus:
 
     def agree(self, operation: str, identity) -> None:
         self.ready_count(operation, identity, 0)
+
+
+def distributed_spec_enabled() -> bool:
+    value = os.environ.get("ARC_HISPARSE_DISTRIBUTED_SPEC", "0")
+    if value not in ("0", "1"):
+        raise ValueError(f"ARC_HISPARSE_DISTRIBUTED_SPEC must be 0 or 1, got {value!r}")
+    if value == "1" and not distributed_hisparse_enabled():
+        raise ValueError("ARC_HISPARSE_DISTRIBUTED_SPEC=1 requires ARC_HISPARSE_DISTRIBUTED=1")
+    return value == "1"
+
+
+def distributed_spec_shape_needs(view, user) -> dict[str, bool]:
+    return {
+        "distributed spec: NEXTN3/EAGLE alias, top1, verify4":
+            view.speculative_algorithm in ("NEXTN", "EAGLE")
+            and view.speculative_num_steps == 3
+            and view.speculative_num_draft_tokens == 4
+            and view.speculative_eagle_topk == 1,
+        "distributed spec: ReplaySSM-spec cache16":
+            view.enable_linear_replayssm_spec and view.linear_replayssm_cache_len == 16,
+        "distributed spec: native FP8 draft, prefill attention, overlap":
+            view.speculative_draft_kv_cache_dtype == "fp8_e4m3"
+            and view.speculative_attention_mode == "prefill" and not view.disable_overlap_schedule,
+        "distributed spec: no adaptive or multilayer spec":
+            not view.speculative_adaptive and not view.enable_multi_layer_eagle,
+        "distributed spec: static ragged verify":
+            os.environ.get("SGLANG_RAGGED_VERIFY_MODE") == "static",
+        "distributed spec: full vocabulary draft path":
+            os.environ.get("SGLANG_QWEN4_MTP_DISTRIBUTED_TOPK1", "0") == "0",
+        "distributed spec: session snapshots and B>=2048":
+            view.radix_cache_backend == "qsa_hisparse_session"
+            and user.get("qsa_session_resume") is True
+            and isinstance(user.get("qsa_snapshot_interval"), int)
+            and not isinstance(user.get("qsa_snapshot_interval"), bool)
+            and user["qsa_snapshot_interval"] > 4
+            and isinstance(user.get("qsa_hot_blocks"), int)
+            and not isinstance(user.get("qsa_hot_blocks"), bool)
+            and user["qsa_hot_blocks"] >= 2048
+            and user.get("qsa_snapshot_staging_slots") == 4
+            and user.get("qsa_spec_small_hot_ok", False) is False,
+    }
+
+
+def new_spec_protocols(namespace, attention_ranks):
+    """Separate Gloo channels avoid overlap-thread/scheduler collective ordering races.
+
+    All four target ranks create the same groups in the same order. The draft
+    creates no coordinator, so these channels are target-only and CPU-only.
+    """
+    import torch.distributed as dist
+
+    if dist.get_world_size() != 4:
+        raise ValueError("h29 protocol channels require four target ranks")
+    own = dist.get_rank()
+    if list(attention_ranks) != ([0, 1] if own < 2 else [2, 3]):
+        raise ValueError("h29 protocol channels require contiguous attention TP2 ranks")
+    result = {}
+    for channel in ("allocation", "forward"):
+        for ranks in ([0, 1], [2, 3]):
+            group = dist.new_group(ranks, backend="gloo")
+            if own in ranks:
+                result[channel] = AttentionTPConsensus(group, 2, namespace + ":spec-" + channel)
+    return result
+
+
+def agree_spec_transition(consensus, operation, identity, *, invalid=False):
+    """Every sibling sees disagreement/invalidity before callers mutate ownership."""
+    consensus.agree(operation, [identity, bool(invalid)])
+    if invalid:
+        raise RuntimeError(f"distributed HiSparse invalid speculative transition at {operation}")
+
+
+def spec_tensor_identity(tensor):
+    """Hash ordered allocator state without putting large lists in the collective."""
+    value = tensor.detach().cpu().contiguous()
+    return [list(value.shape), str(value.dtype), hashlib.sha256(value.numpy().tobytes()).hexdigest()]
+
+
+def spec_staging_busy(consensus, busy):
+    """A staging slot is reusable only when every TP sibling sees it released."""
+    import torch.distributed as dist
+
+    own = busy.detach().cpu().clone()
+    consensus.agree("spec-snapshot-state", [list(own.shape), str(own.dtype)])
+    if consensus.world_size > 1:
+        dist.all_reduce(own, op=dist.ReduceOp.MAX, group=consensus.group)
+    return own.to(busy.device)

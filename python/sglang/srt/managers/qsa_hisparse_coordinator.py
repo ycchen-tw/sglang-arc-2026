@@ -199,13 +199,15 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=tp_group)
         from sglang.srt.mem_cache.qsa_hisparse_distributed import (
-            AttentionTPConsensus, distributed_hisparse_enabled,
+            AttentionTPConsensus, distributed_hisparse_enabled, distributed_spec_enabled, new_spec_protocols,
         )
         self.distributed = distributed_hisparse_enabled()
         if self.tp_world_size != 1 and not self.distributed:
             raise NotImplementedError("QSA HiSparse is TP1 unless ARC_HISPARSE_DISTRIBUTED=1")
-        if self.distributed and (self.tp_world_size != 2 or verify_tokens != 1):
-            raise NotImplementedError("h25 requires attention TP2 and no speculative decoding")
+        self.distributed_spec = distributed_spec_enabled()
+        expected_verify = 4 if self.distributed_spec else 1
+        if self.distributed and (self.tp_world_size != 2 or verify_tokens != expected_verify):
+            raise NotImplementedError("distributed HiSparse requires attention TP2 and gated verify1/4")
         if self.distributed and host_admission is None:
             raise ValueError("distributed HiSparse requires collective host admission before pin")
         if self.distributed:
@@ -214,6 +216,8 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         else:
             self.namespace = "attention-dp-0"
         self.consensus = AttentionTPConsensus(tp_group, self.tp_world_size, self.namespace)
+        self.spec_protocols = new_spec_protocols(self.namespace,
+            torch.distributed.get_process_group_ranks(tp_group)) if self.distributed_spec else {}
 
         max_context_len = req_to_token_pool.max_context_len
         max_blocks = -(-max_context_len // layout.block_tokens)
@@ -764,6 +768,93 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
 
     # ------------------------------------------------------------ speculative serving (M5 h17)
 
+    def agree_spec_allocation(self, reqs, current, following, needed):
+        if not self.distributed_spec:
+            return
+        from sglang.srt.mem_cache.qsa_hisparse_distributed import agree_spec_transition, spec_tensor_identity
+        logical, host = self.token_to_kv_pool_allocator.logical_attn_allocator, self.mem_pool_host
+        rows = [req.kv.req_pool_idx for req in reqs]
+        invalid = not len(reqs) == len(current) == len(following) or needed < 0
+        tails, grow, pages = [], [], 0
+        if not invalid:
+            for row, a, n in zip(rows, current, following):
+                if row is None or not 1 <= row < self.req_to_host_pool.shape[0] or not 0 <= a <= n <= self.req_to_token_pool.req_to_token.shape[1]:
+                    invalid = True
+                    continue
+                tails.append(-1 if a == 0 else int(self.req_to_token_pool.req_to_token[row, a - 1].cpu()))
+                pages += -(-n // logical.page_size) - -(-a // logical.page_size)
+                have = int(self.req_to_host_pool_allocated_len[row])
+                target = -(-self.layout.seq_blocks(n) // self.page_size) * self.page_size
+                grow.append([row, have, target])
+                invalid |= target > self.req_to_host_pool.shape[1]
+            invalid |= needed != sum(n - a for a, n in zip(current, following))
+        host_needed = sum(max(0, target - have) for _, have, target in grow)
+        invalid |= pages * logical.page_size > logical.available_size() or host_needed > host.available_size()
+        identity = [[req.rid for req in reqs], rows, current, following, int(needed), tails, grow,
+            [spec_tensor_identity(logical.free_pages), [spec_tensor_identity(x) for x in logical.staged_pages]],
+            [spec_tensor_identity(host.free_slots), [spec_tensor_identity(x) for x in host.release_slots]],
+            logical.available_size(), host.available_size()]
+        agree_spec_transition(self.spec_protocols["allocation"], "spec-allocate", identity,
+            invalid=invalid)
+
+    def agree_spec_allocation_result(self, locations):
+        if not self.distributed_spec:
+            return
+        from sglang.srt.mem_cache.qsa_hisparse_distributed import agree_spec_transition
+        agree_spec_transition(self.spec_protocols["allocation"], "spec-allocated",
+            None if locations is None else locations.detach().cpu().tolist(), invalid=locations is None)
+
+    def agree_spec_verify_input(self, batch, verify_input):
+        if not self.distributed_spec or batch.forward_mode.is_idle():
+            return
+        from sglang.srt.mem_cache.qsa_hisparse_distributed import agree_spec_transition, spec_tensor_identity
+        # QSA does not read the FULL_MASK prefix/padding; it may be uninitialized.
+        # Agree the active tokens, positions and complete initialized tree tables.
+        identity = [[req.rid for req in batch.reqs], batch.req_pool_indices.detach().cpu().tolist(),
+                    batch.seq_lens.detach().cpu().tolist(),
+                    [spec_tensor_identity(getattr(verify_input, name)) for name in
+                     ("draft_token", "positions", "retrieve_index", "retrieve_next_token", "retrieve_next_sibling")]]
+        agree_spec_transition(self.spec_protocols["forward"], "spec-verify-input", identity,
+            invalid=verify_input.draft_token_num != self.verify_tokens or verify_input.topk != 1)
+
+    def agree_spec_accept(self, batch, predict, accepted, indices):
+        if not self.distributed_spec or batch.forward_mode.is_idle():
+            return
+        rows = batch.req_pool_indices.detach().cpu().tolist()
+        before = batch.seq_lens.detach().cpu().tolist()
+        counts = accepted.detach().cpu().tolist()
+        # Required completed-block destinations are checked before mamba commit
+        # and before backup_after_accept can write any accepted host KV.
+        addresses = []
+        invalid = not len(rows) == len(before) == len(counts)
+        for row, seq, count in zip(rows, before, counts):
+            if not 1 <= row < self.req_to_host_pool.shape[0] or not 1 <= count <= self.verify_tokens:
+                invalid = True
+                continue
+            lo, hi = int(seq) // self.layout.block_tokens, (int(seq) + int(count)) // self.layout.block_tokens
+            invalid |= not 0 <= lo <= hi <= self.req_to_host_pool.shape[1]
+            addresses.append(self.req_to_host_pool[row, lo:hi].detach().cpu().tolist())
+        flag = int(self.verify_overflow.detach().cpu().reshape(-1)[0])
+        identity = [rows, before, counts, indices.detach().cpu().tolist(),
+                    predict.detach().cpu().tolist(), addresses, flag]
+        from sglang.srt.mem_cache.qsa_hisparse_distributed import agree_spec_transition
+        agree_spec_transition(self.spec_protocols["forward"], "spec-accept", identity,
+            invalid=invalid or bool(flag) or any(not 1 <= n <= self.verify_tokens for n in counts)
+                    or any(loc < 0 for row in addresses for loc in row))
+
+    def agree_spec_result(self, reqs, accepted, tracked, overflow):
+        if not self.distributed_spec:
+            return
+        counts = [] if accepted is None else accepted.tolist()
+        claims = None if tracked is None else tracked.tolist()
+        flag = 0 if overflow is None else int(overflow.reshape(-1)[0])
+        identity = [[[req.rid, req.kv.req_pool_idx, req.kv.kv_committed_len] for req in reqs], counts, claims, flag]
+        from sglang.srt.mem_cache.qsa_hisparse_distributed import agree_spec_transition
+        agree_spec_transition(self.consensus, "spec-result", identity,
+            invalid=bool(flag) or len(counts) != len(reqs)
+                    or (bool(reqs) and (claims is None or len(claims) != len(reqs)))
+                    or any(not 1 <= n <= self.verify_tokens for n in counts))
+
     def map_spec_window(
         self,
         req_pool_indices: Sequence[int],
@@ -784,6 +875,8 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         new_allocated = [int(n) for n in new_allocated]
         if not len(rows) == len(allocated) == len(new_allocated):
             raise ValueError("map_spec_window: lists of different lengths")
+        if self.distributed_spec:
+            self.spec_protocols["allocation"].agree("spec-map-window", [rows, allocated, new_allocated])
         self._map_spec_blocks(rows, allocated, new_allocated)
         self._grow_spec_host_rows(rows, new_allocated)
 
@@ -1521,6 +1614,8 @@ def _check_distributed_host_budget(model_runner, pool, user, snapshot, session_r
         attn_tp_leader_global_rank=ranks[0], attn_dp_rank=dp_rank,
         namespace=f"attention-dp-{dp_rank}", max_running_requests_per_dp=layout.num_slabs,
         logical_tokens_per_dp=layout.logical_tokens, hot_blocks=layout.hot_blocks,
+        verify_tokens=verify_tokens,
+        spec_dummy_host_bytes_per_rank=(layout.page_blocks * pool.layer_num * pool.plane_spec.record_bytes if verify_tokens > 1 else 0),
         kv_host_bytes_per_rank=kv, snapshot_host_bytes_per_rank=gdn,
         kv_host_bytes_all_ranks=total[0], snapshot_host_bytes_all_ranks=total[1],
         host_reserve_bytes=total[2], host_available_bytes_before_pin=total[3],
@@ -1852,11 +1947,21 @@ class QSAHiSparseSnapshots:
         pre = seq_lens.to(torch.int64)
         cross = pre // t != (pre + accept_lens.to(torch.int64)) // t
         n = len(self.staging_slots)
-        free_rank = torch.cumsum((self.staging_busy[:n] == 0).to(torch.int64), 0)
+        busy = self.staging_busy
+        if self.coord.distributed_spec:
+            from sglang.srt.mem_cache.qsa_hisparse_distributed import spec_staging_busy
+            busy = spec_staging_busy(self.coord.spec_protocols["forward"], busy)
+        free_rank = torch.cumsum((busy[:n] == 0).to(torch.int64), 0)
         k = torch.cumsum(cross.to(torch.int64), 0)  # 1-based rank among crossing rows
         ok = cross & (k <= free_rank[-1])
         idx = torch.searchsorted(free_rank, k)  # the k-th free entry
         idx = torch.where(ok, idx, torch.full_like(idx, n))
+        if self.coord.distributed_spec:
+            self.coord.spec_protocols["forward"].agree("spec-snapshot-claim", [
+                pre.detach().cpu().tolist(), accept_lens.detach().cpu().tolist(),
+                busy.detach().cpu().tolist(), idx.detach().cpu().tolist(),
+                self.staging_ids[idx].detach().cpu().tolist(),
+            ])
         self.staging_busy.index_put_((idx,), torch.ones_like(idx, dtype=torch.int32))
         return self.staging_ids[idx]
 

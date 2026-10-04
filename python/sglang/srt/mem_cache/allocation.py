@@ -760,6 +760,8 @@ def alloc_for_spec_decode(
     # arc-forge M5 h17: QSA HiSparse allocates logical slots only and maps the new
     # blocks to their slab ring slots (design §2.1); None for every other pool.
     hisparse = _qsa_hisparse_spec_coordinator(tree_cache, batch)
+    if hisparse is not None:
+        hisparse.agree_spec_allocation(reqs, cur_kv_lens_cpu.tolist(), nxt_kv_lens_cpu.tolist(), num_needed_tokens)
     if num_needed_tokens > 0:
         if hisparse is not None:
             last_loc = get_last_loc(
@@ -773,6 +775,7 @@ def alloc_for_spec_decode(
                 last_loc,
                 num_needed_tokens,
             )
+            hisparse.agree_spec_allocation_result(out_cache_loc)
             if out_cache_loc is None:
                 raise RuntimeError(
                     f"QSA HiSparse speculative decode: the logical pool has no room for "

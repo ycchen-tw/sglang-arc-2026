@@ -494,6 +494,11 @@ def run_eagle_verify(
     """
     fwd_stream = torch.get_device_module(device).current_stream()
     verify_input: EagleVerifyInput = batch.spec_info
+    coord = target_worker.model_runner.hisparse_coordinator
+    if coord is not None:
+        from sglang.srt.managers.qsa_hisparse_coordinator import QSAHiSparseCoordinator
+        if isinstance(coord, QSAHiSparseCoordinator):
+            coord.agree_spec_verify_input(batch, verify_input)
     record_stream_for_v2_verify(batch, verify_input, fwd_stream)
 
     bs = len(batch.seq_lens)
@@ -602,6 +607,11 @@ def run_eagle_verify(
         grammar_mask,
         uno_target_max_top_k=uno_target_max_top_k,
     )
+    coord = target_worker.model_runner.hisparse_coordinator
+    if coord is not None:
+        from sglang.srt.managers.qsa_hisparse_coordinator import QSAHiSparseCoordinator
+        if isinstance(coord, QSAHiSparseCoordinator):
+            coord.agree_spec_accept(batch, predict, accept_lens, accept_index)
     new_seq_lens = batch.seq_lens + accept_lens
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),

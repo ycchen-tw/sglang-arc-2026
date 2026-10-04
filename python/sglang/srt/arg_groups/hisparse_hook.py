@@ -83,6 +83,10 @@ def validate_hisparse(server_args: ServerArgs) -> None:
     """Validate --enable-hisparse constraints (model class, radix cache, DSA backend)."""
 
     cfg = resolving_view(server_args)
+    from sglang.srt.mem_cache.qsa_hisparse_distributed import distributed_spec_enabled
+    spec = distributed_spec_enabled()
+    if spec and not cfg.enable_hisparse:
+        raise ValueError("ARC_HISPARSE_DISTRIBUTED_SPEC=1 requires --enable-hisparse")
     if not cfg.enable_hisparse:
         return
 
@@ -97,6 +101,8 @@ def validate_hisparse(server_args: ServerArgs) -> None:
     if is_qwen_qsa(hf_config):
         validate_qsa_hisparse(server_args)
         return
+    if spec:
+        raise ValueError("ARC_HISPARSE_DISTRIBUTED_SPEC=1 requires a Qwen QSA model")
     is_v4_hisparse = is_deepseek_v4(hf_config)
     is_hip = get_platform().is_hip
     assert is_deepseek_dsa(hf_config) or is_v4_hisparse, (
