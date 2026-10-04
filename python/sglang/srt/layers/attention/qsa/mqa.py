@@ -11,6 +11,31 @@ from sglang.srt.environ import envs
 _GROUPED_QSA_MIN_ROWS_SCALE = {2: 2.0, 4: 1.0}
 
 
+def _qsa_verify_group_size(queries_per_request: Optional[int]) -> Optional[int]:
+    """Widest supported sub-group that evenly divides the verify window.
+
+    The grouped kernel's contract is narrower than "the whole verify window":
+    it needs ``queries_per_request`` consecutive rows of one request with
+    monotonic context lengths. A width-8 window (MTP 8 steps) splits into two
+    sub-groups of four that both satisfy it, so a width with no table entry of
+    its own can still use the widest divisor that has one. Without this, width
+    8 misses the table, falls back to the per-row kernel, and re-reads each
+    request's whole compressed-K tile once per verify row -- measured at 329 us
+    against 233 us for groups of four at B=110, ctx=32,100 on B200.
+
+    Width 3 keeps returning None: its N=24 three-warp lowering measured slower
+    than baseline, and 3 has no supported divisor above 1.
+    """
+    if not queries_per_request or queries_per_request < 2:
+        return None
+    if queries_per_request in _GROUPED_QSA_MIN_ROWS_SCALE:
+        return queries_per_request
+    for group in sorted(_GROUPED_QSA_MIN_ROWS_SCALE, reverse=True):
+        if queries_per_request % group == 0:
+            return group
+    return None
+
+
 def _grouped_qsa_effective_min_rows(
     queries_per_request: Optional[int], configured_min_rows: int
 ) -> Optional[int]:
@@ -520,13 +545,17 @@ def tilelang_qsa_mqa_decode(
     if groups_per_cta == 0:
         rows = q.shape[0]
         groups_per_cta = 1 if rows <= 8 else 2 if rows <= 24 else 4
+    grouped_size = _qsa_verify_group_size(verify_queries_per_request)
     grouped_min_rows = _grouped_qsa_effective_min_rows(
-        verify_queries_per_request, envs.SGLANG_QSA_GROUPED_VERIFY_MIN_ROWS.get()
+        grouped_size, envs.SGLANG_QSA_GROUPED_VERIFY_MIN_ROWS.get()
     )
     use_grouped_verify = (
         envs.SGLANG_QSA_GROUPED_VERIFY.get()
         and grouped_min_rows is not None
         and q.shape[0] >= grouped_min_rows
+        # The producer's row layout is still checked against the *window*
+        # width; the sub-group only subdivides a window that is already
+        # request-major.
         and q.shape[0] % verify_queries_per_request == 0
     )
     kernel_args = (
@@ -541,7 +570,7 @@ def tilelang_qsa_mqa_decode(
             heads=kernel_heads,
             head_dim=head_dim,
             page_size=page_size,
-            queries_per_request=verify_queries_per_request,
+            queries_per_request=grouped_size,
             groups_per_cta=groups_per_cta,
         )(q_kernel.contiguous().view(-1, head_dim), *kernel_args)
     else:
