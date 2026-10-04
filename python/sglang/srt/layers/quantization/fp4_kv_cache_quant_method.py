@@ -33,6 +33,7 @@ Why do we need attention access rules?
   combination is unsupported.
 """
 
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -523,6 +524,12 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
             else None
         )
 
+        if os.environ.get("ARC_FULL_NVFP4") == "1":
+            assert dq_k_buffer is None and dq_v_buffer is None
+            packed_bytes = sum(t.numel() * t.element_size() for group in
+                               (k_buffer, v_buffer, k_scale_buffer, v_scale_buffer) for t in group)
+            print(f"ARC_NVFP4_POOL slots={m} layers={layer_num} heads={n} dim={k} "
+                  f"packed_bytes={packed_bytes} dequant_bytes=0", flush=True)
         return {
             "k_buffer": k_buffer,
             "v_buffer": v_buffer,
@@ -837,7 +844,9 @@ KV_CACHE_ATTENTION_ACCESS_REGISTRY: dict[str, tuple[KVCacheAttentionAccess, ...]
         _plain(_DECODE, _CPU_FP8_BACKENDS),
     ),
     NVFP4KVCacheMethod.name: (
-        _dq_workspace(_PREFILL, _NVFP4_PREFILL_BACKENDS, _NVFP4_SCALE, _FP8_E4M3),
+        (_native_fp4(_PREFILL, _NVFP4_PREFILL_BACKENDS, _NVFP4_SCALE, torch.uint8)
+         if os.environ.get("ARC_FULL_NVFP4") == "1"
+         else _dq_workspace(_PREFILL, _NVFP4_PREFILL_BACKENDS, _NVFP4_SCALE, _FP8_E4M3)),
         _native_fp4(_DECODE, _NVFP4_DECODE_BACKENDS, _NVFP4_SCALE, _TORCH_FP4),
     ),
     FP4MXBlock16KVCacheMethod.name: (

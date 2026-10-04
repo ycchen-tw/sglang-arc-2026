@@ -349,6 +349,12 @@ class FlashInferAttnBackend(AttentionBackend):
             access is not None and access.scale_recipe == "nvfp4"
             for access in (self.prefill_kv_access, self.decode_kv_access)
         )
+        self.arc_native_nvfp4 = (
+            os.environ.get("ARC_FULL_NVFP4") == "1" and self.is_nvfp4_kvcache
+        )
+        if self.arc_native_nvfp4:
+            assert not self.prefill_uses_dequant_workspace
+            logger.info("ARC_FULL_NVFP4_PREFILL=fa2_packed; no full dequant workspace")
         self.dq_page_table = None
         self.dq_paged_kernel_lens = None
         self.cpu_req_pool_indices = None
@@ -359,7 +365,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.prefill_uses_dequant_workspace
                 or self.decode_uses_dequant_workspace
             )
-            else model_runner.kv_cache_dtype
+            else (torch.uint8 if self.arc_native_nvfp4 else model_runner.kv_cache_dtype)
         )
 
         # Parse constants
@@ -1315,7 +1321,14 @@ class FlashInferAttnBackend(AttentionBackend):
 
         # We perform dequant for chunk prefill/cache reuse.
         pool = self.token_to_kv_pool
-        if self.prefill_uses_dequant_workspace:
+        arc_kv_kwargs = {}
+        if self.arc_native_nvfp4:
+            if self.forward_metadata.use_ragged or layer.is_cross_attention:
+                raise RuntimeError("Native NVFP4 requires paged self-attention prefill")
+            kp, vp, ks, vs = pool.get_raw_kv_buffer(layer.layer_id)
+            kv_cache = (kp, vp)
+            arc_kv_kwargs["kv_cache_sf"] = (ks, vs)
+        elif self.prefill_uses_dequant_workspace:
             kv_cache = pool.get_flashinfer_dequant_workspace_kv_buffer(
                 layer,
                 self.req_to_token_pool.req_to_token,
@@ -1368,8 +1381,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 ),
                 logits_soft_cap=logits_soft_cap,
                 # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-                k_scale=layer.k_scale_float,
-                v_scale=layer.v_scale_float,
+                k_scale=(self.kv_cache_quant_method.get_bmm_scales(layer.layer_id)[0]
+                         if self.arc_native_nvfp4 else layer.k_scale_float),
+                v_scale=(self.kv_cache_quant_method.get_bmm_scales(layer.layer_id)[1]
+                         if self.arc_native_nvfp4 else layer.v_scale_float),
+                **arc_kv_kwargs,
             )
         else:
             # If `k`/`v` are not explicitly provided, fall back to the KV cache stored in

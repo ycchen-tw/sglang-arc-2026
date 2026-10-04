@@ -14,6 +14,7 @@ Two entry points, same core computation:
 from __future__ import annotations
 
 import logging
+import os
 from bisect import bisect_right
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
@@ -440,6 +441,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         if num_layers == 0:
             return 0
         qsa_profile = parse_qsa_profile(hf_config)
+        if os.environ.get("ARC_FULL_NVFP4") == "1":
+            qsa_profile = None  # No idle QSA cache or its token budget in full mode.
         if qsa_profile is None:
             return 0
         return QSATokenToKVPool.qsa_bytes_per_token(

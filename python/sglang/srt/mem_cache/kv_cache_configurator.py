@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import logging
 import math
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -1890,6 +1891,8 @@ class KVCacheConfigurator:
         )
 
         qsa_profile = parse_qsa_profile(self.model_config.hf_config)
+        if os.environ.get("ARC_FULL_NVFP4") == "1":
+            qsa_profile = None  # No idle QSA cache or its token budget in full mode.
         if qsa_profile is None:
             pool_class = HybridLinearKVPool
             extra_args["use_mla"] = self.use_mla_backend
