@@ -340,6 +340,16 @@ class QwenSparseAttnBackend(AttentionBackend):
         self.runner = runner
         self.token_to_kv_pool = getattr(runner, "token_to_kv_pool", None)
         self.device = getattr(runner, "device", None)
+        self.hisparse_coordinator = (
+            None if runner is None else runner.hisparse_coordinator
+        )
+        # h28: the h25 direct route is valid only for the admitted distributed
+        # coordinator on Ada. Resolve it before the legacy Blackwell/XQA guard.
+        self._hisparse_sm89 = (
+            self.hisparse_coordinator is not None
+            and self.hisparse_coordinator.distributed
+            and torch.cuda.get_device_capability(self.device) == (8, 9)
+        )
         self.arc_nvfp4 = _pool_kv_quant_name(self.token_to_kv_pool) == "nvfp4"
         self.arc_nvfp4_sm100 = self.arc_nvfp4 and is_sm100_supported()
         if self.arc_nvfp4:
@@ -348,7 +358,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                     "NVFP4 KV pool under QSA requires ARC_QSA_NVFP4=1; the pool "
                     "budget and prefill access were configured without it"
                 )
-            if _resolve_trtllm_sparse_decode() is None:
+            if not self._hisparse_sm89 and _resolve_trtllm_sparse_decode() is None:
                 raise RuntimeError(
                     "NVFP4 QSA decode needs the trtllm-gen/XQA paged decode "
                     "kernel and _resolve_trtllm_sparse_decode() returned None "
@@ -363,7 +373,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             logger.info(
                 "ARC_QSA_NVFP4=1: packed FP4 gather + %s kv_cache_sf decode; "
                 "prefix prefill uses the fused NVFP4 expansion to %s",
-                "sm100 trtllm-gen" if self.arc_nvfp4_sm100 else "XQA",
+                "sm89 HiSparse direct" if self._hisparse_sm89 else ("sm100 trtllm-gen" if self.arc_nvfp4_sm100 else "XQA"),
                 _ARC_QSA_NVFP4_PREFILL,
             )
         model_config = getattr(runner, "model_config", None)
@@ -409,9 +419,6 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._extend_plan_state: Optional[_QSAExtendPlan] = None  # h15
         # QSA HiSparse offload (arc-forge h04). ModelRunner builds the
         # coordinator in alloc_memory_pool, before the attention backends.
-        self.hisparse_coordinator = (
-            None if runner is None else runner.hisparse_coordinator
-        )
         if self.hisparse_coordinator is not None:
             self._validate_hisparse()
 
