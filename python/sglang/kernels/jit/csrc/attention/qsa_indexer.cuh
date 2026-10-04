@@ -262,7 +262,8 @@ struct QsaIndexKCompressParams {
   const int32_t* axis_map;              // [rotary_dim / 2]
   const void* weight;                   // [kHeadDim]
   const int32_t* write_locs;            // [groups]
-  void* compressed_k_buffer;            // [compressed_slots, kHeadDim]
+  void* compressed_k_buffer;            // [compressed_slots, kHeadDim] (T, or fp8 e4m3 for kFp8Out)
+  float* compressed_k_scale;            // [compressed_slots] fp32 power-of-two scales (kFp8Out only)
   int32_t compress_ratio;
   int32_t rotary_dim;
   int32_t num_groups;
@@ -273,8 +274,13 @@ struct QsaIndexKCompressParams {
  * \brief Per-group compressed-K prep: fp32 mean over the group, gemma norm,
  * MRoPE at the group-start position, store into the compressed cache.
  * One warp per group.
+ *
+ * kFp8Out (arc-forge h21, ARC_QSA_INDEX_FP8): the rotated row (rounded to T, i.e. exactly the key the T cache
+ * would hold) is quantized to e4m3 with one power-of-two scale, bit-identical to quantize_qsa_index_k in
+ * qsa_kv_pool.py: scale = 2^k, the smallest with amax / scale <= 448 (amax = m * 2^e, m in [0.5, 1):
+ * k = e - 9 if m <= 0.875 else e - 8; scale 1 for an all-zero row), k8 = e4m3_rn(x / scale).
  */
-template <typename T, int kHeadDim, bool kIsNeox, bool kUsePDL>
+template <typename T, int kHeadDim, bool kIsNeox, bool kUsePDL, bool kFp8Out = false>
 __global__
 __launch_bounds__(128) void qsa_index_k_compress_kernel(const QsaIndexKCompressParams __grid_constant__ params) {
   using namespace device;
@@ -287,6 +293,7 @@ __launch_bounds__(128) void qsa_index_k_compress_kernel(const QsaIndexKCompressP
     return;
   }
   __shared__ T smem_rows[4][kHeadDim];
+  __shared__ alignas(16) T smem_out[kFp8Out ? 4 : 1][kFp8Out ? kHeadDim : 1];  // the rotated row (kFp8Out)
 
   device::PDLWaitPrimary<kUsePDL>();
 
@@ -345,9 +352,37 @@ __launch_bounds__(128) void qsa_index_k_compress_kernel(const QsaIndexKCompressP
     pos[a] = params.rope_position_buffer[static_cast<int64_t>(loc0) * 3 + a];
   }
 
-  T* out_row = static_cast<T*>(params.compressed_k_buffer) + static_cast<int64_t>(params.write_locs[group]) * kHeadDim;
-  qsa_mrope_apply<T, kHeadDim, kIsNeox>(
-      smem_rows[warp], out_row, params.cos_sin_cache, params.axis_map, pos, params.rotary_dim);
+  const int64_t write_loc = static_cast<int64_t>(params.write_locs[group]);
+  if constexpr (!kFp8Out) {
+    T* out_row = static_cast<T*>(params.compressed_k_buffer) + write_loc * kHeadDim;
+    qsa_mrope_apply<T, kHeadDim, kIsNeox>(
+        smem_rows[warp], out_row, params.cos_sin_cache, params.axis_map, pos, params.rotary_dim);
+  } else {
+    qsa_mrope_apply<T, kHeadDim, kIsNeox>(
+        smem_rows[warp], smem_out[warp], params.cos_sin_cache, params.axis_map, pos, params.rotary_dim);
+    __syncwarp();
+    float v[kPerLane];
+    float amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kPerLane; ++i) {
+      v[i] = static_cast<float>(smem_out[warp][lane * kPerLane + i]);
+      amax = fmaxf(amax, fabsf(v[i]));
+    }
+    amax = warp::reduce_max(amax);
+    int e = 0;
+    const float m = frexpf(amax, &e);
+    const int k = (m <= 0.875f) ? e - 9 : e - 8;
+    const bool nonzero = amax > 0.0f;
+    const float inv_scale = nonzero ? ldexpf(1.0f, -k) : 1.0f;  // exact: a power of two
+    fp8_e4m3_t* out8 = static_cast<fp8_e4m3_t*>(params.compressed_k_buffer) + write_loc * kHeadDim;
+#pragma unroll
+    for (int i = 0; i < kPerLane; ++i) {
+      out8[lane * kPerLane + i] = fp8_e4m3_t(v[i] * inv_scale);  // round to nearest even, satfinite
+    }
+    if (lane == 0) {
+      params.compressed_k_scale[write_loc] = nonzero ? ldexpf(1.0f, k) : 1.0f;
+    }
+  }
 
   device::PDLTriggerSecondary<kUsePDL>();
 }
@@ -474,6 +509,7 @@ void qsa_index_k_compress(
       .weight = weight.data_ptr(),
       .write_locs = static_cast<const int32_t*>(write_locs.data_ptr()),
       .compressed_k_buffer = compressed_k_buffer.data_ptr(),
+      .compressed_k_scale = nullptr,
       .compress_ratio = static_cast<int32_t>(compress_ratio),
       .rotary_dim = static_cast<int32_t>(rotary_dim),
       .num_groups = static_cast<int32_t>(num_groups),
@@ -481,6 +517,68 @@ void qsa_index_k_compress(
   };
   LaunchKernel(static_cast<uint32_t>(div_ceil(num_groups, 4)), 128, device.unwrap())
       .enable_pdl(kUsePDL)(qsa_index_k_compress_kernel<T, kHeadDim, kIsNeox, kUsePDL>, params);
+}
+
+/**
+ * \brief arc-forge h21: `qsa_index_k_compress` into the FP8 cache (e4m3 keys + fp32 power-of-two scales).
+ */
+template <typename T, int kHeadDim, bool kIsNeox, bool kUsePDL>
+void qsa_index_k_compress_fp8(
+    tvm::ffi::TensorView key_state_buffer,
+    tvm::ffi::TensorView group_locs,
+    tvm::ffi::TensorView rope_position_buffer,
+    tvm::ffi::TensorView cos_sin_cache,
+    tvm::ffi::TensorView axis_map,
+    tvm::ffi::TensorView weight,
+    tvm::ffi::TensorView write_locs,
+    tvm::ffi::TensorView compressed_k8,
+    tvm::ffi::TensorView compressed_k_scale,
+    int64_t compress_ratio,
+    int64_t rotary_dim,
+    float eps) {
+  using namespace host;
+  auto device = SymbolicDevice{};
+  device.set_options<kDLCUDA>();
+  constexpr int64_t D = kHeadDim;
+
+  auto slots = SymbolicSize{"state_slots"};
+  TensorMatcher({slots, D}).with_dtype<T>().with_device(device).verify(key_state_buffer);
+  auto groups = SymbolicSize{"groups"};
+  TensorMatcher({groups, compress_ratio}).with_dtype<int32_t>().with_device(device).verify(group_locs);
+  TensorMatcher({slots, 3}).with_dtype<int64_t>().with_device(device).verify(rope_position_buffer);
+  auto cache_rows = SymbolicSize{"cos_sin_cache_rows"};
+  TensorMatcher({cache_rows, rotary_dim}).with_dtype<fp32_t>().with_device(device).verify(cos_sin_cache);
+  TensorMatcher({rotary_dim / 2}).with_dtype<int32_t>().with_device(device).verify(axis_map);
+  TensorMatcher({D}).with_dtype<T>().with_device(device).verify(weight);
+  TensorMatcher({groups}).with_dtype<int32_t>().with_device(device).verify(write_locs);
+  auto compressed_slots = SymbolicSize{"compressed_slots"};
+  TensorMatcher({compressed_slots, D}).with_dtype<fp8_e4m3_t>().with_device(device).verify(compressed_k8);
+  TensorMatcher({compressed_slots}).with_dtype<fp32_t>().with_device(device).verify(compressed_k_scale);
+
+  const int64_t num_groups = groups.unwrap();
+  CHECK_HOST(num_groups > 0) << "qsa_index_k_compress_fp8: no groups";
+  CHECK_HOST(compress_ratio > 0 && compress_ratio <= 16)
+      << "qsa_index_k_compress_fp8: invalid compress_ratio " << compress_ratio;
+  CHECK_HOST(rotary_dim > 0 && rotary_dim % 2 == 0 && rotary_dim <= D)
+      << "qsa_index_k_compress_fp8: invalid rotary_dim " << rotary_dim;
+
+  const auto params = QsaIndexKCompressParams{
+      .key_state_buffer = key_state_buffer.data_ptr(),
+      .group_locs = static_cast<const int32_t*>(group_locs.data_ptr()),
+      .rope_position_buffer = static_cast<const int64_t*>(rope_position_buffer.data_ptr()),
+      .cos_sin_cache = static_cast<const float*>(cos_sin_cache.data_ptr()),
+      .axis_map = static_cast<const int32_t*>(axis_map.data_ptr()),
+      .weight = weight.data_ptr(),
+      .write_locs = static_cast<const int32_t*>(write_locs.data_ptr()),
+      .compressed_k_buffer = compressed_k8.data_ptr(),
+      .compressed_k_scale = static_cast<float*>(compressed_k_scale.data_ptr()),
+      .compress_ratio = static_cast<int32_t>(compress_ratio),
+      .rotary_dim = static_cast<int32_t>(rotary_dim),
+      .num_groups = static_cast<int32_t>(num_groups),
+      .eps = eps,
+  };
+  LaunchKernel(static_cast<uint32_t>(div_ceil(num_groups, 4)), 128, device.unwrap())
+      .enable_pdl(kUsePDL)(qsa_index_k_compress_kernel<T, kHeadDim, kIsNeox, kUsePDL, true>, params);
 }
 
 }  // namespace sglang

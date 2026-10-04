@@ -165,13 +165,23 @@ def torch_qsa_mqa_decode(
     context_lens: torch.Tensor,
     max_model_len: int,
     score_scale: Optional[float] = None,
+    k_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Torch reference for variable-length paged decode MQA."""
+    """Torch reference for variable-length paged decode MQA; k_scale [pages, page_size]
+    (arc-forge h21) dequantizes an FP8 k_cache and quantizes q the same way."""
 
     _validate_decode_inputs(q, k_cache, page_table, context_lens)
     batch = q.shape[0]
     page_size = k_cache.shape[1]
     total = page_table.shape[1] * page_size
+    if k_scale is not None:
+        from sglang.srt.mem_cache.qsa_kv_pool import (
+            dequantize_qsa_index_k,
+            quantize_qsa_index_k,
+        )
+
+        k_cache = dequantize_qsa_index_k(k_cache[:, :, 0], k_scale).unsqueeze(2)
+        q = dequantize_qsa_index_k(*quantize_qsa_index_k(q))
     gathered = k_cache[page_table.long().clamp_min(0).reshape(-1), :, 0].reshape(
         batch, total, q.shape[-1]
     )
@@ -472,6 +482,212 @@ if HAS_TILELANG:
         return kernel
 
 
+    # arc-forge h21 (ARC_QSA_INDEX_FP8): the same two paged kernels, FP8 x FP8. The index Q is
+    # quantized per (row, head) with the keys' power-of-two rule (quantize_qsa_index_q_fp8); the
+    # e4m3 K pages and the e4m3 Q tile feed the MMA directly (fp32 accumulate, no widening pass),
+    # the head's Q scale multiplies its relu'd score before the head sum and the key's scale the
+    # summed score at the store (relu(s * x) = s * relu(x) for s > 0). With power-of-two scales the
+    # logits are the BF16 kernels' over the dequantized Q and K up to the MMA's accumulation.
+    @tilelang.jit(
+        pass_configs={
+            tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+            tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        }
+    )
+    def _tilelang_qsa_mqa_decode_fp8_kernel(
+        heads: int,
+        head_dim: int,
+        page_size: int = 64,
+        groups_per_cta: int = 1,
+        num_stages: int = 3,
+        threads: int = 128,
+    ):
+        GROUP = 64
+        assert GROUP % page_size == 0, page_size
+        sub_pages = GROUP // page_size
+        batch = T.dynamic("batch")
+        pages = T.dynamic("pages")
+        max_pages = T.dynamic("max_pages")
+        max_model_len = T.dynamic("max_model_len")
+
+        @T.prim_func
+        def kernel(
+            Q: T.Tensor([batch, 1, heads, head_dim], T.float8_e4m3fn),  # type: ignore
+            QScale: T.Tensor([batch, heads], T.float32),  # type: ignore
+            KCache: T.Tensor([pages, page_size, 1, head_dim], T.float8_e4m3fn),  # type: ignore
+            KScale: T.Tensor([pages, page_size], T.float32),  # type: ignore
+            PageTable: T.Tensor([batch, max_pages], T.int32),  # type: ignore
+            ContextLens: T.Tensor([batch], T.int32),  # type: ignore
+            Logits: T.Tensor([batch, max_model_len], T.float32),  # type: ignore
+            Scale: T.float32,
+        ):
+            with T.Kernel(
+                batch,
+                T.ceildiv(T.ceildiv(max_pages, sub_pages), groups_per_cta),
+                threads=threads,
+            ) as (bx, group_block):
+                q_shared = T.alloc_shared([heads, head_dim], T.float8_e4m3fn)
+                k_shared = T.alloc_shared([GROUP, head_dim], T.float8_e4m3fn)
+                q_scale = T.alloc_fragment([heads], T.float32)
+                scores = T.alloc_fragment([GROUP, heads], T.float32)
+                reduced = T.alloc_fragment([GROUP], T.float32)
+                T.copy(Q[bx, 0, :, :], q_shared)
+                T.copy(QScale[bx, :], q_scale)
+                context_len = ContextLens[bx]
+
+                for gi in T.Pipelined(groups_per_cta, num_stages=num_stages):
+                    group = group_block * groups_per_cta + gi
+                    if group * GROUP < context_len:
+                        for sp in range(sub_pages):
+                            if (group * sub_pages + sp) * page_size < context_len:
+                                T.copy(
+                                    KCache[
+                                        PageTable[bx, group * sub_pages + sp],
+                                        :,
+                                        0,
+                                        :,
+                                    ],
+                                    k_shared[sp * page_size : (sp + 1) * page_size, :],
+                                )
+                        T.gemm(
+                            k_shared,
+                            q_shared,
+                            scores,
+                            transpose_B=True,
+                            clear_accum=True,
+                            policy=T.GemmWarpPolicy.FullCol,
+                        )
+                        for token, head in T.Parallel(GROUP, heads):
+                            scores[token, head] = T.max(scores[token, head], 0.0) * q_scale[head]
+                        T.reduce_sum(scores, reduced, dim=1, clear=True)
+                        for token in T.Parallel(GROUP):
+                            position = group * GROUP + token
+                            if position < context_len:
+                                Logits[bx, position] = (
+                                    reduced[token]
+                                    * KScale[
+                                        PageTable[bx, position // page_size],
+                                        position % page_size,
+                                    ]
+                                    / Scale
+                                )
+
+        return kernel
+
+    @tilelang.jit(
+        pass_configs={
+            tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+            tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+            tilelang.PassConfigKey.TL_DISABLE_DATA_RACE_CHECK: True,
+        }
+    )
+    def _tilelang_qsa_mqa_grouped_verify_fp8_kernel(
+        heads: int,
+        head_dim: int,
+        page_size: int = 64,
+        queries_per_request: int = 4,
+        groups_per_cta: int = 4,
+        num_stages: int = 3,
+        threads: int = 128,
+        min_blocks_per_sm: int = 0,
+    ):
+        GROUP = 64
+        assert GROUP % page_size == 0, page_size
+        sub_pages = GROUP // page_size
+        batch = T.dynamic("batch")
+        pages = T.dynamic("pages")
+        max_pages = T.dynamic("max_pages")
+        max_model_len = T.dynamic("max_model_len")
+
+        @T.prim_func
+        def kernel(
+            Q: T.Tensor([batch * heads, head_dim], T.float8_e4m3fn),  # type: ignore
+            QScale: T.Tensor([batch * heads], T.float32),  # type: ignore
+            KCache: T.Tensor([pages, page_size, 1, head_dim], T.float8_e4m3fn),  # type: ignore
+            KScale: T.Tensor([pages, page_size], T.float32),  # type: ignore
+            PageTable: T.Tensor([batch, max_pages], T.int32),  # type: ignore
+            ContextLens: T.Tensor([batch], T.int32),  # type: ignore
+            Logits: T.Tensor([batch, max_model_len], T.float32),  # type: ignore
+            Scale: T.float32,
+        ):
+            with T.Kernel(
+                T.ceildiv(batch, queries_per_request),
+                T.ceildiv(T.ceildiv(max_pages, sub_pages), groups_per_cta),
+                threads=threads,
+            ) as (request, group_block):
+                if min_blocks_per_sm:
+                    T.annotate_min_blocks_per_sm(min_blocks_per_sm)
+                row_base = request * queries_per_request
+                q_shared = T.alloc_shared(
+                    [queries_per_request * heads, head_dim], T.float8_e4m3fn
+                )
+                k_shared = T.alloc_shared([GROUP, head_dim], T.float8_e4m3fn)
+                q_scale = T.alloc_fragment([queries_per_request * heads], T.float32)
+                scores = T.alloc_fragment(
+                    [GROUP, queries_per_request * heads], T.float32
+                )
+                scores_3d = T.reshape(
+                    scores, (GROUP, queries_per_request, heads)
+                )
+                reduced = T.alloc_fragment(
+                    [GROUP, queries_per_request], T.float32
+                )
+                T.copy(Q[row_base * heads, 0], q_shared)
+                T.copy(QScale[row_base * heads], q_scale)
+                context_max = ContextLens[
+                    row_base + queries_per_request - 1
+                ]
+
+                for gi in T.Pipelined(groups_per_cta, num_stages=num_stages):
+                    group = group_block * groups_per_cta + gi
+                    if group * GROUP < context_max:
+                        for sp in range(sub_pages):
+                            if (group * sub_pages + sp) * page_size < context_max:
+                                T.copy(
+                                    KCache[
+                                        PageTable[
+                                            row_base, group * sub_pages + sp
+                                        ],
+                                        :,
+                                        0,
+                                        :,
+                                    ],
+                                    k_shared[
+                                        sp * page_size : (sp + 1) * page_size, :
+                                    ],
+                                )
+                        T.gemm(
+                            k_shared,
+                            q_shared,
+                            scores,
+                            transpose_B=True,
+                            clear_accum=True,
+                            policy=T.GemmWarpPolicy.FullCol,
+                        )
+                        for token, column in T.Parallel(
+                            GROUP, queries_per_request * heads
+                        ):
+                            scores[token, column] = (
+                                T.max(scores[token, column], 0.0) * q_scale[column]
+                            )
+                        T.reduce_sum(scores_3d, reduced, dim=2, clear=True)
+                        for token, query in T.Parallel(
+                            GROUP, queries_per_request
+                        ):
+                            row = row_base + query
+                            position = group * GROUP + token
+                            if position < ContextLens[row]:
+                                Logits[row, position] = (
+                                    reduced[token, query]
+                                    * KScale[
+                                        PageTable[row_base, position // page_size],
+                                        position % page_size,
+                                    ]
+                                    / Scale
+                                )
+
+        return kernel
+
 def tilelang_qsa_mqa_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -530,12 +746,26 @@ def tilelang_qsa_mqa_decode(
     score_scale: Optional[float] = None,
     verify_queries_per_request: Optional[int] = None,
     fill_invalid_tail: bool = True,
+    k_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Validated TileLang paged decode kernel with weights removed."""
+    """Validated TileLang paged decode kernel with weights removed; k_scale (arc-forge h21)
+    selects the FP8 kernels: k_cache float8_e4m3fn, k_scale [pages, page_size] fp32."""
 
     if not HAS_TILELANG:
         raise RuntimeError("TileLang is unavailable")
     _validate_decode_inputs(q, k_cache, page_table, context_lens)
+    fp8 = k_scale is not None
+    if fp8 and (
+        k_cache.dtype != torch.float8_e4m3fn
+        or k_scale.dtype != torch.float32
+        or tuple(k_scale.shape) != tuple(k_cache.shape[:2])
+    ):
+        raise ValueError(
+            "QSA FP8 decode needs a float8_e4m3fn cache and fp32 scales [pages, page_size], got "
+            f"{k_cache.dtype} {tuple(k_cache.shape)} / {k_scale.dtype} {tuple(k_scale.shape)}"
+        )
+    if not fp8 and k_cache.dtype == torch.float8_e4m3fn:
+        raise ValueError("QSA decode got an FP8 cache without its scales")
     page_size = int(k_cache.shape[1])
     if page_size < 8 or 64 % page_size != 0:
         raise ValueError(
@@ -604,13 +834,34 @@ def tilelang_qsa_mqa_decode(
             ],
             dim=1,
         )
-    kernel_args = (
-        k_cache.to(torch.bfloat16).contiguous(),
+    tail_args = (
         page_table.to(device=q.device, dtype=torch.int32).contiguous(),
         context_lens.to(device=q.device, dtype=torch.int32).contiguous(),
         logits,
         float(score_scale or math.sqrt(head_dim)),
     )
+    if fp8:
+        # arc-forge h21: FP8 x FP8; padded heads are zero rows (scale 1, all-zero e4m3)
+        q8, q_scale = quantize_qsa_index_q_fp8(q_kernel.contiguous())
+        if use_grouped_verify:
+            _tilelang_qsa_mqa_grouped_verify_fp8_kernel(
+                heads=kernel_heads,
+                head_dim=head_dim,
+                page_size=page_size,
+                queries_per_request=grouped_size,
+                groups_per_cta=groups_per_cta,
+                min_blocks_per_sm=_ARC_QSA_INDEXER_MIN_BLOCKS_PER_SM,
+            )(q8.view(-1, head_dim), q_scale.view(-1), k_cache.contiguous(),
+              k_scale.contiguous(), *tail_args)
+        else:
+            _tilelang_qsa_mqa_decode_fp8_kernel(
+                heads=kernel_heads,
+                head_dim=head_dim,
+                page_size=page_size,
+                groups_per_cta=groups_per_cta,
+            )(q8.unsqueeze(1), q_scale, k_cache.contiguous(), k_scale.contiguous(), *tail_args)
+        return logits
+    kernel_args = (k_cache.to(torch.bfloat16).contiguous(), *tail_args)
     if use_grouped_verify:
         _tilelang_qsa_mqa_grouped_verify_kernel(
             heads=kernel_heads,
@@ -629,6 +880,49 @@ def tilelang_qsa_mqa_decode(
         )(q_kernel.unsqueeze(1).contiguous(), *kernel_args)
     return logits
 
+
+
+try:
+    import triton
+    import triton.language as tl
+except ImportError:  # pragma: no cover - CPU-only environments
+    triton = None
+    tl = None
+
+if triton is not None:
+
+    @triton.jit
+    def _quantize_q_fp8_kernel(q, q8, scale, D: tl.constexpr):
+        # one program per (row, head); the keys' rule (qsa_kv_pool.quantize_qsa_index_k): with
+        # amax = m * 2^e, m in [0.5, 1): scale = 2^(e - 9) if m <= 0.875 else 2^(e - 8), i.e. the
+        # fraction bits of amax <= 0x600000; e4m3 round to nearest even. amax = 0 (and a subnormal
+        # amax, below 2^-126) gives scale 1.
+        pid = tl.program_id(0)
+        offs = tl.arange(0, D)
+        x = tl.load(q + pid * D + offs).to(tl.float32)
+        amax = tl.max(tl.abs(x), axis=0)
+        bits = amax.to(tl.int32, bitcast=True)
+        e_field = (bits >> 23) & 0xFF
+        frac = bits & 0x7FFFFF
+        k = tl.where(frac <= 0x600000, e_field - 126 - 9, e_field - 126 - 8)
+        normal = e_field > 0
+        scale_v = tl.where(normal, ((k + 127) << 23).to(tl.float32, bitcast=True), 1.0)
+        inv_v = tl.where(normal, ((127 - k) << 23).to(tl.float32, bitcast=True), 1.0)
+        tl.store(q8 + pid * D + offs, (x * inv_v).to(tl.float8e4nv))
+        tl.store(scale + pid, scale_v)
+
+
+def quantize_qsa_index_q_fp8(q: torch.Tensor):
+    """arc-forge h21: index Q [rows, heads, head_dim] (BF16) -> (e4m3 [rows, heads, head_dim], fp32
+    [rows, heads]) per (row, head), bit for bit quantize_qsa_index_k (one launch; CUDA only)."""
+    if q.ndim != 3 or not q.is_cuda or not q.is_contiguous():
+        raise ValueError(f"index Q must be a contiguous CUDA [rows, heads, dim] tensor, got {tuple(q.shape)}")
+    rows, heads, dim = q.shape
+    q8 = torch.empty((rows, heads, dim), dtype=torch.float8_e4m3fn, device=q.device)
+    scale = torch.empty((rows, heads), dtype=torch.float32, device=q.device)
+    if rows * heads:
+        _quantize_q_fp8_kernel[(rows * heads,)](q, q8, scale, D=dim, num_warps=1)
+    return q8, scale
 
 def qsa_mqa_prefill(
     q: torch.Tensor,
@@ -651,6 +945,7 @@ def qsa_mqa_decode(
     score_scale: Optional[float] = None,
     verify_queries_per_request: Optional[int] = None,
     fill_invalid_tail: bool = True,
+    k_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if q.is_cuda and HAS_TILELANG:
         return tilelang_qsa_mqa_decode(
@@ -662,14 +957,16 @@ def qsa_mqa_decode(
             score_scale,
             verify_queries_per_request,
             fill_invalid_tail,
+            k_scale,
         )
     return torch_qsa_mqa_decode(
-        q, k_cache, page_table, context_lens, max_model_len, score_scale
+        q, k_cache, page_table, context_lens, max_model_len, score_scale, k_scale
     )
 
 
 __all__ = [
     "HAS_TILELANG",
+    "quantize_qsa_index_q_fp8",
     "qsa_mqa_decode",
     "qsa_mqa_prefill",
     "tilelang_qsa_mqa_decode",

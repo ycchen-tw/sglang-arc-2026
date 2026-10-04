@@ -52,6 +52,7 @@ def _jit_qsa_indexer_module(
         cuda_wrappers=[
             ("q_prep", f"qsa_index_q_prep<{args}>"),
             ("k_compress", f"qsa_index_k_compress<{args}>"),
+            ("k_compress_fp8", f"qsa_index_k_compress_fp8<{args}>"),
         ],
     )
 
@@ -170,6 +171,46 @@ def qsa_index_k_compress_store(
         weight,
         write_locs,
         compressed_k_buffer,
+        compress_ratio,
+        rotary_dim,
+        eps,
+    )
+
+
+def qsa_index_k_compress_store_fp8(
+    key_state_buffer: torch.Tensor,
+    group_locs: torch.Tensor,
+    rope_position_buffer: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    axis_map: torch.Tensor,
+    weight: torch.Tensor,
+    write_locs: torch.Tensor,
+    compressed_k8: torch.Tensor,
+    compressed_k_scale: torch.Tensor,
+    compress_ratio: int,
+    rotary_dim: int,
+    eps: float,
+    is_neox_style: bool,
+) -> None:
+    """arc-forge h21: ``qsa_index_k_compress_store`` into the FP8 index cache.
+
+    compressed_k8      : CUDA float8_e4m3fn [compressed_slots, head_dim] (written)
+    compressed_k_scale : CUDA fp32 [compressed_slots] power-of-two scales (written)
+    Same numerics as the BF16 store up to the rotated BF16 row, then quantize_qsa_index_k
+    (qsa_kv_pool.py) bit for bit. Other parameters as ``qsa_index_k_compress_store``.
+    """
+    head_dim = weight.shape[0]
+    module = _jit_qsa_indexer_module(key_state_buffer.dtype, head_dim, is_neox_style)
+    module.k_compress_fp8(
+        key_state_buffer,
+        group_locs,
+        rope_position_buffer,
+        cos_sin_cache,
+        axis_map,
+        weight,
+        write_locs,
+        compressed_k8,
+        compressed_k_scale,
         compress_ratio,
         rotary_dim,
         eps,

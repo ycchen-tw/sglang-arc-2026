@@ -338,6 +338,30 @@ class QSAIndexer(MultiPlatformOp):
         if source_rope is None:
             source_rope = pool.qsa_rope_position_buffer
         compressed_buffer = pool.get_qsa_compressed_k_buffer(self.layer_id)
+        if getattr(pool, "qsa_index_fp8", False):
+            # arc-forge h21: e4m3 keys + power-of-two scales, one kv head
+            from sglang.kernels.ops.attention.qsa_indexer import (
+                qsa_index_k_compress_store_fp8,
+            )
+
+            qsa_index_k_compress_store_fp8(
+                source_keys.reshape(source_keys.shape[0], -1)
+                .contiguous()
+                .to(pool.index_state_dtype),
+                group_locs.to(torch.int32),
+                source_rope,
+                self.rotary_emb.cos_sin_cache,
+                self._rope_axis_map(source_keys.device),
+                self.k_layernorm.weight.data,
+                write_locs.to(torch.int32),
+                compressed_buffer.view(compressed_buffer.shape[0], -1),
+                pool.get_qsa_compressed_k_scale(self.layer_id).view(-1),
+                self.compress_ratio,
+                self.rotary_emb.rotary_dim,
+                self.k_layernorm.variance_epsilon,
+                self.rotary_emb.is_neox_style,
+            )
+            return
         qsa_index_k_compress_store(
             source_keys.reshape(source_keys.shape[0], -1)
             .contiguous()
@@ -594,6 +618,7 @@ class QSAIndexer(MultiPlatformOp):
         query_positions: torch.Tensor,
         sequence_lengths: torch.Tensor,
         verify_queries_per_request: Optional[int] = None,
+        compressed_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         block_indices = self._select_decode_blocks(
             q,
@@ -602,6 +627,7 @@ class QSAIndexer(MultiPlatformOp):
             compressed_lengths,
             max_model_len,
             verify_queries_per_request=verify_queries_per_request,
+            compressed_scale=compressed_scale,
         )
         return expand_qsa_block_indices(
             block_indices,
@@ -625,6 +651,7 @@ class QSAIndexer(MultiPlatformOp):
         req_pool_indices: torch.Tensor,
         pool,
         verify_queries_per_request: Optional[int] = None,
+        compressed_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """DECODE / TARGET_VERIFY selection under HiSparse offload: swap the
         selected blocks into each request's hot buffer, then expand them to the
@@ -645,6 +672,7 @@ class QSAIndexer(MultiPlatformOp):
             compressed_lengths,
             max_model_len,
             verify_queries_per_request=verify_queries_per_request,
+            compressed_scale=compressed_scale,
         )
         rows = block_indices.shape[0]
         if (
@@ -688,6 +716,7 @@ class QSAIndexer(MultiPlatformOp):
         compressed_lengths: torch.Tensor,
         max_model_len: int,
         verify_queries_per_request: Optional[int] = None,
+        compressed_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         use_fast_decode_topk = q.is_cuda and self.block_topk == 512
         logits = qsa_mqa_decode(
@@ -698,6 +727,7 @@ class QSAIndexer(MultiPlatformOp):
             max_model_len,
             verify_queries_per_request=verify_queries_per_request,
             fill_invalid_tail=not use_fast_decode_topk,
+            k_scale=compressed_scale,
         )
         if use_fast_decode_topk:
             # Decode rows start at zero, so compressed lengths double as row lengths;
@@ -803,6 +833,7 @@ class QSAIndexer(MultiPlatformOp):
             compressed_cache, page_table, compressed_lengths, max_model_len = (
                 indexer_metadata.get_decode_mqa_inputs(self.layer_id)
             )
+            compressed_scale = indexer_metadata.get_decode_mqa_scale(self.layer_id)
             hisparse = indexer_metadata.hisparse
             if hisparse is not None:
                 if not (forward_mode.is_decode() or is_target_verify):
@@ -825,6 +856,7 @@ class QSAIndexer(MultiPlatformOp):
                         is_target_verify=is_target_verify,
                         is_draft_extend=False,
                     ),
+                    compressed_scale=compressed_scale,
                 )
             return self.select_decode_tokens(
                 q,
@@ -839,11 +871,19 @@ class QSAIndexer(MultiPlatformOp):
                     is_target_verify=is_target_verify,
                     is_draft_extend=is_draft_extend,
                 ),
+                compressed_scale=compressed_scale,
             )
 
         compressed_keys, row_starts, row_ends, sequence_lengths = (
             indexer_metadata.get_prefill_mqa_inputs(self.layer_id, logical_positions)
         )
+        if getattr(indexer_metadata.token_to_kv_pool, "qsa_index_fp8", False) and q.shape[0]:
+            # arc-forge h21: prefill scores the Q the FP8 decode kernels score (quantized per
+            # (row, head) with the keys' power-of-two rule; dequantized exactly into BF16)
+            from sglang.srt.layers.attention.qsa.mqa import quantize_qsa_index_q_fp8
+            from sglang.srt.mem_cache.qsa_kv_pool import dequantize_qsa_index_k
+
+            q = dequantize_qsa_index_k(*quantize_qsa_index_q_fp8(q.contiguous()))
         query_sequence_ids = indexer_metadata.get_token_to_batch_idx()
         row_sequence_lengths = sequence_lengths.index_select(
             0, query_sequence_ids.long()

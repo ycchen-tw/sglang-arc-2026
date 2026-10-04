@@ -159,15 +159,30 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
         compressed_buffer = pool.get_qsa_compressed_k_buffer(layer_id)
         sequence_lengths = self.sequence_lengths.to(torch.int32)
         empty = (0, pool.qsa_index_kv_heads, pool.qsa_index_head_dim)
+        compressed_scale = pool.get_qsa_compressed_k_scale(layer_id)
+        if compressed_scale is not None:
+            # arc-forge h21: FP8 cache; gather and dequantize (exact in BF16: the scales
+            # are powers of two), so prefill scores the keys decode / verify score
+            from sglang.srt.mem_cache.qsa_kv_pool import dequantize_qsa_index_k
+
+            def gather(locs):
+                return dequantize_qsa_index_k(
+                    compressed_buffer.index_select(0, locs),
+                    compressed_scale.index_select(0, locs),
+                )
+
+            empty_keys = torch.empty(empty, dtype=torch.bfloat16, device=compressed_buffer.device)
+        else:
+
+            def gather(locs):
+                return compressed_buffer.index_select(0, locs)
+
+            empty_keys = compressed_buffer.new_empty(empty)
         if self.prefill_compressed_locs is not None:
             # h15: one gather of the slots the metadata builder concatenated from
             # host lengths; the same bytes as the per-sequence loop below
             locs = self.prefill_compressed_locs
-            compressed_keys = (
-                compressed_buffer.index_select(0, locs)
-                if locs.numel()
-                else compressed_buffer.new_empty(empty)
-            )
+            compressed_keys = gather(locs) if locs.numel() else empty_keys
         else:
             parts = []
             sequence_lengths_list = sequence_lengths.tolist()
@@ -183,10 +198,8 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
                     ].long()
                     // ratio
                 )
-                parts.append(compressed_buffer.index_select(0, compressed_locs))
-            compressed_keys = (
-                torch.cat(parts, dim=0) if parts else compressed_buffer.new_empty(empty)
-            )
+                parts.append(gather(compressed_locs))
+            compressed_keys = torch.cat(parts, dim=0) if parts else empty_keys
         num_valid_tokens = self.token_to_batch_idx.numel()
         if positions.numel() < num_valid_tokens:
             raise ValueError(
@@ -201,6 +214,17 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
             self.compress_ratio,
         )
         return compressed_keys, row_starts, row_ends, sequence_lengths
+
+    def get_decode_mqa_scale(self, layer_id: int) -> Optional[torch.Tensor]:
+        """arc-forge h21: the FP8 cache's scales paged like get_decode_mqa_inputs' cache,
+        [pages, page_size] fp32 (one index kv head); None for the BF16 cache."""
+        pool = self.token_to_kv_pool
+        scale = pool.get_qsa_compressed_k_scale(layer_id)
+        if scale is None:
+            return None
+        if pool.qsa_index_kv_heads != 1:
+            raise ValueError("the FP8 QSA index cache needs indexer_kv_heads=1")
+        return scale.reshape(-1, pool.qsa_compressed_page_size)
 
     def get_decode_mqa_inputs(
         self, layer_id: int

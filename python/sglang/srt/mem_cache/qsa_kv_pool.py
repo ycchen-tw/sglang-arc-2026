@@ -8,6 +8,7 @@ Qwen3Next-DSA) adds only the flat per-token index-K cache.
 
 from __future__ import annotations
 
+import os
 from contextlib import nullcontext
 from typing import List, Optional
 
@@ -26,6 +27,41 @@ def _index_k_bytes(*, kv_heads: int, head_dim: int, dtype: torch.dtype) -> int:
     return kv_heads * head_dim * dtype.itemsize
 
 
+def qsa_index_fp8_enabled() -> bool:
+    """arc-forge h21: ARC_QSA_INDEX_FP8=1 stores the compressed index keys as FP8 (e4m3) with one power-of-two fp32
+    scale per compressed key (per key head), instead of BF16. Default 0 (off). Read wherever the cache is sized or
+    built (planner, target and draft pools), so both sides agree."""
+    value = os.environ.get("ARC_QSA_INDEX_FP8", "0")
+    if value not in ("0", "1"):
+        raise ValueError(f"ARC_QSA_INDEX_FP8 must be 0 or 1, got {value!r}")
+    return value == "1"
+
+
+QSA_INDEX_FP8_DTYPE = torch.float8_e4m3fn
+QSA_INDEX_FP8_MAX = 448.0
+
+
+def quantize_qsa_index_k(keys: torch.Tensor):
+    """Reference FP8 quantization of compressed index keys [..., head_dim] (the fused compress kernel matches it bit
+    for bit): scale = the smallest power of two with amax / scale <= 448, k8 = e4m3(key / scale) rounded to nearest
+    even. The key is first rounded to BF16 (what the BF16 cache would hold). Dequantized keys k8 * scale are exact in
+    BF16, so every consumer (decode / verify kernels scaling the logits, prefill dequantizing) scores the same keys.
+    Returns (k8 [..., head_dim] float8_e4m3fn, scale [...] float32); an all-zero key gets scale 1."""
+    x = keys.to(torch.bfloat16).float()
+    amax = x.abs().amax(dim=-1)
+    mantissa, exponent = torch.frexp(amax)  # amax = m * 2^e, m in [0.5, 1)
+    # amax / 2^k <= 448 = 0.875 * 2^9  <=>  k >= e - 9 (m <= 0.875) or e - 8 (m > 0.875)
+    k = torch.where(mantissa <= 0.875, exponent - 9, exponent - 8)
+    scale = torch.where(amax > 0, torch.ldexp(torch.ones_like(amax), k), torch.ones_like(amax))
+    k8 = (x / scale.unsqueeze(-1)).to(QSA_INDEX_FP8_DTYPE)
+    return k8, scale
+
+
+def dequantize_qsa_index_k(k8: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """k8 [..., head_dim] e4m3 and scale [...] fp32 -> BF16 keys (exact: scale is a power of two)."""
+    return (k8.float() * scale.unsqueeze(-1)).to(torch.bfloat16)
+
+
 class QSATokenToKVPool(HybridLinearKVPool):
     """Hybrid KV pool with the minimal BF16 state required by simple QSA."""
 
@@ -41,9 +77,13 @@ class QSATokenToKVPool(HybridLinearKVPool):
     ) -> int:
         """Per-token QSA index-cache cost: compressed keys only;
         the per-request pending ring is budgeted with the other per-request buffers."""
-        index_k_bytes = _index_k_bytes(
-            kv_heads=kv_heads, head_dim=head_dim, dtype=cls.index_state_dtype
-        )
+        if qsa_index_fp8_enabled():
+            # e4m3 key plus one fp32 scale per key head (arc-forge h21)
+            index_k_bytes = kv_heads * (head_dim * QSA_INDEX_FP8_DTYPE.itemsize + 4)
+        else:
+            index_k_bytes = _index_k_bytes(
+                kv_heads=kv_heads, head_dim=head_dim, dtype=cls.index_state_dtype
+            )
         return index_k_bytes // compress_ratio * num_layers
 
     def __init__(
@@ -84,7 +124,9 @@ class QSATokenToKVPool(HybridLinearKVPool):
         # so the QSA buffers get placeholders first; mem_usage is recomputed last.
         self.qsa_key_state_buffer_pool = []
         self.qsa_compressed_k_buffer_pool = []
+        self.qsa_compressed_scale_pool = []
         self.qsa_rope_position_buffer = torch.empty(0)
+        self.qsa_index_fp8 = qsa_index_fp8_enabled()
         super().__init__(
             size=size,
             dtype=dtype,
@@ -180,9 +222,22 @@ class QSATokenToKVPool(HybridLinearKVPool):
                     * self.qsa_index_kv_heads
                     * self.qsa_index_head_dim,
                 ),
-                dtype=self.index_state_dtype,
+                dtype=(
+                    QSA_INDEX_FP8_DTYPE if self.qsa_index_fp8 else self.index_state_dtype
+                ),
                 device=device,
             )
+            if self.qsa_index_fp8:
+                # arc-forge h21: one power-of-two scale per compressed key head; ones keep the
+                # never-written slots (zeros in k8) at a zero key, as in the BF16 cache
+                self.qsa_compressed_scale_flat = torch.ones(
+                    (
+                        len(full_attention_layer_ids),
+                        self.qsa_compressed_capacity * self.qsa_index_kv_heads,
+                    ),
+                    dtype=torch.float32,
+                    device=device,
+                )
         self.qsa_compressed_k_buffer_pool = [
             self.qsa_compressed_flat[layer_offset].view(
                 self.qsa_compressed_capacity,
@@ -191,6 +246,13 @@ class QSATokenToKVPool(HybridLinearKVPool):
             )
             for layer_offset in range(len(full_attention_layer_ids))
         ]
+        if self.qsa_index_fp8:
+            self.qsa_compressed_scale_pool = [
+                self.qsa_compressed_scale_flat[layer_offset].view(
+                    self.qsa_compressed_capacity, self.qsa_index_kv_heads
+                )
+                for layer_offset in range(len(full_attention_layer_ids))
+            ]
         k_size, v_size = self.get_kv_size_bytes()
         self.mem_usage = (k_size + v_size) / GB
 
@@ -225,10 +287,23 @@ class QSATokenToKVPool(HybridLinearKVPool):
             self._transfer_full_attention_id(layer_id)
         ]
 
+    def get_qsa_compressed_k_scale(self, layer_id: int) -> Optional[torch.Tensor]:
+        """[compressed_slots, kv_heads] fp32 scales of the FP8 cache (h21), None for BF16."""
+        if not self.qsa_index_fp8:
+            return None
+        return self.qsa_compressed_scale_pool[
+            self._transfer_full_attention_id(layer_id)
+        ]
+
     def set_qsa_compressed_k_buffer(
         self, layer_id: int, loc: torch.Tensor, compressed_k: torch.Tensor
     ) -> None:
         buffer = self.get_qsa_compressed_k_buffer(layer_id)
+        if self.qsa_index_fp8:
+            k8, scale = quantize_qsa_index_k(compressed_k)
+            buffer[loc.long()] = k8
+            self.get_qsa_compressed_k_scale(layer_id)[loc.long()] = scale
+            return
         buffer[loc.long()] = compressed_k.to(buffer.dtype)
 
     @staticmethod
@@ -280,6 +355,10 @@ class QSATokenToKVPool(HybridLinearKVPool):
         One full KV page maps to one compressed page because the full page size
         is an integer multiple of the compression ratio.
         """
+        if self.qsa_index_fp8:
+            raise NotImplementedError(
+                "ARC_QSA_INDEX_FP8 (h21) does not transfer the compressed-key scales; PD is unsupported"
+            )
         return self._get_paged_state_buf_infos(
             self.qsa_compressed_k_buffer_pool,
             self.qsa_compressed_page_size,
@@ -295,6 +374,10 @@ class QSATokenToKVPool(HybridLinearKVPool):
             + sum(
                 tensor.numel() * tensor.element_size()
                 for tensor in self.qsa_compressed_k_buffer_pool
+            )
+            + sum(
+                tensor.numel() * tensor.element_size()
+                for tensor in self.qsa_compressed_scale_pool
             )
             + self.qsa_rope_position_buffer.numel() * 8
         )
