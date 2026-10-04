@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
@@ -47,11 +48,14 @@ def handle_kv4_compatibility(server_args: Any) -> None:
     attention_backend = resolved_view(server_args).attention_backend
 
     if get_platform().is_cuda:
-        if cfg.kv_cache_dtype == "nvfp4" and not (
-            get_platform().is_sm100 or get_platform().is_sm120
+        if (
+            cfg.kv_cache_dtype == "nvfp4"
+            and not (get_platform().is_sm100 or get_platform().is_sm120)
+            and os.environ.get("ARC_QSA_FP4_FUSED", "1") != "1"
         ):
             raise RuntimeError(
-                "--kv-cache-dtype=nvfp4 requires Blackwell SM100 or SM120. "
+                "--kv-cache-dtype=nvfp4 requires Blackwell SM100 or SM120, or "
+                "ARC_QSA_FP4_FUSED=1 for the Triton quantize+decode path (sm_89). "
                 "Use --kv-cache-dtype=fp4_mx_block16 for the block-size-16 FP4 recipe."
             )
         if (

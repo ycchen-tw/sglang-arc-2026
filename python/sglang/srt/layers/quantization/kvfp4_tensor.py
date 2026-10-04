@@ -13,6 +13,8 @@
 # ==============================================================================
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.srt.runtime_context import get_platform
 
@@ -140,6 +142,57 @@ class FP4MXBlock16KVQuantizeUtil:
         return scaled.view(b, m, n).to(dtype)
 
 
+@triton.jit
+def _nvfp4_quantize(x, gscale, out, sf, rows, N: tl.constexpr, BLOCK_R: tl.constexpr):
+    """One program per (row block, 16-element scale block)."""
+    pid_r, pid_b = tl.program_id(0), tl.program_id(1)
+    SF: tl.constexpr = N // 16
+    r = pid_r * BLOCK_R + tl.arange(0, BLOCK_R)
+    live = r < rows
+    cols = pid_b * 16 + tl.arange(0, 16)
+    vals = tl.load(x + r[:, None] * N + cols[None, :], mask=live[:, None], other=0.0).to(tl.float32)
+
+    g = tl.load(gscale)
+    amax = tl.max(tl.abs(vals), 1)
+    bs = amax / (6.0 * g)
+    bs = tl.minimum(tl.maximum(bs, 1e-8), 448.0).to(tl.float8e4nv)     # storable scale
+    step = tl.maximum(bs.to(tl.float32) * g, 1e-12)
+    q = vals / step[:, None]
+
+    # Nearest E2M1 level: thresholds are the midpoints of (0,.5,1,1.5,2,3,4,6).
+    a = tl.minimum(tl.abs(q), 6.0)
+    idx = ((a > 0.25).to(tl.int32) + (a > 0.75).to(tl.int32) + (a > 1.25).to(tl.int32)
+           + (a > 1.75).to(tl.int32) + (a > 2.5).to(tl.int32) + (a > 3.5).to(tl.int32)
+           + (a > 5.0).to(tl.int32))
+    nib = idx | tl.where(q < 0, 8, 0)
+
+    # Pack: byte p carries element 2p in the low nibble, 2p+1 in the high nibble.
+    even = tl.sum(tl.where(tl.arange(0, 16)[None, :] % 2 == 0, nib, 0)
+                  .reshape(BLOCK_R, 8, 2), 2)
+    odd = tl.sum(tl.where(tl.arange(0, 16)[None, :] % 2 == 1, nib, 0)
+                 .reshape(BLOCK_R, 8, 2), 2)
+    byte = (even | (odd << 4)).to(tl.uint8)
+    pack_cols = pid_b * 8 + tl.arange(0, 8)
+    tl.store(out + r[:, None] * (N // 2) + pack_cols[None, :], byte, mask=live[:, None])
+    tl.store(sf + r * SF + pid_b, bs, mask=live)
+
+
+def nvfp4_quantize_triton(tensor_2d, global_scale):
+    """[rows, N] bf16/fp16 -> (packed uint8 [rows, N//2], e4m3 scales [rows, N//16])."""
+    rows, n = tensor_2d.shape
+    if n % 16:
+        raise ValueError(f"NVFP4 needs a multiple of 16 features, got {n}")
+    out = torch.empty(rows, n // 2, dtype=torch.uint8, device=tensor_2d.device)
+    sf = torch.empty(rows, n // 16, dtype=torch.float8_e4m3fn, device=tensor_2d.device)
+    if rows == 0:
+        return out, sf
+    block_r = 8
+    _nvfp4_quantize[(triton.cdiv(rows, block_r), n // 16)](
+        tensor_2d.contiguous(), global_scale.reshape(1), out, sf, rows,
+        N=n, BLOCK_R=block_r, num_warps=4)
+    return out, sf
+
+
 class NVFP4KVQuantizeUtil:
     """Utility class for NVFP4 quantization and dequantization with two-level scaling
     (global FP32 + block FP8 E4M3).
@@ -169,9 +222,11 @@ class NVFP4KVQuantizeUtil:
                 global_scale: passthrough
         """
 
-        assert (
+        # Ada has neither kernel: nvfp4_kv_quantize is SM100/SM120 PTX and
+        # flashinfer's fp4_quantize refuses with "Invalid backend: 89".
+        _arc_triton_quant = not (
             get_platform().is_sm100 or get_platform().is_sm120 or get_platform().is_sm90
-        ), "NVFP4 KV cache quantize requires SM100/SM120 or SM90 fallback GPU"
+        )
 
         b, m, n = tensor.shape
         tensor_2d = tensor.reshape(b * m, n)
@@ -190,7 +245,9 @@ class NVFP4KVQuantizeUtil:
                 "NVFP4 global scale tensor must already be on the KV tensor device."
             )
 
-        if get_platform().is_sm100 or get_platform().is_sm120:
+        if _arc_triton_quant:
+            fp4_2d, scales_2d = nvfp4_quantize_triton(tensor_2d, global_scale)
+        elif get_platform().is_sm100 or get_platform().is_sm120:
             from flashinfer import nvfp4_kv_quantize
 
             # nvfp4_kv_quantize takes global_scale directly (not inverted)
