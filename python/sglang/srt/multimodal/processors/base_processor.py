@@ -230,6 +230,10 @@ class BaseMultimodalProcessor(ABC):
     # Artifact-based processors may keep their prompt/M-RoPE fast path even
     # when artifact retention is disabled.
     uses_media_artifacts_without_cache = False
+    # ARC h41: image items of the uncached path take the same content-derived hash (artifact key namespace) as
+    # the artifact fast path, so a picture's pad value does not depend on which path a request took; needs the
+    # processor fingerprint whether or not the preprocess cache is on.
+    content_addressed_image_hash = False
     # Processors opt out only when their preprocessing is not thread-safe. The
     # worker pool gives each thread its own `copy.deepcopy` of the HF processor
     # and injects it, and the single function it runs --
@@ -291,6 +295,7 @@ class BaseMultimodalProcessor(ABC):
             build_processor_fingerprint(self, hf_config)
             if self.mm_preprocess_cache.enabled
             or self.uses_media_artifacts_without_cache
+            or self.content_addressed_image_hash
             else None
         )
         if self.mm_preprocess_cache.enabled:

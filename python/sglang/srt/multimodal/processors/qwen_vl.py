@@ -333,6 +333,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
     supports_transformers_backend = True
     generates_input_ids_from_raw_prompt = True
     artifact_modality = Modality.IMAGE
+    content_addressed_image_hash = True  # ARC h41
     models = [
         Qwen2VLForConditionalGeneration,
         Qwen2_5_VLForConditionalGeneration,
@@ -1058,6 +1059,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             base_output, self.mm_tokens, **processor_kwargs
         )
 
+        self._set_content_addressed_image_hashes(image_data, mm_items)
         self._mark_cuda_ipc_features_for_deferred_reconstruction(mm_items)
 
         audio_feature_lengths = None
@@ -1171,6 +1173,36 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             mrope_positions=mrope_positions,
             mrope_position_delta=mrope_position_delta,
         )
+
+    def _set_content_addressed_image_hashes(self, image_data, mm_items) -> None:
+        """ARC h41: give each image item the hash the artifact fast path gives the same picture.
+
+        The fast path (compose_image_artifacts) sets ``feature_hash`` derived from
+        the artifact key (content digest + processor fingerprint + preprocess
+        kwargs); an image left without a hash here would get the scheduler's
+        sha256 of its pixel_values instead. The two differ, so a session whose
+        requests switch paths (an image-only request, then one that also
+        carries a video) used to stop matching its own prefix at the first
+        image. Image items map to ``image_data`` in order, as in
+        compose_image_artifacts. Preprocessed inputs keep the old behavior;
+        video and audio items are not touched.
+        """
+        images = [item for item in mm_items if item.is_image()]
+        if not images or not image_data:
+            return
+        if any(self._is_preprocessed_input(item) for item in image_data):
+            return
+        if len(images) != len(image_data):
+            raise RuntimeError(
+                f"ARC h41: {len(images)} image items for {len(image_data)} images; "
+                "cannot assign content-addressed hashes"
+            )
+        for item, source in zip(images, image_data):
+            snapshot = self.snapshot_media_source(source, Modality.IMAGE)
+            key = self._artifact_key(
+                snapshot.content_digest, source, modality=Modality.IMAGE
+            )
+            item.set_hash(resolve_multimodal_item_hash(existing_hash=0, namespace=key))
 
     async def process_mm_data_async(
         self,
