@@ -59,6 +59,74 @@ def _env_flag(name: str, default: str) -> bool:
 # 0 restores the full-ring loads (kill switch, and the reference for the check).
 _ARC_GDN_COMMIT_LIVE_ROWS = _env_flag("ARC_GDN_COMMIT_LIVE_ROWS", "1")
 
+# arc-forge h20 (opt-in, QSA HiSparse arm only; attention_hook refuses it elsewhere):
+# with a 16-bit checkpoint the accepted window is folded by the NEXT verify, which
+# reads the checkpoint anyway, instead of by the commit, which read and wrote it once
+# more. The commit keeps only the snapshot-track rows and leaves the cursors as the
+# advance set them (base at the window, write_pos = accepted, is_flush = 1); the
+# verify folds those rows with the commit's arithmetic, stores the checkpoint and
+# projects with it. Nothing but the verify and the commit's track reads the live
+# checkpoint on that arm, and a fresh request row starts with zeroed cursors.
+_ARC_GDN_FOLD_IN_VERIFY = _env_flag("ARC_GDN_FOLD_IN_VERIFY", "0")
+# the verify's fold tile (key rows per step) and loop form; any choice gives the same
+# bytes (per element the same dot chain and roundings), they differ in speed only.
+# G4, 36 layers x 53 rows (opt2_fold_sweep.sh): 32 rows unrolled 4.82 ms per step of
+# verify, 32 looped 4.83, 16 looped 5.48, 16 unrolled 5.54, 64 >= 6.4, 128 10.4.
+_FOLD_BK = 32
+_FOLD_UNROLL = True
+
+
+@triton.jit
+def _fold_key_block(
+    p_keys,  # [BC, 1] pointers: this row's pending key rows (normalized, high part)
+    p_key_residual,  # [BC, 1] pointers: their low parts
+    p_h0,  # [1, BV] pointers: the checkpoint's rows of this V tile
+    fold_mask,  # [BC] the pending rows
+    fold_hi,  # [BC, BV] decayed updates, high part
+    fold_lo,  # [BC, BV] low part
+    fold_scale,  # exp(sum of the pending gates)
+    mask_v,
+    kf,
+    K: tl.constexpr,
+    FOLD_BK: tl.constexpr,
+    STORE_K_RESIDUAL: tl.constexpr,
+):
+    """h20: fold FOLD_BK key rows of one checkpoint V tile in place, statement for
+    statement as gdn_replayssm_compact_commit_kernel's active fold."""
+    o_kf = kf * FOLD_BK + tl.arange(0, FOLD_BK)
+    mask_kf = o_kf < K
+    fold_keys = tl.load(
+        p_keys + o_kf[None, :], mask=fold_mask[:, None] & mask_kf[None, :], other=0.0
+    )
+    fold_delta = tl.dot(tl.trans(fold_keys), fold_hi)
+    fold_delta += tl.dot(tl.trans(fold_keys), fold_lo)
+    if STORE_K_RESIDUAL:
+        fold_key_residual = tl.load(
+            p_key_residual + o_kf[None, :],
+            mask=fold_mask[:, None] & mask_kf[None, :],
+            other=0.0,
+        )
+        fold_delta += tl.dot(tl.trans(fold_key_residual), fold_hi)
+        fold_delta += tl.dot(tl.trans(fold_key_residual), fold_lo)
+    p = p_h0 + o_kf[:, None]
+    fold_old = tl.load(p, mask=mask_kf[:, None] & mask_v[None, :], other=0.0).to(tl.float32)
+    # The commit rounds old * scale before it adds the delta (a layout conversion
+    # sits between its multiply and its add); here they would contract into one
+    # FMA, so the multiply is an explicitly rounded mul.rn.
+    fold_scaled = tl.inline_asm_elementwise(
+        "mul.rn.f32 $0, $1, $2;",
+        "=f,f,f",
+        [fold_old, fold_scale],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+    tl.store(
+        p,
+        (fold_scaled + fold_delta).to(p.dtype.element_ty),
+        mask=mask_kf[:, None] & mask_v[None, :],
+    )
+
 
 @triton.jit
 def gdn_replayssm_spec_circular_kernel(
@@ -120,6 +188,9 @@ def gdn_replayssm_spec_circular_kernel(
     IS_FLUSH: tl.constexpr,
     NULL_BLOCK_ID: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
+    FOLD_PENDING: tl.constexpr = False,
+    FOLD_BK: tl.constexpr = 16,
+    FOLD_UNROLL: tl.constexpr = False,
 ):
     i_v = tl.program_id(0)
     i_n = tl.program_id(1)
@@ -165,8 +236,9 @@ def gdn_replayssm_spec_circular_kernel(
             )
             return
         b_is_flush = tl.load(is_flush_flags + replay_idx) != 0
-        if b_is_flush:
-            return
+        if not FOLD_PENDING:
+            if b_is_flush:
+                return
 
     b_write_pos = tl.load(write_pos + replay_idx).to(tl.int64)
     b_cache_base = tl.load(cache_base + replay_idx).to(tl.int32)
@@ -174,7 +246,15 @@ def gdn_replayssm_spec_circular_kernel(
     out_mask = mask_s[:, None] & mask_v[None, :]
 
     b_wp_i = b_write_pos.to(tl.int32)
-    cache_valid = o_c < b_write_pos
+    if FOLD_PENDING:
+        # h20: a flush row's write_pos rows at base are the accepted window the
+        # commit left pending; they are folded below and there is no history.
+        # The spec window still starts after them (phys_spec), where the
+        # commit-fold path would put it after moving base past them.
+        n_fold = tl.where(b_is_flush, b_wp_i, 0)
+        cache_valid = o_c < tl.where(b_is_flush, 0, b_write_pos)
+    else:
+        cache_valid = o_c < b_write_pos
 
     # CIRCULAR physical slots (addresses only; masks/cumsums stay logical).
     phys_c = (b_cache_base + o_c) & (MAX_CACHE_LEN - 1)  # [BC] history
@@ -253,6 +333,66 @@ def gdn_replayssm_spec_circular_kernel(
     else:
         q_rnorm = tl.where(mask_s, 1.0, 0.0)
         k_rnorm = tl.where(mask_s, 1.0, 0.0)
+
+    if FOLD_PENDING:
+        # h20: the pending window's decays and decayed updates, as
+        # gdn_replayssm_compact_commit_kernel computes them for its fold
+        # (BC == MAX_CACHE_LEN rows from base; the launcher checks). Every value
+        # is zero on rows that do not fold.
+        fold_mask = o_c < n_fold
+        fold_g = tl.load(
+            g_cache + replay_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + phys_c,
+            mask=fold_mask,
+            other=0.0,
+        ).to(tl.float32)
+        fold_g = tl.where(fold_mask, fold_g, 0.0)
+        fold_prefix = tl.cumsum(fold_g, axis=0)
+        fold_total = tl.sum(fold_g, axis=0)
+        fold_decay = tl.where(fold_mask, tl.exp(fold_total - fold_prefix), 0.0)
+        fold_scale = tl.exp(fold_total)
+        p_fold_d = (i_hv * MAX_CACHE_LEN + phys_c[:, None]) * V + o_v[None, :]
+        fold_updates = tl.load(
+            d_cache + replay_idx * stride_d_slot + p_fold_d,
+            mask=fold_mask[:, None] & mask_v[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        if STORE_D_RESIDUAL:
+            fold_updates += tl.load(
+                rawv_cache + replay_idx * stride_rawv_slot + p_fold_d,
+                mask=fold_mask[:, None] & mask_v[None, :],
+                other=0.0,
+            ).to(tl.float32)
+        fold_updates = fold_updates * fold_decay[:, None]
+        fold_hi = fold_updates.to(k_cache.dtype.element_ty)
+        fold_lo = (fold_updates - fold_hi.to(tl.float32)).to(k_cache.dtype.element_ty)
+        if b_is_flush:
+            # Fold this program's V tile of the checkpoint in place, FOLD_BK key
+            # rows at a time ([K, V] like the commit: per element the same
+            # m16n8k16 dots and the same roundings), before the projection loop
+            # loads it as every row does. The barrier makes the stores visible
+            # to the threads that load them.
+            p_fold_keys = (
+                k_cache
+                + replay_idx * stride_k_slot
+                + (i_h * MAX_CACHE_LEN + phys_c[:, None]) * K
+            )
+            p_fold_key_residual = (
+                rawk_cache
+                + replay_idx * stride_rawk_slot
+                + (i_h * MAX_CACHE_LEN + phys_c[:, None]) * K
+            )
+            p_fold_h0 = h0 + state_idx * stride_state_slot + i_hv * V * K + o_v[None, :] * K
+            if FOLD_UNROLL:
+                for kf in tl.static_range(BK // FOLD_BK):
+                    _fold_key_block(p_fold_keys, p_fold_key_residual, p_fold_h0, fold_mask,
+                                    fold_hi, fold_lo, fold_scale, mask_v, kf, K, FOLD_BK,
+                                    STORE_K_RESIDUAL)
+            else:
+                for kf in range(BK // FOLD_BK):
+                    _fold_key_block(p_fold_keys, p_fold_key_residual, p_fold_h0, fold_mask,
+                                    fold_hi, fold_lo, fold_scale, mask_v, kf, K, FOLD_BK,
+                                    STORE_K_RESIDUAL)
+            tl.debug_barrier()
 
     # ------------------------------------------------------------------
     # K-Tiled Fused Projection and Intra-Spec Matrices (+ flush)
@@ -787,8 +927,12 @@ def gdn_replayssm_compact_commit_kernel(
     HAS_TRACK: tl.constexpr,
     HAS_RESIDUAL: tl.constexpr,
     LIVE_ROWS: tl.constexpr,
+    FOLD_IN_VERIFY: tl.constexpr = False,
 ):
-    """Materialize the checkpoint directly from compact ReplaySSM D/K/G."""
+    """Materialize the checkpoint directly from compact ReplaySSM D/K/G.
+
+    FOLD_IN_VERIFY (arc-forge h20): the active checkpoint is left to the next
+    verify; only track rows are written, from the same loads as before."""
     i_v = tl.program_id(0)
     i_n = tl.program_id(1)
     i_hvl = tl.program_id(2)
@@ -812,8 +956,12 @@ def gdn_replayssm_compact_commit_kernel(
         track_idx = NULL_BLOCK_ID
         has_track = False
         track_len = 0
-    if (not fold_active) and (not has_track):
-        return
+    if FOLD_IN_VERIFY:
+        if not has_track:
+            return
+    else:
+        if (not fold_active) and (not has_track):
+            return
 
     h0 += i_layer * stride_state_layer
     d_cache += i_layer * stride_d_layer
@@ -884,7 +1032,9 @@ def gdn_replayssm_compact_commit_kernel(
         other=0.0,
     ).to(tl.float32)
 
-    if fold_active:
+    if FOLD_IN_VERIFY:
+        pass
+    elif fold_active:
         active_mask = o_t < n_history
         active_g = tl.where(active_mask, gates, 0.0)
         active_prefix = tl.cumsum(active_g, axis=0)
@@ -923,15 +1073,40 @@ def gdn_replayssm_compact_commit_kernel(
             if HAS_RESIDUAL:
                 track_delta += tl.dot(tl.trans(key_residual), track_hi)
                 track_delta += tl.dot(tl.trans(key_residual), track_lo)
-            tl.store(
-                h0
-                + track_idx * stride_state_slot
-                + i_hv * V * K
-                + o_v[None, :] * K
-                + o_k[:, None],
-                (old_state * tl.exp(track_total) + track_delta).to(h0.dtype.element_ty),
-                mask=mask_v[None, :],
-            )
+            if FOLD_IN_VERIFY:
+                # h20: without the fold, old_state is loaded straight into the
+                # dot layout and old_state * scale would contract into an FMA
+                # with the add; the fold path rounds it first (a layout
+                # conversion sits between them), so round it explicitly.
+                tl.store(
+                    h0
+                    + track_idx * stride_state_slot
+                    + i_hv * V * K
+                    + o_v[None, :] * K
+                    + o_k[:, None],
+                    (
+                        tl.inline_asm_elementwise(
+                            "mul.rn.f32 $0, $1, $2;",
+                            "=f,f,f",
+                            [old_state, tl.exp(track_total)],
+                            dtype=tl.float32,
+                            is_pure=True,
+                            pack=1,
+                        )
+                        + track_delta
+                    ).to(h0.dtype.element_ty),
+                    mask=mask_v[None, :],
+                )
+            else:
+                tl.store(
+                    h0
+                    + track_idx * stride_state_slot
+                    + i_hv * V * K
+                    + o_v[None, :] * K
+                    + o_k[:, None],
+                    (old_state * tl.exp(track_total) + track_delta).to(h0.dtype.element_ty),
+                    mask=mask_v[None, :],
+                )
 
 
 @triton.jit
@@ -1107,6 +1282,7 @@ def _launch_gdn_spec(
     bs_min,
     null_block_id,
     dot_precision,
+    fold_pending=False,
 ):
     num_slots, HV, V, K = checkpoint_state.shape
     H = k.shape[1]
@@ -1114,6 +1290,17 @@ def _launch_gdn_spec(
     assert max_cache_len & (max_cache_len - 1) == 0, (
         "circular cache requires power-of-two max_cache_len"
     )
+    if fold_pending:
+        # h20 folds in the non-flush launch, from compact 16-bit records, over
+        # the commit's MAX_CACHE_LEN rows (BC below must equal it)
+        if is_flush_kernel:
+            raise ValueError("fold_pending is a verify-launch mode, not a flush one")
+        if checkpoint_state.dtype == torch.float32:
+            raise ValueError("fold_pending needs a 16-bit checkpoint (fold every commit)")
+        if rawv_cache is None or rawk_cache is None or beta_cache is not None:
+            raise ValueError("fold_pending needs the compact D/K low-part rings")
+        if max_cache_len < 16:
+            raise ValueError(f"fold_pending needs max_cache_len >= 16, got {max_cache_len}")
     assert d_cache.shape[2] == max_cache_len
 
     BK = triton.next_power_of_2(K)
@@ -1197,6 +1384,9 @@ def _launch_gdn_spec(
         IS_FLUSH=is_flush_kernel,
         NULL_BLOCK_ID=null_block_id,
         DOT_PRECISION=dot_precision,
+        FOLD_PENDING=fold_pending,
+        FOLD_BK=_FOLD_BK,
+        FOLD_UNROLL=_FOLD_UNROLL,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -1319,6 +1509,10 @@ def gdn_replayssm_spec_decode(
         scale = checkpoint_state.shape[-1] ** -0.5
     if is_flush.dtype != torch.int8:
         is_flush = is_flush.to(torch.int8)
+    if _ARC_GDN_FOLD_IN_VERIFY and launch_mode != "verify":
+        raise ValueError(
+            f"ARC_GDN_FOLD_IN_VERIFY=1 folds in the verify launch; launch_mode={launch_mode!r}"
+        )
 
     if launch_mode in ("both", "flush"):
         if rawv_cache is None or rawk_cache is None or beta_cache is None:
@@ -1376,6 +1570,7 @@ def gdn_replayssm_spec_decode(
             bs_min,
             null_block_id,
             dot_precision,
+            fold_pending=_ARC_GDN_FOLD_IN_VERIFY,
         )
     if launch_mode in ("both", "flush"):
         _launch_gdn_spec(
@@ -1475,7 +1670,12 @@ def commit_gdn_replayssm_circular(
     rows update their active checkpoint and reset the ring; track rows snapshot
     the exact state at the requested accepted step without disturbing the active
     checkpoint.
+
+    With ARC_GDN_FOLD_IN_VERIFY=1 (h20) only track rows are written and the
+    cursors keep the advance's values: the next verify folds the window.
     """
+    if _ARC_GDN_FOLD_IN_VERIFY and checkpoint_state.dtype == torch.float32:
+        raise ValueError("ARC_GDN_FOLD_IN_VERIFY=1 needs a 16-bit checkpoint (fold every commit)")
     launch_gdn_replayssm_compact_commit(
         checkpoint_state=checkpoint_state,
         d_cache=d_cache,
@@ -1493,7 +1693,10 @@ def commit_gdn_replayssm_circular(
         mamba_steps_to_track=mamba_steps_to_track,
         null_block_id=null_block_id,
         live_rows=_ARC_GDN_COMMIT_LIVE_ROWS,
+        fold_in_verify=_ARC_GDN_FOLD_IN_VERIFY,
     )
+    if _ARC_GDN_FOLD_IN_VERIFY:
+        return
     max_cache_len = d_cache.shape[-2]
     B = state_batch_indices.shape[0]
     block = triton.next_power_of_2(max(1, B))
@@ -1530,9 +1733,11 @@ def launch_gdn_replayssm_compact_commit(
     mamba_steps_to_track: torch.Tensor | None,
     null_block_id: int,
     live_rows: bool,
+    fold_in_verify: bool = False,
 ) -> None:
     """The compact commit kernel alone (no cursor finish): reads the cursors,
-    writes the checkpoint and track slots. ``live_rows`` is patch 0030's switch."""
+    writes the checkpoint and track slots. ``live_rows`` is patch 0030's switch;
+    ``fold_in_verify`` (h20) writes the track slots only."""
     num_layers, _, HV, V, K = checkpoint_state.shape
     H = k_cache.shape[2]
     max_cache_len = d_cache.shape[-2]
@@ -1542,6 +1747,8 @@ def launch_gdn_replayssm_compact_commit(
     k_residual_buf = k_residual_cache if has_residual else k_cache
     BV = min(triton.next_power_of_2(V), 64)
     has_track = mamba_track_indices is not None and mamba_steps_to_track is not None
+    if fold_in_verify and not has_track:
+        return
     if has_track:
         track_indices = mamba_track_indices
         track_steps = mamba_steps_to_track
@@ -1595,6 +1802,7 @@ def launch_gdn_replayssm_compact_commit(
         HAS_TRACK=has_track,
         HAS_RESIDUAL=has_residual,
         LIVE_ROWS=live_rows,
+        FOLD_IN_VERIFY=fold_in_verify,
         num_warps=4,
         num_stages=2,
     )

@@ -436,6 +436,29 @@ def handle_linear_attn_backend(server_args: Any):
                 cfg.mamba_ssm_dtype,
             )
 
+    # arc-forge h20: the next verify folds the accepted window (ARC_GDN_FOLD_IN_VERIFY,
+    # gdn_replayssm_spec_decode.py). Between a commit and that verify the live
+    # checkpoint lags by the window, so only a server where nothing else reads it may
+    # turn it on: QSA HiSparse with its session cache (a snapshot comes from the
+    # commit's track rows, a restore goes into a fresh request row) -- not the mamba
+    # radix cache, whose donate path resets the cursors of a running request.
+    fold_in_verify = os.environ.get("ARC_GDN_FOLD_IN_VERIFY", "0")
+    if fold_in_verify not in ("0", "1"):
+        raise ValueError(f"ARC_GDN_FOLD_IN_VERIFY must be 0 or 1, got {fold_in_verify!r}")
+    if fold_in_verify == "1":
+        need = {
+            "--enable-linear-replayssm-spec": bool(cfg.enable_linear_replayssm_spec),
+            "--mamba-ssm-dtype float16 or bfloat16 (fold every commit)": cfg.mamba_ssm_dtype
+            in ("float16", "bfloat16"),
+            "--enable-hisparse": bool(cfg.enable_hisparse),
+            "--radix-cache-backend qsa_hisparse_session": cfg.radix_cache_backend
+            == "qsa_hisparse_session",
+            "--disable-radix-cache": bool(cfg.disable_radix_cache),
+        }
+        missing = [what for what, ok in need.items() if not ok]
+        if missing:
+            raise ValueError("ARC_GDN_FOLD_IN_VERIFY=1 requires: " + "; ".join(missing))
+
 
 def handle_multi_item_scoring(server_args: Any):
     """Setup and validate multi-item scoring constraints.
