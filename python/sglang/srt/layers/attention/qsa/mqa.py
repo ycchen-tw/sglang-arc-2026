@@ -6,6 +6,8 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.environ import envs
+
 try:
     import flashinfer.comm  # noqa: F401
 except ImportError:
@@ -362,8 +364,19 @@ def tilelang_qsa_mqa_decode(
             ],
             dim=1,
         )
+    groups_per_cta = envs.SGLANG_QSA_MQA_GROUPS_PER_CTA.get()
+    if groups_per_cta < 0:
+        raise ValueError(
+            "SGLANG_QSA_MQA_GROUPS_PER_CTA must be zero (auto) or positive"
+        )
+    if groups_per_cta == 0:
+        rows = q.shape[0]
+        groups_per_cta = 1 if rows <= 8 else 2 if rows <= 24 else 4
     _tilelang_qsa_mqa_decode_kernel(
-        heads=kernel_heads, head_dim=head_dim, page_size=page_size
+        heads=kernel_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        groups_per_cta=groups_per_cta,
     )(
         q_kernel.unsqueeze(1).contiguous(),
         k_cache.to(torch.bfloat16).contiguous(),
