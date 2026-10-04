@@ -882,6 +882,8 @@ class MambaAttnBackendBase(AttentionBackend):
         then, so the result is identical."""
         if forward_batch.mamba_track_mask is None:
             return
+        if ssm_states.dtype == torch.uint8:
+            raise RuntimeError("arc-forge h24: decode-side track of a packed GDN state is not supported")
         if layer_id is not None:
             pools = self._track_pools()
             if pools is not None:
@@ -927,27 +929,34 @@ class MambaAttnBackendBase(AttentionBackend):
         stream once per layer); otherwise they fall back to the per-chunk
         states ``h`` (already rounded to the activation dtype)."""
         if forward_metadata.has_mamba_track_mask:
+            # arc-forge h24: a packed GDN state stores float states through its quantizer (one kernel:
+            # gather rows src, quantize, scatter to dst); otherwise the lines as they were
+            def store(dst, states, src=None):
+                if ssm_states.dtype != torch.uint8:
+                    ssm_states[dst] = (states if src is None else states[src]).to(ssm_states.dtype, copy=False)
+                    return
+                from sglang.srt.layers.attention.linear import gdn_state_fmt
+
+                fmt = gdn_state_fmt.current()
+                if fmt is None:
+                    raise RuntimeError("a uint8 GDN state without ARC_GDN_STATE_FMT")
+                gdn_state_fmt.quantize_scatter(states, ssm_states, dst, fmt, src)
+
             # Triton always returns h; FlashInfer returns it only when checkpoints
             # were requested. Aligned-only tracking reads the final state below.
             if forward_metadata.track_ssm_h_src.numel() > 0:
                 if h_track_buf is not None:
-                    ssm_states[forward_metadata.track_ssm_h_dst] = h_track_buf[
-                        forward_metadata.track_ssm_h_batch_src
-                    ].to(ssm_states.dtype, copy=False)
+                    store(forward_metadata.track_ssm_h_dst, h_track_buf, forward_metadata.track_ssm_h_batch_src)
                 else:
                     assert h is not None
                     h = h.squeeze(0)
-                    ssm_states[forward_metadata.track_ssm_h_dst] = h[
-                        forward_metadata.track_ssm_h_src
-                    ].to(ssm_states.dtype, copy=False)
+                    store(forward_metadata.track_ssm_h_dst, h, forward_metadata.track_ssm_h_src)
             if (
                 forward_metadata.track_ssm_recompute_dst is not None
                 and forward_metadata.track_ssm_recompute_dst.numel() > 0
             ):
                 assert track_states is not None
-                ssm_states[forward_metadata.track_ssm_recompute_dst] = (
-                    track_states.squeeze(0).to(ssm_states.dtype, copy=False)
-                )
+                store(forward_metadata.track_ssm_recompute_dst, track_states.squeeze(0))
             if forward_metadata.track_ssm_final_src.numel() > 0:
                 ssm_states[forward_metadata.track_ssm_final_dst] = ssm_states[
                     forward_metadata.track_ssm_final_src

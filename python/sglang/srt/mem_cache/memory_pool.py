@@ -569,6 +569,24 @@ class MambaPool:
             maybe_init_custom_mem_pool(device=self.device)
         )
 
+        # arc-forge h24: the packed GDN state (ARC_GDN_STATE_FMT): temporal becomes one byte
+        # tensor [layers, slots, HV, NB]; slot copies, clears and host copies move its bytes as-is
+        from sglang.srt.layers.attention.linear import gdn_state_fmt
+
+        self.gdn_state_fmt = gdn_state_fmt.current()
+        if self.gdn_state_fmt is not None:
+            bad = {
+                "envelope (page-major) layout": envelope_layout,
+                "KDA": cache_params.is_kda,
+                "no --enable-linear-replayssm-spec": not enable_linear_replayssm_spec,
+                "the decode ring (--enable-linear-replayssm)": enable_linear_replayssm,
+                f"--mamba-ssm-dtype {ssm_dtype} (float16 only)": ssm_dtype != torch.float16,
+                "a non-CUDA device": not torch.cuda.is_available() or _is_npu or _is_cpu,
+            }
+            refused = [what for what, on in bad.items() if on]
+            if refused:
+                raise ValueError(f"{gdn_state_fmt.ENV}={self.gdn_state_fmt.name} refuses: " + "; ".join(refused))
+
         with (
             self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE),
             (
@@ -633,11 +651,21 @@ class MambaPool:
                     # CPU uses a different layout of conv_state for kernel optimization
                     conv_state = _init_amx_conv_state(conv_state)
 
-                temporal_state = torch.zeros(
-                    size=(num_mamba_layers, size + 1) + temporal_state_shape,
-                    dtype=ssm_dtype,
-                    device=device,
-                )
+                if self.gdn_state_fmt is not None:
+                    hv, v_dim, k_dim = temporal_state_shape
+                    temporal_state = torch.zeros(
+                        size=(num_mamba_layers, size + 1, hv,
+                              self.gdn_state_fmt.head_bytes(v_dim, k_dim)),
+                        dtype=torch.uint8,
+                        device=device,
+                    )
+                    gdn_state_fmt.prepare(device)
+                else:
+                    temporal_state = torch.zeros(
+                        size=(num_mamba_layers, size + 1) + temporal_state_shape,
+                        dtype=ssm_dtype,
+                        device=device,
+                    )
 
             # GDN ReplaySSM ring buffers (slice 1a). Allocated only when the
             # flag is on; otherwise left as None so the legacy State is

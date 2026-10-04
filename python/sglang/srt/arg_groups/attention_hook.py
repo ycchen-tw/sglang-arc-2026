@@ -458,6 +458,10 @@ def handle_linear_attn_backend(server_args: Any):
         missing = [what for what, ok in need.items() if not ok]
         if missing:
             raise ValueError("ARC_GDN_FOLD_IN_VERIFY=1 requires: " + "; ".join(missing))
+    # arc-forge h24: the packed GDN state (ARC_GDN_STATE_FMT) runs on h20's path only
+    from sglang.srt.layers.attention.linear import gdn_state_fmt
+
+    gdn_state_fmt.check_server_args(cfg)
 
 
 def handle_multi_item_scoring(server_args: Any):

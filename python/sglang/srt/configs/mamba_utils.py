@@ -119,10 +119,17 @@ class BaseLinearStateParams(ABC):
         )
 
         ssm_numel = int(np.prod(self.shape.temporal))
-        return (
-            conv_numel * self.dtype.conv.itemsize
-            + ssm_numel * self.dtype.temporal.itemsize
-        ) * len(self.layers)
+        ssm_bytes = ssm_numel * self.dtype.temporal.itemsize
+        # arc-forge h24: the packed GDN state (gdn_state_fmt) sizes the pool by its bytes
+        from sglang.srt.layers.attention.linear import gdn_state_fmt
+
+        fmt = gdn_state_fmt.current()
+        if fmt is not None:
+            if self.is_kda:
+                raise ValueError(f"{gdn_state_fmt.ENV}: KDA state is not supported")
+            hv, v_dim, k_dim = self.shape.temporal
+            ssm_bytes = hv * fmt.head_bytes(v_dim, k_dim)
+        return (conv_numel * self.dtype.conv.itemsize + ssm_bytes) * len(self.layers)
 
     def replayssm_ring_bytes_per_req(self, record_len: int) -> int:
         """ReplaySSM spec-verify scratch bytes across all layers.

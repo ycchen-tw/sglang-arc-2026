@@ -12,6 +12,7 @@ from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
+from sglang.srt.layers.attention.linear import gdn_state_fmt  # arc-forge h24
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnBackends,
     LinearAttnKernelBackend,
@@ -577,6 +578,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
+        if ssm_states.dtype == torch.uint8:
+            raise RuntimeError(
+                "arc-forge h24: a packed GDN state reached the non-speculative decode path; "
+                "ARC_GDN_STATE_FMT runs on the ReplaySSM spec verify only"
+            )
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
         # GDN ReplaySSM (slice 1a): per-layer ring slices + the once-per-forward
@@ -831,7 +837,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
+        # arc-forge h24: packed GDN state (gdn_state_fmt); None keeps every line below as it was
+        state_fmt = gdn_state_fmt.current() if ssm_states.dtype == torch.uint8 else None
+        if ssm_states.dtype == torch.uint8 and state_fmt is None:
+            raise RuntimeError("a uint8 GDN state without ARC_GDN_STATE_FMT")
         if self.mis_metadata is not None:
+            if state_fmt is not None:
+                raise RuntimeError("arc-forge h24: GDN MIS is not supported on a packed state")
             if is_target_verify:
                 raise ValueError("GDN MIS does not support target verify")
             return self._forward_extend_mis(
@@ -869,6 +881,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
             and (not is_cpu())
             and (not conv_states.is_contiguous() or not ssm_states.is_contiguous())
         )
+        if state_fmt is not None and not is_target_verify and needs_state_gather:
+            raise RuntimeError("arc-forge h24: a packed GDN state needs the contiguous (non-envelope) pool")
         if needs_state_gather:
             conv_states_contig = conv_states[cache_indices].contiguous()
             ssm_states_contig = ssm_states[cache_indices].contiguous()
@@ -881,6 +895,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
             conv_states_contig = conv_states
             ssm_states_contig = ssm_states
             state_cache_indices = cache_indices
+        ssm_cache_indices = state_cache_indices
+        if state_fmt is not None and not is_target_verify:
+            # prefill: the chunk kernel runs on an fp16 working copy of this batch's states
+            # (dequantized in, requantized out below, one kernel each); the copy is small
+            ssm_states_contig = gdn_state_fmt.gather_dequant(
+                ssm_states, cache_indices, state_fmt, layer.head_v_dim, layer.head_k_dim
+            )
+            ssm_cache_indices = torch.arange(
+                cache_indices.shape[0], device=cache_indices.device, dtype=cache_indices.dtype
+            )
 
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
@@ -961,6 +985,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 and getattr(mamba_pool, "replayssm_cache_base", None) is not None
                 and not getattr(mamba_pool, "replayssm_is_kda", False)
             )
+            if state_fmt is not None and not use_replayssm_spec:
+                raise RuntimeError(
+                    "arc-forge h24: a packed GDN state verifies with the circular ReplaySSM ring only"
+                )
             if use_replayssm_fold:
                 core_attn_out = self._replayssm_fold_target_verify(
                     layer=layer,
@@ -1018,6 +1046,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            if state_fmt is not None:
+                value = gdn_state_fmt.rotate_v(value)  # into the state's value basis
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
@@ -1025,7 +1055,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 g=g,
                 beta=beta,
                 ssm_states=ssm_states_contig,
-                cache_indices=state_cache_indices,
+                cache_indices=ssm_cache_indices,
                 query_start_loc=query_start_loc,
                 state_checkpoint_cu_starts=(
                     forward_metadata.state_checkpoint_cu_starts
@@ -1048,6 +1078,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 # strided envelope pool (advanced indexing handles the strides).
                 conv_states[cache_indices] = conv_states_contig
                 ssm_states[cache_indices] = ssm_states_contig
+            if state_fmt is not None:
+                gdn_state_fmt.quantize_scatter(ssm_states_contig, ssm_states, cache_indices, state_fmt)
+                gdn_state_fmt.rotate_v(core_attn_out, out=core_attn_out)  # back from the state basis
 
             if forward_metadata.has_mamba_track_mask:
                 self._track_mamba_state_extend(
@@ -1315,6 +1348,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         v = value.reshape(seq_len, HV, V)
         a = a.reshape(seq_len, HV)
         b = b.reshape(seq_len, HV)
+        packed_state = layer_cache.temporal.dtype == torch.uint8  # arc-forge h24
+        if packed_state:
+            v = gdn_state_fmt.rotate_v(v)  # into the state's value basis
         d_cache = layer_cache.replayssm_d  # [slots, HV, L, V]
         max_cache_len = d_cache.shape[-2]  # ring length L
         out = q.new_empty(seq_len, HV, V)
@@ -1356,5 +1392,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # acceptance; the active path is therefore a single launch/layer.
             launch_mode="verify",
         )
+        if packed_state:
+            gdn_state_fmt.rotate_v(out, out=out)  # back from the state basis
         # Match the recurrent target_verify output shape (== value.shape).
         return out.reshape(value.shape)

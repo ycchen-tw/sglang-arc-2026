@@ -1505,6 +1505,29 @@ def gdn_replayssm_spec_decode(
     The circular history and cursors are request-keyed by ``replay_indices``;
     the checkpoint remains keyed by physical ``ssm_state_indices``.
     """
+    if checkpoint_state.dtype == torch.uint8:
+        # arc-forge h24: a packed state runs h20's single verify launch on the packed kernel
+        from sglang.kernels.ops.attention.fla.gdn_state_fmt_kernels import launch_spec_verify_packed
+        from sglang.srt.layers.attention.linear import gdn_state_fmt
+
+        fmt = gdn_state_fmt.current()
+        if fmt is None or launch_mode != "verify" or not _ARC_GDN_FOLD_IN_VERIFY:
+            raise ValueError(
+                "a packed GDN checkpoint needs ARC_GDN_STATE_FMT, ARC_GDN_FOLD_IN_VERIFY=1 and the "
+                f"verify launch (got fmt={fmt}, launch_mode={launch_mode!r})"
+            )
+        if is_flush.dtype != torch.int8:
+            is_flush = is_flush.to(torch.int8)
+        launch_spec_verify_packed(
+            fmt=fmt, q=q, k=k, v=v, a=a, b=b, A_log=A_log, dt_bias=dt_bias, out=out, state=checkpoint_state,
+            d_cache=d_cache, k_cache=k_cache, g_cache=g_cache, rawv_cache=rawv_cache, rawk_cache=rawk_cache,
+            query_start_loc=query_start_loc, ssm_state_indices=ssm_state_indices, replay_indices=replay_indices,
+            write_pos=write_pos, cache_base=cache_base, is_flush=is_flush,
+            scale=scale if scale is not None else k.shape[-1] ** -0.5, max_cache_len=max_cache_len,
+            max_spec_len=max_spec_len, null_block_id=null_block_id, fold_bk=_FOLD_BK, block_v=block_v,
+            num_warps=num_warps, num_stages=num_stages, bs_min=bs_min,
+        )
+        return out
     if scale is None:
         scale = checkpoint_state.shape[-1] ** -0.5
     if is_flush.dtype != torch.int8:
@@ -1738,6 +1761,25 @@ def launch_gdn_replayssm_compact_commit(
     """The compact commit kernel alone (no cursor finish): reads the cursors,
     writes the checkpoint and track slots. ``live_rows`` is patch 0030's switch;
     ``fold_in_verify`` (h20) writes the track slots only."""
+    if checkpoint_state.dtype == torch.uint8:
+        # arc-forge h24: the packed state commits h20's track rows only
+        from sglang.kernels.ops.attention.fla.gdn_state_fmt_kernels import launch_track_packed
+        from sglang.srt.layers.attention.linear import gdn_state_fmt
+
+        fmt = gdn_state_fmt.current()
+        if fmt is None or not fold_in_verify:
+            raise ValueError("a packed GDN checkpoint commits under ARC_GDN_STATE_FMT with h20's fold-in-verify")
+        if mamba_track_indices is None or mamba_steps_to_track is None:
+            return
+        launch_track_packed(
+            fmt=fmt, state=checkpoint_state, d_cache=d_cache, k_cache=k_cache, g_cache=g_cache,
+            d_residual_cache=d_residual_cache, k_residual_cache=k_residual_cache,
+            state_batch_indices=state_batch_indices, replay_indices=replay_indices, write_pos=write_pos,
+            cache_base=cache_base, accept_lens=accept_lens, mamba_track_indices=mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track, null_block_id=null_block_id,
+            v_dim=d_cache.shape[-1], k_dim=k_cache.shape[-1],
+        )
+        return
     num_layers, _, HV, V, K = checkpoint_state.shape
     H = k_cache.shape[2]
     max_cache_len = d_cache.shape[-2]
