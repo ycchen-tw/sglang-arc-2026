@@ -35,6 +35,7 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_kv_extraction_compact_triton,
     qwen_sparse_nvfp4_expand_triton,
     qwen_sparse_gqa_decode_selected_triton,
+    qwen_sparse_gqa_decode_selected_fp4_triton,
     qwen_sparse_valid_counts_triton,
     sparse_gqa_fwd_interface_triton,
     sparse_gqa_fwd_interface_triton_ck,
@@ -49,6 +50,7 @@ from sglang.srt.environ import envs
 _TRTLLM_SPARSE_PAGE_SIZE = 64
 _QSA_DIRECT_DECODE = envs.SGLANG_QSA_DIRECT_DECODE.get()
 _QSA_DIRECT_MIN_ROWS = envs.SGLANG_QSA_DIRECT_MIN_ROWS.get()
+_ARC_QSA_FP4_FUSED = os.environ.get("ARC_QSA_FP4_FUSED", "1") == "1"
 # NVFP4 target KV under QSA: the pool stays packed FP4 (E2M1 + block-16 E4M3
 # scales); decode gathers the selection as bytes and XQA reads FP4 through
 # kv_cache_sf, prefix prefill expands only the request's context transiently.
@@ -1842,6 +1844,34 @@ class QwenSparseAttnBackend(AttentionBackend):
                 q, layer, forward_batch, metadata,
                 topk_indices.to(torch.int32).contiguous(),
             )
+        if (
+            _ARC_QSA_FP4_FUSED
+            and _QSA_DIRECT_DECODE
+            and q.is_cuda
+            and q.shape[0] >= _QSA_DIRECT_MIN_ROWS
+            and getattr(getattr(pool, "full_kv_pool", pool), "k_scale_buffer", None)
+            is not None
+        ):
+            # Take the packed plane before get_key_buffer(), which on a quantized
+            # pool dequantizes the whole layer buffer on every call.
+            metadata = self._resolve_metadata(forward_batch)
+            k_fp4, v_fp4, k_sf, v_sf = pool.get_raw_kv_buffer(layer.layer_id)
+            method = getattr(getattr(pool, "full_kv_pool", pool), "quant_method", None)
+            getter = getattr(method, "get_bmm_scales", None)
+            k_global, v_global = getter(layer.layer_id) if getter else (1.0, 1.0)
+            req_indices = (
+                metadata.row_req_pool_indices
+                if metadata.row_req_pool_indices is not None
+                else forward_batch.req_pool_indices
+            )
+            output = qwen_sparse_gqa_decode_selected_fp4_triton(
+                q.contiguous(), k_fp4, v_fp4, k_sf, v_sf,
+                self.req_to_token_pool.req_to_token, req_indices,
+                topk_indices.to(torch.int32).contiguous(),
+                metadata.sequence_lengths, layer.scaling,
+                float(k_global), float(v_global),
+            )
+            return output.reshape(q.shape[0], -1)
         k_buffer = pool.get_key_buffer(layer.layer_id)
         v_buffer = pool.get_value_buffer(layer.layer_id)
         if _QSA_DIRECT_DECODE and q.is_cuda and q.shape[0] >= _QSA_DIRECT_MIN_ROWS:

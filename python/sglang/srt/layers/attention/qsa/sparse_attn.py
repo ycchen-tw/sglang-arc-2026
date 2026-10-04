@@ -871,6 +871,153 @@ def qwen_sparse_gqa_decode_selected_triton(
     return out
 
 
+
+@triton.jit
+def _sparse_gqa_decode_selected_fp4(
+    q_even, q_odd, k, v, k_sf, v_sf, req_to_token, req_indices, indices, seq_lens, out,
+    topk: tl.constexpr, req_stride: tl.constexpr,
+    GROUP_SIZE: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    Q_HEADS: tl.constexpr, HEADS: tl.constexpr, PACK: tl.constexpr, SF: tl.constexpr,
+):
+    row, kv_head = tl.program_id(0), tl.program_id(1)
+    length = tl.load(seq_lens + row)
+    req = tl.load(req_indices + row)
+    offs_h = tl.arange(0, BLOCK_M)
+    offs_p = tl.arange(0, PACK)
+    hmask = (offs_h < GROUP_SIZE)[:, None]
+    head_start = kv_head * GROUP_SIZE
+    qe = tl.load(q_even + row * (Q_HEADS * PACK) + (head_start + offs_h[:, None]) * PACK
+                 + offs_p[None, :], mask=hmask, other=0.0)
+    qo = tl.load(q_odd + row * (Q_HEADS * PACK) + (head_start + offs_h[:, None]) * PACK
+                 + offs_p[None, :], mask=hmask, other=0.0)
+
+    max_value = tl.full([BLOCK_M], -float("inf"), tl.float32)
+    normalizer = tl.zeros([BLOCK_M], tl.float32)
+    acc_even = tl.zeros([BLOCK_M, PACK], tl.float32)
+    acc_odd = tl.zeros([BLOCK_M, PACK], tl.float32)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_s = tl.arange(0, SF)                  # 1 scale per 16 features == per 8 bytes
+
+    for start in range(0, topk, BLOCK_N):
+        cur = start + offs_n
+        pos = tl.load(indices + row * topk + cur, mask=cur < topk, other=-1)
+        valid = (cur < topk) & (pos >= 0) & (pos < length)
+        tok = tl.load(req_to_token + req * req_stride + tl.where(valid, pos, 0),
+                      mask=valid, other=0).to(tl.int64)
+
+        # K as [PACK, BLOCK_N] so it feeds tl.dot(q[BLOCK_M, PACK], k[PACK, BLOCK_N]).
+        k_src = tok[None, :] * (HEADS * PACK) + kv_head * PACK + offs_p[:, None]
+        k_ss = tok[None, :] * (HEADS * SF) + kv_head * SF + offs_s[:, None]
+        kb = tl.load(k + k_src, mask=valid[None, :], other=0)
+        kstep = tl.load(k_sf + k_ss, mask=valid[None, :], other=0.0).to(tl.float32)
+        kstep = tl.reshape(tl.broadcast_to(tl.reshape(kstep, (SF, 1, BLOCK_N)),
+                                           (SF, 8, BLOCK_N)), (PACK, BLOCK_N))
+        k_low = (_nvfp4_decode_nibble(kb, 0) * kstep).to(qe.dtype)
+        k_high = (_nvfp4_decode_nibble(kb, 1) * kstep).to(qe.dtype)
+
+        scores = tl.dot(qe, k_low) + tl.dot(qo, k_high)
+        scores = tl.where(valid[None, :], scores, -float("inf"))
+        next_max = tl.maximum(max_value, tl.max(scores, 1))
+        alpha = tl.math.exp2(max_value - next_max)
+        probs = tl.math.exp2(scores - next_max[:, None])
+
+        v_src = tok[:, None] * (HEADS * PACK) + kv_head * PACK + offs_p[None, :]
+        v_ss = tok[:, None] * (HEADS * SF) + kv_head * SF + offs_s[None, :]
+        vb = tl.load(v + v_src, mask=valid[:, None], other=0)
+        vstep = tl.load(v_sf + v_ss, mask=valid[:, None], other=0.0).to(tl.float32)
+        vstep = tl.reshape(tl.broadcast_to(tl.reshape(vstep, (BLOCK_N, SF, 1)),
+                                           (BLOCK_N, SF, 8)), (BLOCK_N, PACK))
+        p = probs.to(qe.dtype)
+        acc_even = tl.dot(p, (_nvfp4_decode_nibble(vb, 0) * vstep).to(qe.dtype),
+                          acc_even * alpha[:, None])
+        acc_odd = tl.dot(p, (_nvfp4_decode_nibble(vb, 1) * vstep).to(qe.dtype),
+                         acc_odd * alpha[:, None])
+        normalizer = normalizer * alpha + tl.sum(probs, 1)
+        max_value = next_max
+
+    acc_even = acc_even / normalizer[:, None]
+    acc_odd = acc_odd / normalizer[:, None]
+    base = out + row * (Q_HEADS * 2 * PACK) + (head_start + offs_h[:, None]) * (2 * PACK)
+    tl.store(base + 2 * offs_p[None, :], acc_even, mask=hmask)
+    tl.store(base + 2 * offs_p[None, :] + 1, acc_odd, mask=hmask)
+
+
+def qwen_sparse_gqa_decode_selected_fp4_triton(
+    q, k, v, k_sf, v_sf, req_to_token, req_indices, indices, seq_lens, scale,
+    k_global=1.0, v_global=1.0, block_n=None, stages=None, warps=None,
+):
+    """Sparse GQA decode straight off the packed FP4 pool.
+
+    The sm_100/sm_120 path hands these planes to trtllm-gen/XQA. Ada has no such
+    kernel, and the pool's fallback dequantizes the entire layer buffer on every
+    read; this does the unpack inline instead. Tile config is the measured
+    optimum on sm_89 (BLOCK_N=128, 2 stages, 16 warps). A 16-entry LUT gather, a
+    bf16 decode chain and a tl.join-merged V dot were each tried and each came out
+    slower, so the arithmetic decode stays.
+    """
+    rows, q_heads, dim = q.shape
+    kv_heads, pack = k.shape[1], k.shape[2]
+    if pack * 2 != dim:
+        raise ValueError(f"packed width {pack} does not match head_dim {dim}")
+    group = q_heads // kv_heads
+    scaled = (q.float() * scale * 1.4426950408 * k_global).to(torch.bfloat16)
+    q_even = scaled[..., 0::2].contiguous()
+    q_odd = scaled[..., 1::2].contiguous()
+    out = torch.empty(rows, q_heads, dim, device=q.device, dtype=torch.float32)
+    if rows == 0:
+        return out.to(q.dtype)
+    _sparse_gqa_decode_selected_fp4[(rows, kv_heads)](
+        q_even, q_odd, k, v, k_sf, v_sf, req_to_token, req_indices, indices,
+        seq_lens, out,
+        topk=indices.shape[1], req_stride=req_to_token.stride(0),
+        GROUP_SIZE=group, BLOCK_M=max(16, triton.next_power_of_2(group)),
+        BLOCK_N=128 if block_n is None else block_n,
+        Q_HEADS=q_heads, HEADS=kv_heads, PACK=pack, SF=dim // 16,
+        num_warps=16 if warps is None else warps,
+        num_stages=2 if stages is None else stages,
+    )
+    return (out * v_global).to(q.dtype)
+
+
+@triton.jit
+def _qsa_nvfp4_expand_kv(
+    k_fp4, v_fp4, k_sf, v_sf, req_to_token, req_indices, cu_k, out_k, out_v,
+    k_global, v_global,
+    heads: tl.constexpr, dim: tl.constexpr, req_stride: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+):
+    """Gather one request's packed FP4 context and write it out dequantized.
+
+    Replaces index_select -> dequantize -> torch.cat: the packed bytes and their
+    block scales are read once and the result lands directly at the request's
+    cu_k offset, so no packed-to-dense copy of the whole layer buffer exists.
+    """
+    PACK: tl.constexpr = dim // 2
+    SF: tl.constexpr = dim // 16
+    pid_b, pid_h, pid_t = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    start = tl.load(cu_k + pid_b).to(tl.int64)
+    length = tl.load(cu_k + pid_b + 1).to(tl.int64) - start
+    tokens = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
+    live = tokens < length
+    req = tl.load(req_indices + pid_b).to(tl.int64)
+    slots = tl.load(req_to_token + req * req_stride + tokens, mask=live, other=0).to(tl.int64)
+
+    pack = tl.arange(0, PACK)
+    packed_src = slots[:, None] * (heads * PACK) + pid_h * PACK + pack[None, :]
+    scale_src = slots[:, None] * (heads * SF) + pid_h * SF + (pack // 8)[None, :]
+    mask = live[:, None]
+    kb = tl.load(k_fp4 + packed_src, mask=mask, other=0)
+    vb = tl.load(v_fp4 + packed_src, mask=mask, other=0)
+    k_step = tl.load(k_sf + scale_src, mask=mask, other=0.0).to(tl.float32) * tl.load(k_global)
+    v_step = tl.load(v_sf + scale_src, mask=mask, other=0.0).to(tl.float32) * tl.load(v_global)
+    dst = (start + tokens)[:, None] * (heads * dim) + pid_h * dim + 2 * pack[None, :]
+
+    tl.store(out_k + dst, (_nvfp4_decode_nibble(kb, 0) * k_step).to(tl.bfloat16), mask=mask)
+    tl.store(out_k + dst + 1, (_nvfp4_decode_nibble(kb, 1) * k_step).to(tl.bfloat16), mask=mask)
+    tl.store(out_v + dst, (_nvfp4_decode_nibble(vb, 0) * v_step).to(tl.bfloat16), mask=mask)
+    tl.store(out_v + dst + 1, (_nvfp4_decode_nibble(vb, 1) * v_step).to(tl.bfloat16), mask=mask)
+
+
 __all__ = [
     "qwen_sparse_fa2_cu_seqlens_triton",
     "qwen_sparse_valid_counts_triton",
@@ -879,4 +1026,5 @@ __all__ = [
     "sparse_gqa_fwd_interface_triton",
     "sparse_gqa_fwd_interface_triton_ck",
     "qwen_sparse_gqa_decode_selected_triton",
+    "qwen_sparse_gqa_decode_selected_fp4_triton",
 ]
