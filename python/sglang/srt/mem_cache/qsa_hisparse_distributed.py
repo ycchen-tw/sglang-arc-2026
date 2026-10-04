@@ -72,7 +72,15 @@ def host_memory_state() -> dict:
     used = int((cgroup / "memory.current").read_text())
     cap = None if limit == "max" else int(limit)
     if cap is not None:
-        available = min(available, max(0, cap - used))
+        headroom = cap - used
+        if os.environ.get("ARC_ADMISSION_RECLAIMABLE_FILE") == "1":
+            # arc-forge (Vast only, opt-in): memory.current counts page cache. Inactive file pages are reclaimable
+            # (here: the checkpoint read at load time), so count them back; a container cannot drop_caches.
+            for line in (cgroup / "memory.stat").read_text().splitlines():
+                key, value = line.split()
+                if key == "inactive_file":
+                    headroom += int(value)
+        available = min(available, max(0, headroom))
     return dict(available_bytes=available, proc_available_bytes=proc_available,
                 cgroup_limit_bytes=cap, cgroup_current_bytes=used)
 
@@ -131,8 +139,11 @@ def distributed_spec_enabled() -> bool:
 def distributed_mtp_steps() -> int:
     """Explicit reviewed depth; default retains h29 NEXTN3/verify4."""
     value = os.environ.get("ARC_HISPARSE_MTP_STEPS", "3")
-    if value not in ("1", "3"):
-        raise ValueError("ARC_HISPARSE_MTP_STEPS must be 1 or 3")
+    # arc-forge l01: the DFlash drafter (experimental-dflash/l4) proposes K-1 = 1..7 tokens; the verify-width
+    # machinery (h16-h19: ring width, spec backup, union hot blocks) is generic in K. The native MTP keeps 1 / 3.
+    allowed = ("1", "2", "3", "4", "5", "6", "7") if os.environ.get("ARC_DFLASH_DRAFTER") else ("1", "3")
+    if value not in allowed:
+        raise ValueError(f"ARC_HISPARSE_MTP_STEPS must be one of {allowed}")
     if value == "1" and not distributed_spec_enabled():
         raise ValueError("ARC_HISPARSE_MTP_STEPS=1 requires guarded distributed spec")
     return int(value)

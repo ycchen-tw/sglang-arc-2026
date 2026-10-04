@@ -1432,6 +1432,10 @@ class QSAHiSparsePoolConfigurator(DefaultPoolConfigurator):
         slot (h19). 0, 0 without spec. Upper bounds; the draft worker checks the pool it builds against them."""
         if kvc.spec_algorithm.is_none():
             return 0, 0
+        if os.environ.get("ARC_DFLASH_DRAFTER"):
+            # arc-forge d01: the DFlash drafter holds no draft KV pool (its SWA window is per request,
+            # outside the token pool); its weights were on the GPU before this budget was measured
+            return 0, 0
         from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
         from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool, native_mtp_kv_host_enabled
 

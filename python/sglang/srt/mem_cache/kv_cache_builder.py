@@ -80,6 +80,8 @@ def get_draft_kv_pool(
     # nested draft worker or draft KV pool.
     if draft_worker.draft_worker is None:
         return None
+    if getattr(draft_worker.draft_worker, "is_dflash5", False):
+        return None  # arc-forge d01: the DFlash drafter has no draft KV pool
 
     if resolving_view(server_args).enable_multi_layer_eagle:
         draft_runner = draft_worker.draft_worker.draft_runner_list[0]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional, Sequence
 
@@ -21,6 +22,12 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.ngram_info import NgramVerifyInput
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+
+def dflash_drafter_enabled() -> bool:
+    """arc-forge d01 (l4): the DFlash drafter computes every proposal's q inside its own draft step, so the
+    relay carries no first-step q (draft extend publishes none) and h39's owned-q checks do not apply."""
+    return bool(os.environ.get("ARC_DFLASH_DRAFTER"))
 
 
 def require_real_draft_probs(probs, rows: int, *, allow_padding: bool = False, expected_ndim: int = 2):
@@ -455,7 +462,7 @@ class FutureMap:
             draft_input.bonus_tokens = bonus_tokens
             if hidden_states is not None:
                 draft_input.hidden_states = hidden_states
-            if get_spec().speculative_use_rejection_sampling:
+            if get_spec().speculative_use_rejection_sampling and not dflash_drafter_enabled():
                 owned_q = None if self.draft_probs_buf is None else self.draft_probs_buf[indices]
                 draft_input.draft_probs = require_real_draft_probs(owned_q, indices.shape[0],
                     expected_ndim=3 if get_spec().enable_multi_layer_eagle else 2)
@@ -619,7 +626,8 @@ class FutureMap:
             self.accept_tokens_buf[indices] = payload.accept_tokens
             self.accept_lens_buf[indices] = payload.accept_lens
             return
-        if get_spec().speculative_use_rejection_sampling and self.spec_algo.need_topk():
+        if (get_spec().speculative_use_rejection_sampling and self.spec_algo.need_topk()
+                and not dflash_drafter_enabled()):
             require_real_draft_probs(payload.draft_probs, indices.shape[0],
                 expected_ndim=3 if get_spec().enable_multi_layer_eagle else 2)
         self._maybe_init_forward_bufs(payload)

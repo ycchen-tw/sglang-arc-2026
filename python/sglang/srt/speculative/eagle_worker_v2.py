@@ -1,5 +1,6 @@
 import contextlib
 import gc
+import os
 import logging
 import time
 from dataclasses import replace
@@ -1321,17 +1322,38 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # Only the last PP stage runs the draft; other EAGLEWorkerV2 instances
         # return proxies so scheduler dispatch remains rank-uniform.
         self._hosts_draft = get_pp_group().is_last_rank
-        self._draft_worker = (
-            EagleDraftWorker(
-                server_args,
-                gpu_id,
-                ps,
-                nccl_port,
-                target_worker,
+        # arc-forge DFlash (experimental-dflash d01): ARC_DFLASH_DRAFTER swaps the native MTP draft worker for the
+        # MTP5-DFlash drafter (work/qwen38fn_dflash/g4/dflash_eagle.py); target, verify and HiSparse are unchanged.
+        self._dflash = bool(os.environ.get("ARC_DFLASH_DRAFTER"))
+        if self._dflash:
+            if not self._hosts_draft:
+                raise ValueError("DFlash drafter runs without pipeline parallelism")
+            import sys as _sys
+
+            _sys.path.insert(0, os.environ["ARC_DFLASH_CODE"])
+            import importlib as _importlib
+
+            # l4: ARC_DFLASH_WORKER=module:Class picks the worker (default the G4 single-GPU one)
+            _module, _cls = os.environ.get(
+                "ARC_DFLASH_WORKER", "dflash_eagle:DFlashDraftWorker"
+            ).split(":")
+            DFlashDraftWorker = getattr(_importlib.import_module(_module), _cls)
+
+            self._draft_worker = DFlashDraftWorker(
+                server_args, gpu_id, ps, nccl_port, target_worker
             )
-            if self._hosts_draft
-            else None
-        )
+        else:
+            self._draft_worker = (
+                EagleDraftWorker(
+                    server_args,
+                    gpu_id,
+                    ps,
+                    nccl_port,
+                    target_worker,
+                )
+                if self._hosts_draft
+                else None
+            )
 
         # Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None
@@ -1356,12 +1378,30 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def last_shared_read_runner(self):
         # Per the base contract: the step's last shared-buffer-reading phase is
         # draft_extend, which runs on the draft runner.
+        if self._dflash:
+            # d01: the drafter reads no shared buffer; the target verify is the last reader
+            return self._target_worker.model_runner
         return self._draft_worker.draft_runner
+
+    def _draft_tp_context(self):
+        if self._dflash:
+            return contextlib.nullcontext()
+        return self.draft_worker.draft_tp_context(self.draft_worker.draft_runner.tp_group)
+
+    def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
+        if self._dflash:
+            self._draft_worker.note_request_finished(rid)
+
+    def clear_cache_pool(self):
+        if self._dflash:
+            self._draft_worker.clear_cache_pool()
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
         # Every attn backend a spec_v2 forward touches; consumed by
         # decide_needs_cpu_seq_lens to gate the seq_lens_cpu D2H.
+        if self._dflash:
+            return (self._target_worker.model_runner.attn_backend,)
         return (
             self._target_worker.model_runner.attn_backend,
             self._draft_worker.draft_attn_backend,
@@ -1434,9 +1474,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             # Draft prefill
             with (
-                self.draft_worker.draft_tp_context(
-                    self.draft_worker.draft_runner.tp_group
-                ),
+                self._draft_tp_context(),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
                 spec_stage_span("draft_extend"),
@@ -1452,6 +1490,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 return batch_output
         else:
             self.activate_step_by_batch(batch.seq_lens.shape[0])
+            # arc-forge d02: per-phase GPU time (ARC_SPEC_PHASE_TIMING)
+            from sglang.srt.speculative.arc_phase_timing import get_timer
+
+            timer = get_timer()
+            phase = (
+                timer.start(int(batch.seq_lens.shape[0]))
+                if timer is not None and not batch.forward_mode.is_idle()
+                else None
+            )
 
             if batch.spec_info is None:
                 capture_mode = (
@@ -1459,8 +1506,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     if self.speculative_algorithm.is_standalone()
                     else CaptureHiddenMode.LAST
                 )
-                hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
-                    self.draft_worker.draft_runner
+                hidden_size, hidden_dtype = (
+                    (None, None)
+                    if self._dflash
+                    else get_draft_recurrent_hidden_state_spec(
+                        self.draft_worker.draft_runner
+                    )
                 )
                 batch.spec_info = EagleDraftInput.create_idle_input(
                     device=self.device,
@@ -1476,9 +1527,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 verify_input = self._build_trivial_verify_input(batch)
             else:
                 with (
-                    self.draft_worker.draft_tp_context(
-                        self.draft_worker.draft_runner.tp_group
-                    ),
+                    self._draft_tp_context(),
                     speculative_moe_backend_context(),
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft"),
@@ -1486,7 +1535,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
+            if phase is not None:
+                timer.mark(phase, 1)
             batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
+            if phase is not None:
+                timer.mark(phase, 2)
             # arc-forge M5 h16: the QSA HiSparse verify swap-in's overflow flag rides the
             # step result to the host; the result processor raises on it before this
             # step's tokens are sent.
@@ -1510,6 +1563,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         # to the host (on_verify_result); the draft extend sees none
                         batch_output.hisparse_track_slots = batch.mamba_track_indices
                         batch.mamba_track_indices = None
+            if phase is not None:
+                timer.mark(phase, 3)
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
@@ -1520,14 +1575,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 self._stub_skipped_draft_extend(batch, batch_output)
             else:
                 with (
-                    self.draft_worker.draft_tp_context(
-                        self.draft_worker.draft_runner.tp_group
-                    ),
+                    self._draft_tp_context(),
                     speculative_moe_backend_context(),
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft_extend"),
                 ):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
+            if phase is not None:
+                timer.mark(phase, 4)
+                timer.finish(phase)
 
             return batch_output
 
