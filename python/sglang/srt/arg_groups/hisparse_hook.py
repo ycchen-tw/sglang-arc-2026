@@ -243,8 +243,8 @@ def _qsa_session_needs(view) -> dict:
 
 
 def _qsa_spec_needs(view) -> dict:
-    """M5 h17 (design §9): the speculative shape QSA HiSparse serves. The target
-    verifies K rows per request (h16) and backs up after accept (h17) only on the
+    """M5 h17 (design §9): the speculative shape QSA HiSparse serves (K <= 8 from h19).
+    The target verifies K rows per request (h16) and backs up after accept (h17) only on the
     overlap EAGLEWorkerV2 path; the draft keeps a resident plain QSA pool priced
     per logical token (fp8_e4m3 / bfloat16 only). GDN snapshots (and so session
     resume) under spec take the ReplaySSM commit's track into staging slots the
@@ -263,8 +263,9 @@ def _qsa_spec_needs(view) -> dict:
         "--speculative-num-draft-tokens = --speculative-num-steps + 1": k is not None
         and view.speculative_num_steps is not None
         and k == view.speculative_num_steps + 1,
-        # the QSA pending ring holds one group; K = 8 comes with h19 (experimental-qsa 0018)
-        "--speculative-num-draft-tokens <= 4": k is not None and 1 <= k <= 4,
+        # h19: the QSA pending ring holds ratio + K keys (experimental-qsa 0018), the
+        # HiSparse ring W = ceil((K + 3) / 4) slots; K is sized for DFlash block 8
+        "--speculative-num-draft-tokens <= 8": k is not None and 1 <= k <= 8,
         "no --enable-multi-layer-eagle": not view.enable_multi_layer_eagle,
         "no --speculative-adaptive (it changes K at runtime)": not view.speculative_adaptive,
         "--speculative-draft-kv-cache-dtype fp8_e4m3 or bfloat16": view.speculative_draft_kv_cache_dtype

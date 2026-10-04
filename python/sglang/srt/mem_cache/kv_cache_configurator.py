@@ -1913,6 +1913,7 @@ class KVCacheConfigurator:
                 qsa_compress_ratio=qsa_profile.compress_ratio,
                 qsa_token_topk=qsa_profile.budget,
                 num_request_slots=req_to_token_pool.req_to_token.shape[0],
+                qsa_max_verify_tokens=max_speculative_num_draft_tokens() or 0,
             )
         size_args = {"size": max_total_num_tokens}
         qsa_hisparse = get_memory().enable_hisparse

@@ -62,6 +62,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         qsa_compress_ratio: int,
         qsa_token_topk: int,
         num_request_slots: int,
+        qsa_max_verify_tokens: int = 0,
         enable_memory_saver: bool = False,
         enable_kv_cache_copy: bool = False,
         start_layer: Optional[int] = None,
@@ -125,16 +126,20 @@ class QSATokenToKVPool(HybridLinearKVPool):
         # seen by the scoring kernels is one full-KV page's worth of groups.
         self.qsa_compressed_page_size = page_size // self.qsa_compress_ratio
         self.qsa_compressed_capacity = -(state_size // -self.qsa_compress_ratio)
-        # Pre-compression index-K state is a per-request ring, not a per-token cache:
-        # only the pending group's ``ratio`` members must survive a forward,
-        # addressed as ``req_pool_idx * ratio + position % ratio``.
-        # Request slot 0 is never allocated, so rows [0, ratio) are the inert dump.
+        # ARC QSA speculative ring: a verify writes its complete window before
+        # compression, so retain the preceding ratio-1 uncompressed keys too.
+        # Rejected future keys are overwritten on continuation; committed tail
+        # keys must survive without a rollback copy, including native MTP4.
+        # Request slot 0 is never allocated and owns the inert extend dump.
         if num_request_slots <= 0:
             raise ValueError(
                 f"QSA pending ring needs request slots, got {num_request_slots}"
             )
         self.qsa_num_request_slots = int(num_request_slots)
-        ring_slots = self.qsa_num_request_slots * self.qsa_compress_ratio
+        if qsa_max_verify_tokens < 0:
+            raise ValueError("QSA verify token capacity must be nonnegative")
+        self.qsa_pending_ring_size = self.qsa_compress_ratio + int(qsa_max_verify_tokens)
+        ring_slots = self.qsa_num_request_slots * self.qsa_pending_ring_size
         # These buffers participate in Mooncake PD transfer just like the base
         # KV and Mamba pools.  Keep their allocation in the same memory-saver
         # and Mooncake custom-pool regions; otherwise MNNVL cannot resolve the
@@ -242,10 +247,18 @@ class QSATokenToKVPool(HybridLinearKVPool):
         # its zero-initialized or stale contents.
         if not self.full_attention_layer_id_mapping:
             return [], [], []
+        if self.qsa_pending_ring_size != self.qsa_compress_ratio:
+            # PD prefill and decode may use different speculative widths. The
+            # existing protocol transfers request rows without remapping ring
+            # offsets; advertising either stride alone cannot make that safe.
+            raise NotImplementedError(
+                "QSA speculative pending rings currently support aggregated "
+                "serving only; PD requires negotiated ring sizes and remapping"
+            )
         tensors = [*self.qsa_key_state_buffer_pool, self.qsa_rope_position_buffer]
         return self._get_paged_state_buf_infos(
             tensors,
-            self.qsa_compress_ratio,
+            self.qsa_pending_ring_size,
         )
 
     def get_qsa_pending_state_layer_ids(self):

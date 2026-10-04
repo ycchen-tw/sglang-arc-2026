@@ -1426,8 +1426,8 @@ class QSAHiSparsePoolConfigurator(DefaultPoolConfigurator):
         (M5 h17, design §10.3): the draft worker's QSATokenToKVPool has one attention
         layer (kv_cache_configurator: full_attention_layer_ids = [0]) of
         --speculative-draft-kv-cache-dtype K/V plus its compressed index keys, over
-        logical size + page rows, and a pending ring per request slot. 0, 0 without
-        spec. Upper bounds; the draft worker checks the pool it builds against them."""
+        logical size + page rows, and a pending ring of ratio + K keys per request
+        slot (h19). 0, 0 without spec. Upper bounds; the draft worker checks the pool it builds against them."""
         if kvc.spec_algorithm.is_none():
             return 0, 0
         from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
@@ -1454,7 +1454,10 @@ class QSAHiSparsePoolConfigurator(DefaultPoolConfigurator):
         )
         page = get_schedule().page_size
         slots = get_schedule().max_running_requests + 1
-        ring = slots * profile.compress_ratio * (profile.kv_heads * profile.head_dim * 2 + 3 * 8)
+        # h19: the pending ring holds ratio + K keys per request slot (experimental-qsa 0018),
+        # as kv_cache_configurator builds it (qsa_max_verify_tokens)
+        ring_size = profile.compress_ratio + (max_speculative_num_draft_tokens() or 0)
+        ring = slots * ring_size * (profile.kv_heads * profile.head_dim * 2 + 3 * 8)
         # rows beyond L: the pool's page_size padding plus the index capacity's round-up
         return cell, cell * 2 * page + ring
 
