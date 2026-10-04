@@ -1385,7 +1385,15 @@ class OpenAIServingResponses(OpenAIServingChat):
                 and merged
                 and isinstance(merged[-1], dict)
                 and merged[-1].get("role") == "assistant"
-                and merged[-1].get("phase") == msg.get("phase")
+                # ARC_0017_MERGE_ASSISTANT_TURN: do not split a logical turn on
+                # ``phase``. Responses clients (codex) replay one assistant turn
+                # as reasoning + message(phase=commentary) + function_call items;
+                # keying the merge on ``phase`` renders them as three assistant
+                # blocks, two of them "<think>\n\n</think>\n\n" followed by
+                # <|im_end|>, and Qwen3.8 then imitates that shape: ~100
+                # reasoning tokens, "\n\n", end of turn, no tool call
+                # (2026-09-19: 16x4-turn probe 4-10/60 such turns vs 0/64 on the
+                # pre-0.5.20 line, whose merge ignored ``phase``).
             ):
                 prev = merged[-1] = dict(merged[-1])
                 # Lift mixed str/list content to list parts so non-text parts
