@@ -416,8 +416,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 cell_size = (cell_size // 2) + (
                     (n * k * effective_num_layers * 2 * kv_size) // scale_block_size
                 )
-                # FP4 prefill uses one shared FP8 dequant workspace across layers.
-                cell_size += n * k * 2 * kv_size
+                # Native packed prefill allocates no pool-sized dequant workspace.
+                if os.environ.get("ARC_FULL_NVFP4") != "1":
+                    cell_size += n * k * 2 * kv_size
             elif self.kv_cache_dtype_str == "mxfp8":
                 scale_block_size = 32
                 cell_size += (
