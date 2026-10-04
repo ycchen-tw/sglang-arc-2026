@@ -566,11 +566,8 @@ def _nvfp4_decode_nibble(byte, shift):
     nibble = (byte >> (4 * shift)) & 0x0F
     exponent = (nibble >> 1) & 0x03
     mantissa = (nibble & 0x01).to(tl.float32)
-    magnitude = tl.where(
-        exponent == 0,
-        mantissa * 0.5,
-        tl.exp2((exponent - 1).to(tl.float32)) * (1.0 + mantissa * 0.5),
-    )
+    pow2 = (1 << tl.maximum(exponent - 1, 0)).to(tl.float32)
+    magnitude = tl.where(exponent == 0, mantissa * 0.5, pow2 * (1.0 + mantissa * 0.5))
     return tl.where(((nibble >> 3) & 0x01) == 1, -magnitude, magnitude)
 
 
