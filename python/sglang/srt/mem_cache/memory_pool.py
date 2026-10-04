@@ -4094,8 +4094,9 @@ class HybridLinearKVPool(KVCache):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
-        k_scale: float = 1.0,
-        v_scale: float = 1.0,
+        # None lets the full KV pool use preloaded per-layer GPU scales.
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
         dcp_kv_mask: Optional[torch.Tensor] = None,
     ):
         # Write-location info lives in the metadata (`KVWriteLoc`). `full_loc` is the
