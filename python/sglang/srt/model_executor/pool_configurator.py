@@ -417,7 +417,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     (n * k * effective_num_layers * 2 * kv_size) // scale_block_size
                 )
                 # Native packed prefill allocates no pool-sized dequant workspace.
-                if os.environ.get("ARC_FULL_NVFP4") != "1":
+                if os.environ.get("ARC_FULL_NVFP4") != "1" and os.environ.get("ARC_QSA_NVFP4") != "1":
                     cell_size += n * k * 2 * kv_size
             elif self.kv_cache_dtype_str == "mxfp8":
                 scale_block_size = 32

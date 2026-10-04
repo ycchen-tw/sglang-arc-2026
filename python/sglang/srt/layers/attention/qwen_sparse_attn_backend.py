@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from copy import copy
 from functools import lru_cache
 from typing import Dict, Optional, Tuple
@@ -42,6 +43,34 @@ logger = logging.getLogger(__name__)
 
 
 _TRTLLM_SPARSE_PAGE_SIZE = 64
+# NVFP4 target KV under QSA: the pool stays packed FP4 (E2M1 + block-16 E4M3
+# scales); decode gathers the selection as bytes and XQA reads FP4 through
+# kv_cache_sf, prefix prefill expands only the request's context transiently.
+_ARC_QSA_NVFP4 = os.environ.get("ARC_QSA_NVFP4") == "1"
+
+
+def _pool_kv_quant_name(pool) -> Optional[str]:
+    if pool is None:
+        return None
+    method = pool.get_kv_cache_quant_method()
+    return None if method is None else method.name
+
+
+def _nvfp4_dequantize_tokens(pool, layer_id: int, slots: torch.Tensor, dtype: torch.dtype):
+    """Gather packed NVFP4 K/V rows at ``slots`` and expand them to ``dtype``."""
+    from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4KVQuantizeUtil
+
+    k_fp4, v_fp4, k_sf, v_sf = pool.get_raw_kv_buffer(layer_id)
+    method = pool.get_kv_cache_quant_method()
+    k_scale = method.k_scales_gpu[layer_id : layer_id + 1]
+    v_scale = method.v_scales_gpu[layer_id : layer_id + 1]
+    k = NVFP4KVQuantizeUtil.dequantize(
+        k_fp4.index_select(0, slots), k_sf.index_select(0, slots), k_scale, dtype=dtype
+    )
+    v = NVFP4KVQuantizeUtil.dequantize(
+        v_fp4.index_select(0, slots), v_sf.index_select(0, slots), v_scale, dtype=dtype
+    )
+    return k, v
 
 
 @lru_cache(maxsize=1)
@@ -178,6 +207,22 @@ class QwenSparseAttnBackend(AttentionBackend):
         self.runner = runner
         self.token_to_kv_pool = getattr(runner, "token_to_kv_pool", None)
         self.device = getattr(runner, "device", None)
+        self.arc_nvfp4 = _pool_kv_quant_name(self.token_to_kv_pool) == "nvfp4"
+        if self.arc_nvfp4:
+            if not _ARC_QSA_NVFP4:
+                raise RuntimeError(
+                    "NVFP4 KV pool under QSA requires ARC_QSA_NVFP4=1; the pool "
+                    "budget and prefill access were configured without it"
+                )
+            if _resolve_trtllm_sparse_decode() is None:
+                raise RuntimeError(
+                    "NVFP4 QSA decode needs the trtllm-gen path: set "
+                    "ARC_QSA_SM120_DECODE=xqa"
+                )
+            logger.info(
+                "ARC_QSA_NVFP4=1: packed FP4 gather + XQA kv_cache_sf decode; "
+                "prefix prefill expands the request context to the query dtype"
+            )
         model_config = getattr(runner, "model_config", None)
         config = getattr(model_config, "hf_text_config", None)
         if config is None:
@@ -218,6 +263,16 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._trtllm_workspace = None
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
+
+    def _store_kv(self, layer, loc, k: torch.Tensor, v: torch.Tensor) -> None:
+        if self.arc_nvfp4:
+            # HybridLinearKVPool.set_kv_buffer defaults k/v scale to the Python
+            # float 1.0, and MHATokenToKVPool._quantized_scales only substitutes
+            # the quant method's per-layer global scales when it is given None.
+            # A float would also be materialised host-side inside graph capture.
+            self.token_to_kv_pool.set_kv_buffer(layer, loc, k, v, None, None)
+            return
+        self.token_to_kv_pool.set_kv_buffer(layer, loc, k, v)
 
     @staticmethod
     def _is_speculative_paged_mode(forward_mode) -> bool:
@@ -1272,9 +1327,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         if topk_indices is None:
             raise ValueError("QSA sparse attention requires topk_indices")
         if save_kv_cache:
-            self.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
+            self._store_kv(layer, forward_batch.out_cache_loc, k, v)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         num_output_rows = q.shape[0]
         num_valid_rows = topk_indices.shape[0]
@@ -1292,6 +1345,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             return self._pad_extend_output(output, num_output_rows)
         if not q.is_cuda:
+            if self.arc_nvfp4:
+                raise RuntimeError("NVFP4 QSA has no CPU attention path")
             metadata = self._resolve_metadata(forward_batch)
             slots = self._logical_to_physical(topk_indices, metadata)
             pool = self.token_to_kv_pool
@@ -1329,22 +1384,38 @@ class QwenSparseAttnBackend(AttentionBackend):
         # The validated chunk-prefill kernel consumes tightly packed full-context
         # K/V. Current-chunk K/V has already been committed to the cache above.
         pool = self.token_to_kv_pool
-        k_buffer = pool.get_key_buffer(layer.layer_id)
-        v_buffer = pool.get_value_buffer(layer.layer_id)
         req_to_token = self.req_to_token_pool.req_to_token
         req_indices = forward_batch.req_pool_indices.tolist()
-        k_parts = [
-            k_buffer.index_select(
-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
-            )
-            for i in range(len(sequence_lens))
-        ]
-        v_parts = [
-            v_buffer.index_select(
-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
-            )
-            for i in range(len(sequence_lens))
-        ]
+        if self.arc_nvfp4:
+            # The chunk kernel reads plain rows, so each request's full context
+            # is expanded from packed FP4. One request at a time and straight
+            # to FP8 (the same kernel dtype as the FP8 pool): a continuation
+            # batch can hold 32 requests x 80k tokens, and a BF16 expansion of
+            # all of them at once (5 GB) is what pushed the pool budget into OOM.
+            # The expansion folds the global scale in, and _sparse_gqa_chunk_prefill
+            # casts FP8 K/V to the query dtype with no scale of its own.
+            k_parts, v_parts = [], []
+            for i in range(len(sequence_lens)):
+                slots = req_to_token[req_indices[i], : sequence_lens[i]].long()
+                k_i, v_i = _nvfp4_dequantize_tokens(pool, layer.layer_id, slots, torch.bfloat16)
+                k_parts.append(k_i.to(torch.float8_e4m3fn))
+                v_parts.append(v_i.to(torch.float8_e4m3fn))
+                del k_i, v_i
+        else:
+            k_buffer = pool.get_key_buffer(layer.layer_id)
+            v_buffer = pool.get_value_buffer(layer.layer_id)
+            k_parts = [
+                k_buffer.index_select(
+                    0, req_to_token[req_indices[i], : sequence_lens[i]].long()
+                )
+                for i in range(len(sequence_lens))
+            ]
+            v_parts = [
+                v_buffer.index_select(
+                    0, req_to_token[req_indices[i], : sequence_lens[i]].long()
+                )
+                for i in range(len(sequence_lens))
+            ]
         sequence_lens_tensor = torch.tensor(
             sequence_lens, dtype=torch.int32, device=q.device
         )
@@ -1496,6 +1567,102 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         return output.reshape(q.shape[0], -1)
 
+    def _forward_trtllm_sparse_nvfp4(
+        self,
+        q: torch.Tensor,
+        layer,
+        forward_batch,
+        metadata,
+        topk_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Selected tokens are gathered as packed FP4 bytes plus their block
+        scales into page-aligned scratch; trtllm-gen XQA reads FP4 directly
+        through kv_cache_sf, so no dequantized copy of the selection exists."""
+        trtllm_decode = _resolve_trtllm_sparse_decode()
+        pool = self.token_to_kv_pool
+        k_fp4, v_fp4, k_sf, v_sf = pool.get_raw_kv_buffer(layer.layer_id)
+        k_global, v_global = pool.get_kv_cache_quant_method().get_bmm_scales(layer.layer_id)
+        batch, topk = topk_indices.shape
+        page = _TRTLLM_SPARSE_PAGE_SIZE
+        pages_per_row = (topk + page - 1) // page
+        stride = pages_per_row * page
+        device = q.device
+        sequence_lens = metadata.sequence_lengths
+        if metadata.is_cuda_graph:
+            valid_counts = metadata.fa2_valid_counts
+            if valid_counts is None:
+                raise RuntimeError("QSA CUDA graph metadata is incomplete")
+        else:
+            valid_counts = torch.empty(batch, dtype=torch.int32, device=device)
+        qwen_sparse_valid_counts_triton(
+            sequence_lens, topk_indices, valid_counts, batch, topk
+        )
+        cu_strided, block_tables = self._get_trtllm_sparse_tables(
+            batch, pages_per_row, page, device
+        )
+        capacity_rows = self._cuda_graph_max_tokens if metadata.is_cuda_graph else batch
+        rows = max(capacity_rows, batch) * stride
+        num_kv_heads, packed_dim = k_fp4.shape[1], k_fp4.shape[2]
+        scale_dim = k_sf.shape[2]
+        if k_fp4.dtype != torch.uint8 or v_fp4.dtype != torch.uint8:
+            raise RuntimeError(f"Packed NVFP4 K/V must be uint8, got {k_fp4.dtype}/{v_fp4.dtype}")
+        packed_k, packed_v = self._get_fa2_scratch(
+            rows, num_kv_heads, packed_dim, torch.uint8, device
+        )
+        packed_ks, packed_vs = self._get_fa2_scratch(
+            rows, num_kv_heads, scale_dim, torch.uint8, device
+        )
+        req_indices = (
+            metadata.row_req_pool_indices
+            if metadata.row_req_pool_indices is not None
+            else forward_batch.req_pool_indices
+        )
+        for src_k, src_v, dst_k, dst_v in (
+            (k_fp4, v_fp4, packed_k, packed_v),
+            (k_sf.view(torch.uint8), v_sf.view(torch.uint8), packed_ks, packed_vs),
+        ):
+            qwen_sparse_kv_extraction_compact_triton(
+                src_k,
+                src_v,
+                self.req_to_token_pool.req_to_token,
+                req_indices,
+                topk_indices,
+                sequence_lens,
+                cu_strided,
+                dst_k,
+                dst_v,
+                batch,
+                topk,
+                zero_fill_cols=stride,
+            )
+        n = batch * stride
+        kv_cache = (
+            packed_k[:n].view(-1, page, num_kv_heads, packed_dim),
+            packed_v[:n].view(-1, page, num_kv_heads, packed_dim),
+        )
+        kv_cache_sf = (
+            packed_ks[:n].view(-1, page, num_kv_heads, scale_dim).view(k_sf.dtype),
+            packed_vs[:n].view(-1, page, num_kv_heads, scale_dim).view(v_sf.dtype),
+        )
+        if self._trtllm_workspace is None:
+            self._trtllm_workspace = torch.zeros(
+                128 * 1024 * 1024, dtype=torch.uint8, device=device
+            )
+        output = trtllm_decode(
+            query=q.contiguous(),
+            kv_cache=kv_cache,
+            workspace_buffer=self._trtllm_workspace,
+            block_tables=block_tables,
+            seq_lens=valid_counts,
+            max_seq_len=stride,
+            bmm1_scale=layer.scaling * k_global,
+            bmm2_scale=v_global,
+            kv_layout="NHD",
+            out_dtype=q.dtype,
+            kv_cache_sf=kv_cache_sf,
+        )
+        return output.reshape(q.shape[0], -1)
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -1510,9 +1677,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         if topk_indices is None:
             raise ValueError("QSA sparse attention requires topk_indices")
         if save_kv_cache:
-            self.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
+            self._store_kv(layer, forward_batch.out_cache_loc, k, v)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         return self._forward_paged_attention(q, layer, forward_batch, topk_indices)
 
@@ -1524,6 +1689,14 @@ class QwenSparseAttnBackend(AttentionBackend):
         topk_indices: torch.Tensor,
     ) -> torch.Tensor:
         pool = self.token_to_kv_pool
+        if self.arc_nvfp4:
+            if not q.is_cuda:
+                raise RuntimeError("NVFP4 QSA has no CPU attention path")
+            metadata = self._resolve_metadata(forward_batch)
+            return self._forward_trtllm_sparse_nvfp4(
+                q, layer, forward_batch, metadata,
+                topk_indices.to(torch.int32).contiguous(),
+            )
         k_buffer = pool.get_key_buffer(layer.layer_id)
         v_buffer = pool.get_value_buffer(layer.layer_id)
         if not q.is_cuda:

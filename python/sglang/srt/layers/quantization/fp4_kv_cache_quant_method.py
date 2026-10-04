@@ -35,6 +35,12 @@ Why do we need attention access rules?
 
 import os
 from abc import ABC, abstractmethod
+
+
+def _arc_native_fp4_prefill() -> bool:
+    """Full (ARC_FULL_NVFP4) and QSA (ARC_QSA_NVFP4) read packed FP4 directly,
+    so the pool must not allocate a pool-sized FP8 dequant workspace."""
+    return os.environ.get("ARC_FULL_NVFP4") == "1" or os.environ.get("ARC_QSA_NVFP4") == "1"
 from dataclasses import dataclass
 from enum import Enum
 from typing import Iterable, Optional
@@ -524,7 +530,7 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
             else None
         )
 
-        if os.environ.get("ARC_FULL_NVFP4") == "1":
+        if _arc_native_fp4_prefill():
             assert dq_k_buffer is None and dq_v_buffer is None
             packed_bytes = sum(t.numel() * t.element_size() for group in
                                (k_buffer, v_buffer, k_scale_buffer, v_scale_buffer) for t in group)
@@ -845,7 +851,7 @@ KV_CACHE_ATTENTION_ACCESS_REGISTRY: dict[str, tuple[KVCacheAttentionAccess, ...]
     ),
     NVFP4KVCacheMethod.name: (
         (_native_fp4(_PREFILL, _NVFP4_PREFILL_BACKENDS, _NVFP4_SCALE, torch.uint8)
-         if os.environ.get("ARC_FULL_NVFP4") == "1"
+         if _arc_native_fp4_prefill()
          else _dq_workspace(_PREFILL, _NVFP4_PREFILL_BACKENDS, _NVFP4_SCALE, _FP8_E4M3)),
         _native_fp4(_DECODE, _NVFP4_DECODE_BACKENDS, _NVFP4_SCALE, _TORCH_FP4),
     ),

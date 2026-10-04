@@ -4151,7 +4151,7 @@ class HybridLinearKVPool(KVCache):
             )
 
     def get_v_head_dim(self):
-        if os.environ.get("ARC_FULL_NVFP4") == "1" and self.full_kv_pool.quant_method.name == "nvfp4":
+        if (os.environ.get("ARC_FULL_NVFP4") == "1" or os.environ.get("ARC_QSA_NVFP4") == "1") and self.full_kv_pool.quant_method.name == "nvfp4":
             return self.full_kv_pool.v_head_dim  # Logical width, not packed byte width.
         # Use start_layer to handle pipeline parallelism where layer 0
         # may not be present in this stage's buffer.
@@ -5699,7 +5699,7 @@ class MiniMaxSparseKVPool(KVCache):
         )
 
     def get_v_head_dim(self):
-        if os.environ.get("ARC_FULL_NVFP4") == "1" and self.full_kv_pool.quant_method.name == "nvfp4":
+        if (os.environ.get("ARC_FULL_NVFP4") == "1" or os.environ.get("ARC_QSA_NVFP4") == "1") and self.full_kv_pool.quant_method.name == "nvfp4":
             return self.full_kv_pool.v_head_dim  # Logical width, not packed byte width.
         # Use start_layer to handle pipeline parallelism where layer 0
         # may not be present in this stage's buffer.
