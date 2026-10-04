@@ -507,17 +507,28 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             and not self.use_attn_tp_ngram
         )
         ngram_prefix = f"{prefix}.ngram_embedding" if prefix else "ngram_embedding"
-        self.ngram_embedding = VocabParallelEmbedding(
-            padded_vocab_size,
-            self.head_dim_per_ngram,
-            params_dtype=(
-                torch.float8_e4m3fn
-                if _ple_table_is_fp8(config, quant_config, ngram_prefix)
-                else torch.bfloat16
-            ),
-            output_dtype=torch.bfloat16,
-            use_attn_tp_group=self.use_attn_tp_ngram,
+        # sm_89: sglang builds the model under a torch.device("cuda") context,
+        # so this table lands on GPU and is then immediately deleted by
+        # Qwen4ExpPinnedHostEmbedding. The transient is padded_vocab/tp_size *
+        # head_dim bytes: 11.9 GiB at TP4, 23.8 GiB at TP2 -- more than a 24 GB
+        # card has. Build it where it is going to live.
+        _ple_offload_target = (
+            torch.device("cpu")
+            if getattr(config, "ple_offload_embedding", False)
+            else nullcontext()
         )
+        with _ple_offload_target:
+            self.ngram_embedding = VocabParallelEmbedding(
+                padded_vocab_size,
+                self.head_dim_per_ngram,
+                params_dtype=(
+                    torch.float8_e4m3fn
+                    if _ple_table_is_fp8(config, quant_config, ngram_prefix)
+                    else torch.bfloat16
+                ),
+                output_dtype=torch.bfloat16,
+                use_attn_tp_group=self.use_attn_tp_ngram,
+            )
         self.ngram_embedding.register_buffer(
             "weight_scale", torch.ones(1, dtype=torch.bfloat16), persistent=True
         )
@@ -2243,6 +2254,11 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if isinstance(module, Qwen3_5GatedDeltaNet):
                 module.finalize_fused_in_proj()
 
+        # sm_89: release loader-only maps captured by the recursive local
+        # helper before Marlin repack doubles the resident weights.
+        params_dict.clear()
+        buffers.clear()
+        ple_modules.clear()
         return loaded_params
 
     def precompile_kernels_after_loading(self) -> None:
