@@ -482,6 +482,26 @@ class OpenAIServingResponses(OpenAIServingChat):
                             else None
                         ),
                     )
+                    # ARC_0018_TOOL_OUTPUT_MEDIA: ``engine_prompt`` still holds
+                    # unexpanded media placeholders, so ``prompt_length`` above
+                    # undercounts by however many vision tokens the processor
+                    # substitutes in later, and ``context_len - prompt_length``
+                    # overshoots the real window by exactly that much: the
+                    # request dies in validation with a message blaming the
+                    # completion budget (Kaggle v5: 76,811 input + 29,938 =
+                    # 106,749 > 106,496, retried identically five times). The
+                    # expanded length is only known after the processor, so a
+                    # media turn states no default here -- like Chat Completions
+                    # with no max_tokens -- and the scheduler clamps it to
+                    # ``max_req_len - input_len - 1`` on the expanded input
+                    # (``init_req_max_new_tokens``). A client's own
+                    # ``max_output_tokens`` is sent as given.
+                    if processed_messages is not None and (
+                        processed_messages.image_data
+                        or processed_messages.video_data
+                        or processed_messages.audio_data
+                    ):
+                        sampling_params["max_new_tokens"] = request.max_output_tokens
                     if processed_messages is not None:
                         set_request_reasoning_end_token_ids(
                             sampling_params,
@@ -1257,6 +1277,64 @@ class OpenAIServingResponses(OpenAIServingChat):
             return "".join(p.get("text", "") for p in output if isinstance(p, dict))
         return output
 
+    #: ARC_0018_TOOL_OUTPUT_MEDIA: content-part types that carry media, not text.
+    _TOOL_OUTPUT_MEDIA_PART_TYPES = frozenset(
+        {
+            "input_image",
+            "image_url",
+            "input_audio",
+            "audio_url",
+            "input_video",
+            "video_url",
+        }
+    )
+
+    #: ARC_0018_TOOL_OUTPUT_MEDIA: content-part types that carry text.
+    _TOOL_OUTPUT_TEXT_PART_TYPES = frozenset({"input_text", "output_text", "text"})
+
+    @classmethod
+    def _tool_output_for_chat(cls, output: Any) -> Any:
+        """The chat ``tool`` message content for a Responses tool output.
+
+        ARC_0018_TOOL_OUTPUT_MEDIA: upstream flattens every output to a string
+        here, which silently drops the media a tool returned (codex
+        ``view_image`` / ``view_video``). The only symptom was a
+        ``prompt_tokens`` count without the attachment and a model answering
+        from nothing -- an image tool call that "worked" and left it guessing.
+
+        Text-only output stays the string upstream builds. Output that carries
+        media stays a content-part list, in its original order, on the tool
+        message itself: the chat path keeps a tool list that holds media
+        (``normalize_tool_content``), extracts media from any role, and the
+        Qwen templates render it inside ``<tool_response>`` -- the shape the
+        model was trained on. An earlier version of this patch moved the media
+        into a following ``user`` message instead, which read as the human
+        speaking, separated parallel tool results, and lost the order of
+        interleaved text and media.
+        """
+        if not isinstance(output, list):
+            return output
+        parts = []
+        has_media = False
+        for part in output:
+            if hasattr(part, "model_dump"):
+                part = part.model_dump(exclude_none=True)
+            if not isinstance(part, dict):
+                raise ValueError(f"tool output content part is not an object: {part!r}")
+            part_type = part.get("type")
+            if part_type in cls._TOOL_OUTPUT_TEXT_PART_TYPES:
+                parts.append({"type": "text", "text": part.get("text", "")})
+            elif part_type in cls._TOOL_OUTPUT_MEDIA_PART_TYPES:
+                parts.append(cls._normalize_response_content_part_for_chat(part))
+                has_media = True
+            else:
+                raise ValueError(
+                    f"unsupported tool output content part type {part_type!r}"
+                )
+        if not has_media:
+            return "".join(p["text"] for p in parts)
+        return parts
+
     @staticmethod
     def _chat_tool_call_message(message: dict, name: Any, arguments: str) -> dict:
         return {
@@ -1317,7 +1395,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             return {
                 "role": "tool",
                 "tool_call_id": message.get("call_id"),
-                "content": cls._flatten_tool_output(message.get("output", "")),
+                "content": cls._tool_output_for_chat(message.get("output", "")),
             }
         # Reasoning items render as {role: assistant, reasoning_content};
         # empty ones drop instead of injecting an empty assistant block.
