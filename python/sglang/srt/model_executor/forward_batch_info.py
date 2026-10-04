@@ -1204,7 +1204,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 )
                 for i in range(batch_size)
             ]
-            mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
+            # ARC h43: a pageable host tensor's .to(device) synchronizes the stream (memcpy + sync), which stalls
+            # the scheduler CPU on every spec step of a batch with a multimodal request; pinned + non_blocking (as
+            # global_num_tokens above) enqueues the same int64 copy without waiting.
+            mrope_delta_tensor = torch.stack(mrope_deltas, dim=0)
+            if mrope_delta_tensor.is_cpu and is_pin_memory_available(device):
+                mrope_delta_tensor = mrope_delta_tensor.pin_memory().to(
+                    device=device, non_blocking=True
+                )
+            else:
+                mrope_delta_tensor = mrope_delta_tensor.to(device=device)
         next_input_positions = (
             (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
         )
