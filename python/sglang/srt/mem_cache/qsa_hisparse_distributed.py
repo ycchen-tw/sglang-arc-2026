@@ -167,8 +167,13 @@ class AttentionTPConsensus:
         ).encode()
         digest = int.from_bytes(hashlib.sha256(payload).digest()[:7], "big")
         own = torch.tensor([digest, local_ready], dtype=torch.int64)
-        peers = [torch.empty_like(own) for _ in range(self.world_size)]
-        dist.all_gather(peers, own, group=self.group)
+        if _shm_gather_enabled():
+            from sglang.srt.distributed import arc_shm_gather
+
+            peers = list(arc_shm_gather.all_gather(own, self.group))
+        else:
+            peers = [torch.empty_like(own) for _ in range(self.world_size)]
+            dist.all_gather(peers, own, group=self.group)
         if any(int(peer[0]) != digest for peer in peers):
             raise RuntimeError(
                 f"QSA HiSparse {self.namespace}: attention-TP lifecycle mismatch "
@@ -179,6 +184,15 @@ class AttentionTPConsensus:
 
     def agree(self, operation: str, identity) -> None:
         self.ready_count(operation, identity, 0)
+
+
+def _shm_gather_enabled() -> bool:
+    """ARC_SHM_GATHER=1: the consensus exchanges go through sglang.srt.distributed.arc_shm_gather instead of Gloo
+    (same payloads, same lockstep); read here without importing sglang, like the other switches of this module."""
+    value = os.environ.get("ARC_SHM_GATHER", "0")
+    if value not in ("0", "1"):
+        raise ValueError(f"ARC_SHM_GATHER must be 0 or 1, got {value!r}")
+    return value == "1"
 
 
 def distributed_spec_enabled() -> bool:
@@ -294,7 +308,12 @@ def spec_staging_busy(consensus, busy):
     own = busy.detach().cpu().clone()
     consensus.agree("spec-snapshot-state", [list(own.shape), str(own.dtype)])
     if consensus.world_size > 1:
-        dist.all_reduce(own, op=dist.ReduceOp.MAX, group=consensus.group)
+        if _shm_gather_enabled():
+            from sglang.srt.distributed import arc_shm_gather
+
+            own = arc_shm_gather.all_gather(own, consensus.group).amax(0)
+        else:
+            dist.all_reduce(own, op=dist.ReduceOp.MAX, group=consensus.group)
     return own.to(busy.device)
 
 

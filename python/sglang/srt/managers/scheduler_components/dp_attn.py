@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.distributed import arc_shm_gather as _arc_shm_gather
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
@@ -181,6 +182,11 @@ class MLPSyncBatchInfo:
             )
             missing = flat_info.abs().sum(dim=1) == 0
             flat_info[missing] = fallback_tensor
+        elif device == "cpu" and _arc_shm_gather.enabled():
+            # arc-forge: shared-memory all-gather instead of Gloo (same layout as all_gather_into_tensor)
+            global_info_tensor.view(-1, info_width).copy_(
+                _arc_shm_gather.all_gather(local_info_tensor, group).view(-1, info_width)
+            )
         else:
             torch.distributed.all_gather_into_tensor(
                 global_info_tensor.flatten(),
