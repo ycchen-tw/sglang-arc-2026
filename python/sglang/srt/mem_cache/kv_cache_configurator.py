@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import json
 import logging
 import math
 import os
@@ -1899,6 +1900,17 @@ class KVCacheConfigurator:
             QSATokenToKVPool,
         )
 
+        from sglang.srt.mem_cache.qsa_kv_pool import native_mtp_kv_host_enabled, NativeMTPMappedHostFP8Pool
+        host_draft = native_mtp_kv_host_enabled() and self.is_draft_worker
+        if host_draft:
+            if (not get_memory().enable_hisparse or self.use_mla_backend
+                    or self.kv_cache_dtype_str != "fp8_e4m3"
+                    or self.model_config.hf_config.architectures[0] != "Qwen4ExpForCausalLMMTP"
+                    or full_attention_layer_ids != [0]
+                    or get_spec().speculative_draft_model_path not in (None, self.model_config.model_path)
+                    or get_exec().features.enable_memory_saver):
+                raise NotImplementedError("mapped host full KV is restricted to native Qwen4 MTP/HiSparse FP8")
+            full_pool_class = NativeMTPMappedHostFP8Pool
         qsa_profile = parse_qsa_profile(self.model_config.hf_config)
         if os.environ.get("ARC_FULL_NVFP4") == "1":
             qsa_profile = None  # No idle QSA cache or its token budget in full mode.
@@ -1974,6 +1986,16 @@ class KVCacheConfigurator:
                     f"QSA HiSparse draft pool holds {k_size + v_size} B, the target's "
                     f"sizing priced {priced} B for {max_total_num_tokens} logical tokens"
                 )
+            if host_draft:
+                host = token_to_kv_pool.full_kv_pool.get_host_kv_size_bytes()
+                logger.info("ARC_NATIVE_MTP_KV_HOST_POOL=%s", json.dumps({
+                    "global_rank": torch.distributed.get_rank(),
+                    "kv_heads": token_to_kv_pool.full_kv_pool.head_num,
+                    "head_dim": token_to_kv_pool.full_kv_pool.head_dim,
+                    "v_head_dim": token_to_kv_pool.full_kv_pool.v_head_dim,
+                    "logical_tokens": max_total_num_tokens, "host_kv_payload_bytes": host,
+                    "gpu_kv_payload_bytes": 0, "gpu_index_payload_bytes": k_size + v_size,
+                    "full_history": True, "dtype": "fp8_e4m3", "is_draft_worker": True}))
             logger.info(
                 "QSA HiSparse draft pool: %.2f GiB resident for %d logical tokens "
                 "(priced %.2f GiB)",

@@ -1597,14 +1597,27 @@ def _check_distributed_host_budget(model_runner, pool, user, snapshot, session_r
         0 if snapshot is None else snapshot.host_buffers
         * model_runner.req_to_token_pool.mamba_pool.host_slot_nbytes()
     )
+    import os
+    flag = os.environ.get("ARC_NATIVE_MTP_KV_HOST", "0")
+    if flag not in ("0", "1"):
+        raise ValueError("ARC_NATIVE_MTP_KV_HOST must be 0 or 1")
+    host_draft = flag == "1"
+    draft_host = 0
+    if host_draft:
+        from sglang.srt.mem_cache.qsa_kv_pool import native_mtp_kv_host_enabled, native_mtp_host_kv_bytes
+        native_mtp_kv_host_enabled()
+        draft_host = native_mtp_host_kv_bytes(layout.logical_tokens, pool.page_size,
+            pool.full_kv_pool.head_num, pool.full_kv_pool.head_dim, pool.full_kv_pool.v_head_dim)
     memory = host_memory_state()
-    record = torch.tensor([
-        kv, gdn, max(int(reserve * (1 << 30)), HICACHE_HOST_MEMORY_RESERVE_BYTES),
-        memory["available_bytes"],
-    ], dtype=torch.int64)
+    values = [kv + draft_host, gdn, max(int(reserve * (1 << 30)), HICACHE_HOST_MEMORY_RESERVE_BYTES),
+              memory["available_bytes"]]
+    if host_draft:
+        values.append(draft_host)
+    record = torch.tensor(values, dtype=torch.int64)
     peers = [torch.empty_like(record) for _ in range(4)]
     torch.distributed.all_gather(peers, record, group=group)
-    total = host_admission_totals([peer.tolist() for peer in peers])
+    total = host_admission_totals([peer.tolist()[:4] for peer in peers])
+    draft_host_all_ranks = sum(int(peer[4]) for peer in peers) if host_draft else 0
     from sglang.srt.layers.dp_attention import get_attention_dp_rank
 
     dp_rank = get_attention_dp_rank()
@@ -1617,12 +1630,15 @@ def _check_distributed_host_budget(model_runner, pool, user, snapshot, session_r
         verify_tokens=verify_tokens,
         spec_dummy_host_bytes_per_rank=(layout.page_blocks * pool.layer_num * pool.plane_spec.record_bytes if verify_tokens > 1 else 0),
         kv_host_bytes_per_rank=kv, snapshot_host_bytes_per_rank=gdn,
-        kv_host_bytes_all_ranks=total[0], snapshot_host_bytes_all_ranks=total[1],
+        kv_host_bytes_all_ranks=total[0] - draft_host_all_ranks, snapshot_host_bytes_all_ranks=total[1],
         host_reserve_bytes=total[2], host_available_bytes_before_pin=total[3],
         cgroup_limit_bytes=memory["cgroup_limit_bytes"],
         cgroup_current_bytes=memory["cgroup_current_bytes"],
         proc_available_bytes=memory["proc_available_bytes"],
     )
+    if host_draft:
+        receipt.update(draft_host_bytes_per_rank=draft_host, draft_host_bytes_all_ranks=draft_host_all_ranks,
+                       planned_pinned_bytes_all_ranks=total[0] + total[1])
     logger.warning("ARC_HISPARSE_STARTUP=%s", json.dumps(receipt, sort_keys=True))
     return kv, gdn
 

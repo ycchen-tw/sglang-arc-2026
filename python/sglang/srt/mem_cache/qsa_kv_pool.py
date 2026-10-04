@@ -15,7 +15,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.mem_cache.memory_pool import GB, HybridLinearKVPool, MambaPool
+from sglang.srt.mem_cache.memory_pool import GB, HybridLinearKVPool, MambaPool, MHATokenToKVPool
 
 # State layer IDs are serialized as uint32 by the disaggregation protocols.
 # Reserve the value below PLE's request-wide sentinel for QSA's request-wide
@@ -382,3 +382,115 @@ class QSATokenToKVPool(HybridLinearKVPool):
             + self.qsa_rope_position_buffer.numel() * 8
         )
         return k_size + qsa_k_size, v_size
+
+
+import weakref
+_NATIVE_MTP_HOST_KV_POOLS = weakref.WeakSet()
+
+def native_mtp_kv_host_enabled() -> bool:
+    value = os.environ.get("ARC_NATIVE_MTP_KV_HOST", "0")
+    if value not in ("0", "1"):
+        raise ValueError("ARC_NATIVE_MTP_KV_HOST must be 0 or 1")
+    if value == "1" and (os.environ.get("ARC_HISPARSE_DISTRIBUTED") != "1"
+                         or os.environ.get("ARC_HISPARSE_DISTRIBUTED_SPEC") != "1"):
+        raise ValueError("native MTP host KV requires the guarded distributed HiSparse spec profile")
+    return value == "1"
+
+
+def native_mtp_host_kv_bytes(logical, page, heads, key_dim, value_dim) -> int:
+    if min(logical, page, heads, key_dim, value_dim) <= 0 or logical % page:
+        raise ValueError("native MTP host KV needs positive page-aligned geometry")
+    return (logical + page) * heads * (key_dim + value_dim)  # FP8: one byte
+
+
+class _NativeMTPHostByteAlias:
+    def __init__(self, owner):
+        import ctypes
+        from pathlib import Path
+        self.owner = owner
+        rt = ctypes.CDLL(str(Path(os.environ["CUDA_HOME"]) / "targets/x86_64-linux/lib/libcudart.so"))
+        rt.cudaHostGetDevicePointer.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint]
+        rt.cudaHostGetDevicePointer.restype = ctypes.c_int
+        pointer = ctypes.c_void_p()
+        code = rt.cudaHostGetDevicePointer(ctypes.byref(pointer), ctypes.c_void_p(owner.data_ptr()), 0)
+        if code != 0 or pointer.value is None:
+            raise RuntimeError(f"native MTP cudaHostGetDevicePointer failed: {code}")
+        self.__cuda_array_interface__ = {"shape": tuple(owner.shape), "strides": None,
+            "typestr": "|u1", "data": (pointer.value, False), "version": 3}
+
+
+class NativeMTPMappedHostFP8Pool(MHATokenToKVPool):
+    """Only native MTP's full K/V; logical indexing and all history are unchanged."""
+    def __init__(self, *args, **kwargs):
+        self._host_tables = []
+        self._host_cuda_proxies = []
+        self._host_closed = False
+        self._host_device = None
+        try:
+            super().__init__(*args, **kwargs)
+        except BaseException:
+            self.release_host_kv()  # Roll back only this constructor's registrations.
+            raise
+        _NATIVE_MTP_HOST_KV_POOLS.add(self)
+
+    def _create_buffers_normal(self):
+        from sglang.srt.mem_cache.pool_host.common import HostTensorAllocator, alloc_with_host_register
+        if not native_mtp_kv_host_enabled():
+            raise ValueError("native MTP mapped host pool requires explicit opt-in")
+        if (self.dtype != torch.float8_e4m3fn or self.store_dtype != torch.uint8
+                or self.kv_cache_layout != "nhd" or self.layer_num != 1
+                or self.is_quantized_kv_cache or self.post_capture_active or self.enable_custom_mem_pool):
+            raise NotImplementedError("native MTP host KV supports one NHD E4M3 layer without custom/post-capture pools")
+        device = torch.device(self.device)
+        device = torch.device("cuda", torch.cuda.current_device()) if device.index is None else device
+        if device.type != "cuda" or torch.cuda.get_device_capability(device) != (8, 9):
+            raise NotImplementedError("native MTP host KV candidate is restricted to SM89 CUDA")
+        self._host_device = device  # Preserve the exact registration/alias device for teardown.
+        shapes = self._kv_buffer_shapes()
+        for shape in shapes:
+            table = alloc_with_host_register(shape, dtype=torch.uint8, device="cpu", pin_memory=True,
+                allocator=HostTensorAllocator(), registration_granularity_bytes=shape[1] * shape[2])
+            self._host_tables.append(table)  # Keep each base before the next allocation can fail.
+            table.zero_()  # Match the resident pool's zeroed padding/dummy page.
+        self._host_cuda_proxies = [_NativeMTPHostByteAlias(table) for table in self._host_tables]
+        aliases = [torch.as_tensor(proxy, dtype=torch.uint8, device=device) for proxy in self._host_cuda_proxies]
+        for alias, proxy in zip(aliases, self._host_cuda_proxies):
+            if alias.device != device or alias.data_ptr() != proxy.__cuda_array_interface__["data"][0]:
+                raise RuntimeError("native MTP CUDA alias copied storage or changed device")
+        self.k_buffer, self.v_buffer = [aliases[0]], [aliases[1]]
+        expected = native_mtp_host_kv_bytes(self.size, self.page_size, self.head_num, self.head_dim, self.v_head_dim)
+        if self.get_host_kv_size_bytes() != expected:
+            raise RuntimeError("native MTP host allocation differs from declared geometry")
+
+    def get_kv_size_bytes(self):
+        return 0, 0  # Payload is host-resident; QSATokenToKVPool adds GPU index bytes.
+
+    def get_host_kv_size_bytes(self):
+        return sum(table.numel() * table.element_size() for table in self._host_tables)
+
+    def release_host_kv(self):
+        if self._host_closed:
+            return
+        if self._host_tables:
+            from sglang.srt.mem_cache.pool_host.common import _cuda_host_unregister
+            if self._host_device is None:
+                raise RuntimeError("native MTP host KV owner device was not bound")
+            torch.cuda.synchronize(self._host_device)
+            for table in self._host_tables:
+                _cuda_host_unregister(table)
+                if table._sglang_cuda_host_registered_ranges:
+                    raise RuntimeError("native MTP host KV registration was not released")
+        self._host_closed = True
+
+    def __del__(self):
+        # Also covers an outer QSA constructor failing after this pool was built.
+        try:
+            self.release_host_kv()
+        except BaseException:
+            import logging
+            logging.getLogger(__name__).exception("native MTP host KV finalizer failed")
+
+
+def release_native_mtp_host_kv_pools():
+    for pool in list(_NATIVE_MTP_HOST_KV_POOLS):
+        pool.release_host_kv()  # Never calls global PLE cleanup or touches target tables.

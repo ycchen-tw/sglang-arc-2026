@@ -1433,8 +1433,9 @@ class QSAHiSparsePoolConfigurator(DefaultPoolConfigurator):
         if kvc.spec_algorithm.is_none():
             return 0, 0
         from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
-        from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+        from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool, native_mtp_kv_host_enabled
 
+        host_kv = native_mtp_kv_host_enabled()
         draft_dtype = get_spec().speculative_draft_kv_cache_dtype
         elem = {"fp8_e4m3": 1, "bf16": 2, "bfloat16": 2}.get(draft_dtype)
         if elem is None:
@@ -1442,12 +1443,14 @@ class QSAHiSparsePoolConfigurator(DefaultPoolConfigurator):
                 "QSA HiSparse prices the draft pool for --speculative-draft-kv-cache-dtype "
                 f"fp8_e4m3 or bfloat16, got {draft_dtype!r}"
             )
+        if host_kv and draft_dtype != "fp8_e4m3":
+            raise ValueError("native MTP host KV requires the FP8 draft profile")
         model_config = kvc.model_config
         heads = model_config.get_num_kv_heads(
             get_parallel().attn_tp_size, get_parallel().attn_dcp_size
         )
         profile = parse_qsa_profile(hf_config)
-        cell = heads * (model_config.head_dim + model_config.v_head_dim) * elem
+        cell = 0 if host_kv else heads * (model_config.head_dim + model_config.v_head_dim) * elem
         cell += QSATokenToKVPool.qsa_bytes_per_token(
             kv_heads=profile.kv_heads,
             head_dim=profile.head_dim,
