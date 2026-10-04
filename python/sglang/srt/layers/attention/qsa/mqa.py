@@ -8,6 +8,30 @@ import torch
 
 from sglang.srt.environ import envs
 
+_GROUPED_QSA_MIN_ROWS_SCALE = {2: 2.0, 4: 1.0}
+
+
+def _grouped_qsa_effective_min_rows(
+    queries_per_request: Optional[int], configured_min_rows: int
+) -> Optional[int]:
+    """Return the qpr-aware grouped-MQA crossover, or ``None`` if unsupported.
+
+    The original qpr=4 path crosses over at 64 rows on B200; qpr=2 uses a
+    conservative 2x threshold. qpr=3's N=24 needs a three-warp lowering that
+    measured slower than baseline through rows=384, so it deliberately falls
+    back. A configured value of zero still
+    disables the crossover floor for explicit microbenching.
+    """
+
+    if configured_min_rows < 0:
+        raise ValueError("SGLANG_QSA_GROUPED_VERIFY_MIN_ROWS must be non-negative")
+    scale = _GROUPED_QSA_MIN_ROWS_SCALE.get(queries_per_request)
+    if scale is None:
+        return None
+    scaled = math.ceil(configured_min_rows * scale)
+    return math.ceil(scaled / queries_per_request) * queries_per_request
+
+
 try:
     import flashinfer.comm  # noqa: F401
 except ImportError:
@@ -274,6 +298,118 @@ if HAS_TILELANG:
 
         return kernel
 
+    @tilelang.jit(
+        pass_configs={
+            tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+            tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+            # (token, query) maps one-to-one to (row, position); TileLang's
+            # symbolic checker cannot prove that row_base + query is unique.
+            tilelang.PassConfigKey.TL_DISABLE_DATA_RACE_CHECK: True,
+        }
+    )
+    def _tilelang_qsa_mqa_grouped_verify_kernel(
+        heads: int,
+        head_dim: int,
+        page_size: int = 64,
+        queries_per_request: int = 4,
+        groups_per_cta: int = 4,
+        num_stages: int = 3,
+        threads: int = 128,
+    ):
+        """Speculative paged MQA that loads each request's K tile only once.
+
+        QSA target-verify and DRAFT_EXTEND_V2 layouts are request-major: two or
+        four consecutive query rows share a page table and have monotonically
+        increasing context lengths. Widening the GEMM across those queries
+        removes duplicate K-cache traffic without changing the MMA reduction
+        order per output.
+        """
+
+        GROUP = 64
+        assert GROUP % page_size == 0, page_size
+        sub_pages = GROUP // page_size
+        batch = T.dynamic("batch")
+        pages = T.dynamic("pages")
+        max_pages = T.dynamic("max_pages")
+        max_model_len = T.dynamic("max_model_len")
+
+        @T.prim_func
+        def kernel(
+            Q: T.Tensor([batch * heads, head_dim], T.bfloat16),  # type: ignore
+            KCache: T.Tensor([pages, page_size, 1, head_dim], T.bfloat16),  # type: ignore
+            PageTable: T.Tensor([batch, max_pages], T.int32),  # type: ignore
+            ContextLens: T.Tensor([batch], T.int32),  # type: ignore
+            Logits: T.Tensor([batch, max_model_len], T.float32),  # type: ignore
+            Scale: T.float32,
+        ):
+            with T.Kernel(
+                T.ceildiv(batch, queries_per_request),
+                T.ceildiv(T.ceildiv(max_pages, sub_pages), groups_per_cta),
+                threads=threads,
+            ) as (request, group_block):
+                row_base = request * queries_per_request
+                q_shared = T.alloc_shared(
+                    [queries_per_request * heads, head_dim], T.bfloat16
+                )
+                k_shared = T.alloc_shared([GROUP, head_dim], T.bfloat16)
+                scores = T.alloc_fragment(
+                    [GROUP, queries_per_request * heads], T.float32
+                )
+                scores_3d = T.reshape(
+                    scores, (GROUP, queries_per_request, heads)
+                )
+                reduced = T.alloc_fragment(
+                    [GROUP, queries_per_request], T.float32
+                )
+                T.copy(Q[row_base * heads, 0], q_shared)
+                # Speculative paged row lengths are monotonic within a request.
+                context_max = ContextLens[
+                    row_base + queries_per_request - 1
+                ]
+
+                for gi in T.Pipelined(groups_per_cta, num_stages=num_stages):
+                    group = group_block * groups_per_cta + gi
+                    if group * GROUP < context_max:
+                        for sp in range(sub_pages):
+                            if (group * sub_pages + sp) * page_size < context_max:
+                                T.copy(
+                                    KCache[
+                                        PageTable[
+                                            row_base, group * sub_pages + sp
+                                        ],
+                                        :,
+                                        0,
+                                        :,
+                                    ],
+                                    k_shared[
+                                        sp * page_size : (sp + 1) * page_size, :
+                                    ],
+                                )
+                        T.gemm(
+                            k_shared,
+                            q_shared,
+                            scores,
+                            transpose_B=True,
+                            clear_accum=True,
+                            policy=T.GemmWarpPolicy.FullCol,
+                        )
+                        for token, query, head in T.Parallel(
+                            GROUP, queries_per_request, heads
+                        ):
+                            scores_3d[token, query, head] = T.max(
+                                scores_3d[token, query, head], 0.0
+                            )
+                        T.reduce_sum(scores_3d, reduced, dim=2, clear=True)
+                        for token, query in T.Parallel(
+                            GROUP, queries_per_request
+                        ):
+                            row = row_base + query
+                            position = group * GROUP + token
+                            if position < ContextLens[row]:
+                                Logits[row, position] = reduced[token, query] / Scale
+
+        return kernel
+
 
 def tilelang_qsa_mqa_prefill(
     q: torch.Tensor,
@@ -331,6 +467,7 @@ def tilelang_qsa_mqa_decode(
     context_lens: torch.Tensor,
     max_model_len: int,
     score_scale: Optional[float] = None,
+    verify_queries_per_request: Optional[int] = None,
 ) -> torch.Tensor:
     """Validated TileLang paged decode kernel with weights removed."""
 
@@ -372,19 +509,37 @@ def tilelang_qsa_mqa_decode(
     if groups_per_cta == 0:
         rows = q.shape[0]
         groups_per_cta = 1 if rows <= 8 else 2 if rows <= 24 else 4
-    _tilelang_qsa_mqa_decode_kernel(
-        heads=kernel_heads,
-        head_dim=head_dim,
-        page_size=page_size,
-        groups_per_cta=groups_per_cta,
-    )(
-        q_kernel.unsqueeze(1).contiguous(),
+    grouped_min_rows = _grouped_qsa_effective_min_rows(
+        verify_queries_per_request, envs.SGLANG_QSA_GROUPED_VERIFY_MIN_ROWS.get()
+    )
+    use_grouped_verify = (
+        envs.SGLANG_QSA_GROUPED_VERIFY.get()
+        and grouped_min_rows is not None
+        and q.shape[0] >= grouped_min_rows
+        and q.shape[0] % verify_queries_per_request == 0
+    )
+    kernel_args = (
         k_cache.to(torch.bfloat16).contiguous(),
         page_table.to(device=q.device, dtype=torch.int32).contiguous(),
         context_lens.to(device=q.device, dtype=torch.int32).contiguous(),
         logits,
         float(score_scale or math.sqrt(head_dim)),
     )
+    if use_grouped_verify:
+        _tilelang_qsa_mqa_grouped_verify_kernel(
+            heads=kernel_heads,
+            head_dim=head_dim,
+            page_size=page_size,
+            queries_per_request=verify_queries_per_request,
+            groups_per_cta=groups_per_cta,
+        )(q_kernel.contiguous().view(-1, head_dim), *kernel_args)
+    else:
+        _tilelang_qsa_mqa_decode_kernel(
+            heads=kernel_heads,
+            head_dim=head_dim,
+            page_size=page_size,
+            groups_per_cta=groups_per_cta,
+        )(q_kernel.unsqueeze(1).contiguous(), *kernel_args)
     return logits
 
 
@@ -407,10 +562,17 @@ def qsa_mqa_decode(
     context_lens: torch.Tensor,
     max_model_len: int,
     score_scale: Optional[float] = None,
+    verify_queries_per_request: Optional[int] = None,
 ) -> torch.Tensor:
     if q.is_cuda and HAS_TILELANG:
         return tilelang_qsa_mqa_decode(
-            q, k_cache, page_table, context_lens, max_model_len, score_scale
+            q,
+            k_cache,
+            page_table,
+            context_lens,
+            max_model_len,
+            score_scale,
+            verify_queries_per_request,
         )
     return torch_qsa_mqa_decode(
         q, k_cache, page_table, context_lens, max_model_len, score_scale

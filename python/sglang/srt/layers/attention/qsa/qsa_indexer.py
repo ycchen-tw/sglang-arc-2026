@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -26,6 +26,26 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 # Cap on the fp32 [query_rows, compressed_keys] prefill logits workspace;
 # top-k is per row, so tiling rows does not change the selection.
 _QSA_PREFILL_LOGITS_BUDGET_BYTES = 128 * 1024 * 1024
+
+
+def _qsa_grouped_queries_per_request(
+    forward_batch, *, is_target_verify: bool, is_draft_extend: bool
+) -> Optional[int]:
+    """Resolve the request-major speculative row width for grouped QSA MQA."""
+
+    spec_info = getattr(forward_batch, "spec_info", None)
+    if spec_info is None:
+        return None
+    if is_target_verify:
+        value = getattr(spec_info, "draft_token_num", None)
+    elif is_draft_extend:
+        value = getattr(spec_info, "num_tokens_per_req", None)
+    else:
+        return None
+    if value is None:
+        return None
+    value = int(value)
+    return value if value > 0 else None
 
 
 def _qsa_prefill_row_chunk_size(rows: int, keys: int, heads: int) -> int:
@@ -487,6 +507,7 @@ class QSAIndexer(MultiPlatformOp):
         max_model_len: int,
         query_positions: torch.Tensor,
         sequence_lengths: torch.Tensor,
+        verify_queries_per_request: Optional[int] = None,
     ) -> torch.Tensor:
         logits = qsa_mqa_decode(
             q,
@@ -494,6 +515,7 @@ class QSAIndexer(MultiPlatformOp):
             compressed_page_table,
             compressed_lengths,
             max_model_len,
+            verify_queries_per_request=verify_queries_per_request,
         )
         if logits.is_cuda and self.block_topk == 512:
             # Decode rows start at zero, so compressed lengths double as row lengths;
@@ -610,6 +632,11 @@ class QSAIndexer(MultiPlatformOp):
                 max_model_len,
                 logical_positions,
                 indexer_metadata.get_seqlens_int32(),
+                verify_queries_per_request=_qsa_grouped_queries_per_request(
+                    forward_batch,
+                    is_target_verify=is_target_verify,
+                    is_draft_extend=is_draft_extend,
+                ),
             )
 
         compressed_keys, row_starts, row_ends, sequence_lengths = (
