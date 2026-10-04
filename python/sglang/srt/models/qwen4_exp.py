@@ -68,7 +68,7 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_prefetcher,
     make_ple_file_rss_trimmer,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import logger
 
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
@@ -1264,10 +1264,36 @@ class Qwen4ExpLayerExtensionMixin:
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
         self.ple = None
+        requested_mnnvl_hc = envs.SGLANG_QWEN4_MNNVL_HC.get()
+        self._qwen4_mnnvl_hc_stream = (
+            get_stream("qwen4_mnnvl_hc_gate")
+            if requested_mnnvl_hc and torch.cuda.is_available()
+            else None
+        )
+        self._qwen4_mnnvl_hc_enabled = (
+            requested_mnnvl_hc
+            and self._qwen4_mnnvl_hc_stream is not None
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability() == (10, 0)
+            and torch.cuda.get_device_name() == "NVIDIA B200"
+            and get_parallel().attn_tp_size == 4
+            and self.hc_count == 4
+            and self.hidden_size == 2560
+        )
+        if requested_mnnvl_hc and layer_id == 0:
+            if self._qwen4_mnnvl_hc_enabled:
+                logger.info(
+                    "Qwen4 MNNVL+HC requested; static TP4/B200/BF16/HC guard passed"
+                )
+            else:
+                logger.warning(
+                    "Qwen4 MNNVL+HC requested but static guard failed; using baseline"
+                )
 
         for attr_name in (
             "input_layernorm",
@@ -1312,6 +1338,40 @@ class Qwen4ExpLayerExtensionMixin:
             use_combine=True,
         )
 
+    def _qwen4_mnnvl_hc_should_precompute(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ) -> bool:
+        if not self._qwen4_mnnvl_hc_enabled:
+            return False
+        mode = forward_batch.forward_mode
+        if not (mode.is_decode() or mode.is_target_verify()):
+            return False
+        from sglang.srt.layers.flashinfer_comm_fusion import (
+            can_use_qwen4_mnnvl_hc,
+        )
+
+        return can_use_qwen4_mnnvl_hc(hidden_states)
+
+    def _qwen4_mnnvl_hc_precompute_gate(self, residuals):
+        hyper_input, hyper_input_normed = residuals
+        current_stream = torch.cuda.current_stream()
+        gate_stream = self._qwen4_mnnvl_hc_stream
+        gate_stream.wait_stream(current_stream)
+        with torch.cuda.stream(gate_stream):
+            from sglang.kernels.ops.elementwise.hc_gate import hc_gate
+
+            gate = hc_gate(
+                hyper_input_normed,
+                self.attn_hyper_connection.block_inject_weight.weight,
+                self.hc_count,
+                self.hidden_size,
+            )
+        # The tensor was produced on gate_stream and remains live in this tuple;
+        # record the cross-stream read as well so allocator reuse is safe in
+        # eager warmup and under CUDA-graph capture.
+        hyper_input_normed.record_stream(gate_stream)
+        return hyper_input, hyper_input_normed, gate
+
     def _prepare_qwen4_exp_attn(
         self,
         hidden_states: torch.Tensor,
@@ -1343,6 +1403,8 @@ class Qwen4ExpLayerExtensionMixin:
                 )
 
         hidden_states, residual = self.attn_hyper_connection.mix(hidden_states)
+        if self._qwen4_mnnvl_hc_should_precompute(hidden_states, forward_batch):
+            residual = self._qwen4_mnnvl_hc_precompute_gate(residual)
         return hidden_states, residual
 
     def _prepare_qwen4_exp_mlp(
@@ -1351,9 +1413,28 @@ class Qwen4ExpLayerExtensionMixin:
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ):
-        if not forward_batch.forward_mode.is_idle():
-            hidden_states = attn_tp_all_reduce(hidden_states)
-        hidden_states = self.attn_hyper_connection.combine(hidden_states, residual)
+        has_precomputed_gate = isinstance(residual, tuple) and len(residual) == 3
+        if has_precomputed_gate:
+            hyper_input, hyper_input_normed, gate = residual
+            current_stream = torch.cuda.current_stream()
+            current_stream.wait_stream(self._qwen4_mnnvl_hc_stream)
+            gate.record_stream(current_stream)
+            from sglang.srt.layers.flashinfer_comm_fusion import (
+                can_use_qwen4_mnnvl_hc,
+                qwen4_mnnvl_hc,
+            )
+
+            if can_use_qwen4_mnnvl_hc(hidden_states):
+                hidden_states = qwen4_mnnvl_hc(hidden_states, hyper_input, gate)
+            else:
+                hidden_states = attn_tp_all_reduce(hidden_states)
+                hidden_states = self.attn_hyper_connection.combine(
+                    hidden_states, (hyper_input, hyper_input_normed)
+                )
+        else:
+            if not forward_batch.forward_mode.is_idle():
+                hidden_states = attn_tp_all_reduce(hidden_states)
+            hidden_states = self.attn_hyper_connection.combine(hidden_states, residual)
         hidden_states, residual = self.mlp_hyper_connection.mix(hidden_states)
         return hidden_states, residual
 
@@ -1437,7 +1518,9 @@ class Qwen4ExpLinearDecoderLayer(
         is_nextn: bool = False,
     ) -> None:
         super().__init__(config, layer_id, quant_config, prefix, alt_stream, is_nextn)
-        self._init_qwen4_exp_layer_extensions(config, layer_id, quant_config, prefix)
+        self._init_qwen4_exp_layer_extensions(
+            config, layer_id, quant_config, prefix, alt_stream
+        )
 
     def forward(
         self,
@@ -1490,7 +1573,9 @@ class Qwen4ExpAttentionDecoderLayer(
                 prefix=f"{prefix}.indexer" if prefix else "indexer",
                 rotary_emb=self.rotary_emb,
             )
-        self._init_qwen4_exp_layer_extensions(config, layer_id, quant_config, prefix)
+        self._init_qwen4_exp_layer_extensions(
+            config, layer_id, quant_config, prefix, alt_stream
+        )
 
     def _compute_qsa_topk_indices(
         self,

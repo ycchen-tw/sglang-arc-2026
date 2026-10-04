@@ -958,6 +958,80 @@ def can_use_flashinfer_allreduce(
     )
 
 
+_QWEN4_MNNVL_HC_MAX_ROWS = 512
+_qwen4_mnnvl_hc_logged = False
+
+
+def can_use_qwen4_mnnvl_hc(input_: torch.Tensor) -> bool:
+    """Strict, rank-invariant guard for the Qwen4 attention-only experiment."""
+    if (
+        input_.device.type != "cuda"
+        or input_.dtype != torch.bfloat16
+        or input_.ndim != 2
+        or input_.shape[1] != 2560
+        or input_.shape[0] > _QWEN4_MNNVL_HC_MAX_ROWS
+        or not input_.is_contiguous()
+    ):
+        return False
+    if not torch.compiler.is_compiling():
+        if (
+            torch.cuda.get_device_capability(input_.device) != (10, 0)
+            or torch.cuda.get_device_name(input_.device) != "NVIDIA B200"
+        ):
+            return False
+
+    coordinator = get_attn_tp_group()
+    if coordinator.world_size != 4:
+        return False
+    manager = _get_workspace_manager(True)
+    if manager.backend != "mnnvl":
+        return False
+    return can_use_flashinfer_allreduce(
+        input_,
+        use_attn_tp_group=True,
+        expected_world_size=4,
+        expected_group_key=(coordinator.device_group, coordinator.cpu_group),
+    )
+
+
+@register_custom_op(op_name="qwen4_mnnvl_hc_op", mutates_args=["output"])
+def _qwen4_mnnvl_hc_op(
+    input_: torch.Tensor,
+    residual: torch.Tensor,
+    gate: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    global _qwen4_mnnvl_hc_logged
+    manager = _get_workspace_manager(True)
+    from sglang.kernels.ops.communication.qwen4_mnnvl_hc import (
+        qwen4_mnnvl_hc_combine,
+    )
+
+    qwen4_mnnvl_hc_combine(
+        input_, residual, gate, output, manager.workspace, launch_with_pdl=True
+    )
+    if not _qwen4_mnnvl_hc_logged:
+        logger.info(
+            "Qwen4 MNNVL+HC active: attention TP4, B200, BF16, H=2560, HC=4"
+        )
+        _qwen4_mnnvl_hc_logged = True
+
+
+def qwen4_mnnvl_hc(
+    input_: torch.Tensor, residual: torch.Tensor, gate: torch.Tensor
+) -> torch.Tensor:
+    """Run the collective after ``can_use_qwen4_mnnvl_hc`` succeeds."""
+    if residual.shape != (input_.shape[0], 4 * input_.shape[1]):
+        raise ValueError("Qwen4 MNNVL+HC residual shape mismatch")
+    if gate.shape != (input_.shape[0], 4) or gate.dtype != torch.float32:
+        raise ValueError("Qwen4 MNNVL+HC gate must be contiguous FP32 [M,4]")
+    if not residual.is_contiguous() or not gate.is_contiguous():
+        raise ValueError("Qwen4 MNNVL+HC inputs must be contiguous")
+    output = torch.empty_like(residual)
+    _qwen4_mnnvl_hc_op(input_, residual, gate, output)
+    return output
+
+
 def flashinfer_allreduce(
     input_: torch.Tensor,
     *,
