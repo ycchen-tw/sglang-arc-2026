@@ -1219,6 +1219,16 @@ class ModelRunner:
         if not self.is_draft_worker:
             get_offloader().post_init()
 
+        # arc-forge 0032: online block-FP8 of chosen BF16 linears (ARC_ONLINE_FP8, unset = nothing)
+        from sglang.srt.layers.quantization import arc_online_fp8
+
+        arc_online_fp8.apply(
+            self.model,
+            is_draft_worker=self.is_draft_worker,
+            tp_size=self.ps.tp_size,
+            startup_overlap=self.startup_weight_load is not None,
+        )
+
         self.maybe_precompile_model_kernels_after_loading()
 
         # Register model for layerwise NVTX profiling if enabled
