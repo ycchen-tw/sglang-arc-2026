@@ -67,6 +67,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     zero_match_result,
 )
+from sglang.srt.mem_cache.qsa_hisparse_pool import QSAHiSparseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 
 if TYPE_CHECKING:
@@ -630,6 +631,27 @@ class PrefillAdder:
         )
         self.is_hybrid_ssm_cache = self.tree_cache.supports_mamba()
 
+        # QSA HiSparse (arc-forge h06): prefill writes device rows of the
+        # prefill area, decode only logical slots (its rows are the static
+        # slab). The KV budgets below see the logical side alone; the prefill
+        # area is a second budget that decode reservations and evictable cache
+        # never touch.
+        self.is_qsa_hisparse = isinstance(
+            self.token_to_kv_pool_allocator, QSAHiSparseTokenToKVPoolAllocator
+        )
+        self.prefill_area_token_offset = 0
+        if self.is_qsa_hisparse:
+            if self.is_hybrid_ssm_cache or dllm_config is not None:
+                raise RuntimeError(
+                    "QSA HiSparse admission supports neither a mamba prefix cache "
+                    "nor dLLM prefill"
+                )
+            if self.token_to_kv_pool_allocator.layout.page_size != page_size:
+                raise RuntimeError(
+                    f"scheduler page_size {page_size} != QSA HiSparse layout page_size "
+                    f"{self.token_to_kv_pool_allocator.layout.page_size}"
+                )
+
         self.rem_swa_token_offset = 0
 
         # A new state slot eats shared-gap bytes that `rem_total_tokens` counts
@@ -733,6 +755,11 @@ class PrefillAdder:
                 self.token_to_kv_pool_allocator.available_size()
                 + self.tree_cache.full_evictable_size()
             )
+        elif self.is_qsa_hisparse:
+            available_and_evictable = (
+                self.token_to_kv_pool_allocator.logical_attn_allocator.available_size()
+                + self.tree_cache.evictable_size()
+            )
         else:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.available_size()
@@ -770,6 +797,11 @@ class PrefillAdder:
                 self.token_to_kv_pool_allocator.available_size()
                 + self.tree_cache.full_evictable_size()
             )
+        elif self.is_qsa_hisparse:
+            available_and_evictable = (
+                self.token_to_kv_pool_allocator.logical_attn_allocator.available_size()
+                + self.tree_cache.evictable_size()
+            )
         else:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.available_size()
@@ -777,6 +809,44 @@ class PrefillAdder:
             )
 
         return available_and_evictable - self.cur_rem_token_offset
+
+    @property
+    def rem_prefill_area_tokens(self):
+        allocator = self.token_to_kv_pool_allocator
+        return (
+            allocator.prefill_block_allocator.available_size()
+            * allocator.layout.block_tokens
+            - self.prefill_area_token_offset
+        )
+
+    def _prefill_area_need(self, prefix_len: int, extend_len: int) -> int:
+        """Prefill-area tokens the rest of a prompt takes: the device pages past
+        the prefix's last page, exactly what QSA HiSparse alloc_extend counts."""
+        page = self.page_size
+        return (
+            _ceil_div(prefix_len + extend_len, page) - _ceil_div(prefix_len, page)
+        ) * page
+
+    def _prefill_area_rejects(self, prefix_len: int, extend_len: int) -> bool:
+        need = self._prefill_area_need(prefix_len, extend_len)
+        capacity = self.token_to_kv_pool_allocator.layout.prefill_tokens
+        if need > capacity:
+            raise RuntimeError(
+                f"QSA HiSparse: a prompt needing {need} prefill-area tokens can never "
+                f"fit the {capacity}-token prefill area (size it to at least "
+                "context_len + chunked_prefill_size)"
+            )
+        return need > self.rem_prefill_area_tokens
+
+    def _charge_prefill_area(self, prefix_len: int, extend_len: int) -> None:
+        """Reserve the whole rest of the prompt, not just this pass's chunk.
+
+        Chunk needs telescope (need(p, R) = need(p, c) + need(p + c, R - c)) and
+        nothing but admission takes prefill-area pages, so a chunked request's
+        later chunks always fit and add_chunked_req never has to shrink one."""
+        self.prefill_area_token_offset += self._prefill_area_need(
+            prefix_len, extend_len
+        )
 
     def _swa_budget_for_req(
         self, extend_input_len: int, max_new_tokens: int, swa_host_hit_length: int = 0
@@ -934,6 +1004,8 @@ class PrefillAdder:
         no_token = self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0
         if not no_token and self.is_hybrid_swa:
             no_token = self.rem_swa_tokens <= 0
+        if not no_token and self.is_qsa_hisparse:
+            no_token = self.rem_prefill_area_tokens <= 0
         # Gate new mamba slots separately: rem_total_tokens' full_evictable can't
         # cover a mamba slot, which needs mamba-recoverable bytes (see __init__).
         if not no_token and self.rem_mamba_slots is not None:
@@ -1165,6 +1237,16 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
+        if self.is_qsa_hisparse:
+            prefix_len = len(req.prefix_indices)
+            if self._prefill_area_rejects(prefix_len, cand_extend_input_len):
+                raise RuntimeError(
+                    f"QSA HiSparse: chunked req {req.rid} needs "
+                    f"{self._prefill_area_need(prefix_len, cand_extend_input_len)} "
+                    f"prefill-area tokens but {self.rem_prefill_area_tokens} are left; "
+                    "admission reserves the whole prompt, so this must not happen"
+                )
+            self._charge_prefill_area(prefix_len, cand_extend_input_len)
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
@@ -1211,6 +1293,10 @@ class PrefillAdder:
         # budget gate so admission can't over-commit (0 for baseline / non-Mamba).
         paged_input += self._mamba_gap_budget_for_req(req)
         if paged_input > min(self.cur_rem_tokens, self.rem_total_tokens):
+            return AddReqResult.NO_TOKEN
+        if self.is_qsa_hisparse and self._prefill_area_rejects(
+            len(req.prefix_indices), cand_extend_input_len
+        ):
             return AddReqResult.NO_TOKEN
         if self.is_hybrid_swa:
             if (
@@ -1340,6 +1426,8 @@ class PrefillAdder:
                 compute_charge=trunc_len if self.exact_chunk_fill else None,
             )
 
+        if self.is_qsa_hisparse:
+            self._charge_prefill_area(len(req.prefix_indices), cand_extend_input_len)
         return self.budget_state()
 
     def add_one_req(
@@ -1471,6 +1559,8 @@ class PrefillAdder:
 
         prefix_len = len(req.prefix_indices) + host_hit_length
         extend_len = len(req.full_untruncated_fill_ids) - prefix_len
+        if self.is_qsa_hisparse and self._prefill_area_rejects(prefix_len, extend_len):
+            return AddReqResult.NO_TOKEN
         input_tokens = self.ceil_paged_tokens(extend_len)
         # Whether the request fits whole. Against the raw length under
         # exact-chunk-fill, so a request whose ceiled length would spill is
@@ -1558,6 +1648,11 @@ class PrefillAdder:
             # Compute budgets are billed forward-pass tokens under exact-chunk-fill.
             compute_charge=admission.extend_len if self.exact_chunk_fill else None,
         )
+        if self.is_qsa_hisparse:
+            self._charge_prefill_area(
+                admission.prefix_len,
+                len(req.full_untruncated_fill_ids) - admission.prefix_len,
+            )
         self._account_prefill_cache_admission(req, admission.prefix_len)
 
     def preempt_to_schedule(self, req: Req) -> bool:
@@ -1565,6 +1660,13 @@ class PrefillAdder:
         Preempt running requests to serve the new request if the priority threshold is met and token count sum is verified.
         Returns True if preemption was committed, and the new request can be scheduled.
         """
+        if self.is_qsa_hisparse and self._prefill_area_rejects(
+            len(req.prefix_indices),
+            len(req.full_untruncated_fill_ids) - len(req.prefix_indices),
+        ):
+            # Preempting frees req slots and logical slots, never prefill-area rows.
+            return False
+
         # Iterate running requests to find preemptible requests
         priority_sign = 1 if get_schedule().schedule_low_priority_values_first else -1
 
