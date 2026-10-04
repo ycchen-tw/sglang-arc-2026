@@ -204,3 +204,136 @@ def spec_staging_busy(consensus, busy):
     if consensus.world_size > 1:
         dist.all_reduce(own, op=dist.ReduceOp.MAX, group=consensus.group)
     return own.to(busy.device)
+
+
+
+def spec_phase_packed_enabled():
+    value = os.environ.get("ARC_HISPARSE_SPEC_PHASE_PACKED", "0")
+    if value not in ("0", "1"):
+        raise ValueError("ARC_HISPARSE_SPEC_PHASE_PACKED must be 0 or 1")
+    if value == "1" and (os.environ.get("ARC_HISPARSE_DISTRIBUTED") != "1"
+                         or os.environ.get("ARC_HISPARSE_DISTRIBUTED_SPEC") != "1"):
+        raise ValueError("phase-packed agreement requires guarded distributed HiSparse spec")
+    return value == "1"
+
+
+def spec_phase_allocation_packable(reqs, current, following, needed):
+    # No implicit integer casts: unsupported lengths/rows use the exact legacy
+    # indexing/error path. Do not consume generators or invoke numeric coercion.
+    if (type(reqs) not in (list, tuple) or type(current) not in (list, tuple)
+            or type(following) not in (list, tuple) or type(needed) is not int):
+        return False
+    return (all(type(value) is int for value in (*current, *following))
+            and all(req.kv.req_pool_idx is None or type(req.kv.req_pool_idx) is int for req in reqs))
+
+
+def spec_phase_to_cpu(tensors):
+    """One blocking live D2H packet per phase; exact dtype/shape/contiguous bytes.
+
+    Caller supplies current-stream producer dependencies, as for legacy .cpu().
+    No cross-call storage, asynchronous CPU reads, allocator mirror or hash cache.
+    CPU tensors stay on CPU. Each returned GPU snapshot owns the copied packet.
+    """
+    import torch
+
+    outputs, chunks, records, device, offset = [], [], [], None, 0
+    for tensor in tensors:
+        value = tensor.detach()
+        if value.device.type == "cpu":
+            outputs.append(value.contiguous())
+            continue
+        if value.device.type != "cuda":
+            raise ValueError("phase-packed agreement supports CPU/CUDA tensors only")
+        if device is not None and value.device != device:
+            raise ValueError("one agreement phase cannot mix CUDA devices")
+        device = value.device
+        shape, dtype, size = tuple(value.shape), value.dtype, value.element_size()
+        data = value.contiguous().reshape(-1).view(torch.uint8)
+        padding = (-offset) % size
+        if padding:
+            chunks.append(torch.empty(padding, dtype=torch.uint8, device=device))
+            offset += padding
+        records.append((len(outputs), offset, data.numel(), shape, dtype))
+        outputs.append(None)
+        chunks.append(data)
+        offset += data.numel()
+    if records:
+        # cat and copy stay on the caller's current stream, preserving producers.
+        packet = torch.cat(chunks).cpu()
+        for index, start, count, shape, dtype in records:
+            outputs[index] = packet[start:start + count].view(dtype).reshape(shape)
+    return outputs
+
+
+def spec_packed_allocation_identity(coord, reqs, current, following, needed):
+    import torch
+
+    logical = coord.token_to_kv_pool_allocator.logical_attn_allocator
+    host = coord.mem_pool_host
+    rows = [req.kv.req_pool_idx for req in reqs]
+    invalid = not len(reqs) == len(current) == len(following) or needed < 0
+    tails, grow, pages, tail_rows, tail_cols, tail_places = [], [], 0, [], [], []
+    if not invalid:
+        for row, a, n in zip(rows, current, following):
+            if (row is None or not 1 <= row < coord.req_to_host_pool.shape[0]
+                    or not 0 <= a <= n <= coord.req_to_token_pool.req_to_token.shape[1]):
+                invalid = True
+                continue
+            tails.append(-1)
+            if a != 0:
+                tail_rows.append(row)
+                tail_cols.append(a - 1)
+                tail_places.append(len(tails) - 1)
+            pages += -(-n // logical.page_size) - -(-a // logical.page_size)
+            have = int(coord.req_to_host_pool_allocated_len[row])
+            target = -(-coord.layout.seq_blocks(n) // coord.page_size) * coord.page_size
+            grow.append([row, have, target])
+            invalid |= target > coord.req_to_host_pool.shape[1]
+        invalid |= needed != sum(n - a for a, n in zip(current, following))
+    host_needed = sum(max(0, target - have) for _, have, target in grow)
+    invalid |= pages * logical.page_size > logical.available_size() or host_needed > host.available_size()
+    table = coord.req_to_token_pool.req_to_token
+    row_index = torch.tensor(tail_rows, dtype=torch.int64, device=table.device)
+    col_index = torch.tensor(tail_cols, dtype=torch.int64, device=table.device)
+    tensors = [table[row_index, col_index], logical.free_pages, *logical.staged_pages]
+    snapshots = spec_phase_to_cpu(tensors)
+    for place, tail in zip(tail_places, snapshots[0].tolist()):
+        tails[place] = int(tail)
+    identity = [[req.rid for req in reqs], rows, current, following, int(needed), tails, grow,
+        [spec_tensor_identity(snapshots[1]), [spec_tensor_identity(x) for x in snapshots[2:]]],
+        [spec_tensor_identity(host.free_slots), [spec_tensor_identity(x) for x in host.release_slots]],
+        logical.available_size(), host.available_size()]
+    return identity, invalid
+
+
+def spec_packed_verify_identity(batch, verify_input):
+    snapshots = spec_phase_to_cpu([batch.req_pool_indices, batch.seq_lens,
+        *[getattr(verify_input, name) for name in
+          ("draft_token", "positions", "retrieve_index", "retrieve_next_token", "retrieve_next_sibling")]])
+    return [[req.rid for req in batch.reqs], snapshots[0].tolist(), snapshots[1].tolist(),
+            [spec_tensor_identity(value) for value in snapshots[2:]]]
+
+
+def spec_packed_accept_identity(coord, batch, predict, accepted, indices):
+    # Keep TWO phase-local blocking reads: sample results, then their exact
+    # ragged destinations. No guard is moved past mamba commit / host backup.
+    snapshots = spec_phase_to_cpu([batch.req_pool_indices, batch.seq_lens, accepted,
+                                  indices, predict, coord.verify_overflow])
+    rows, before, counts = [value.tolist() for value in snapshots[:3]]
+    address_views = []
+    invalid = not len(rows) == len(before) == len(counts)
+    for row, seq, count in zip(rows, before, counts):
+        if not 1 <= row < coord.req_to_host_pool.shape[0] or not 1 <= count <= coord.verify_tokens:
+            invalid = True
+            continue
+        lo = int(seq) // coord.layout.block_tokens
+        hi = (int(seq) + int(count)) // coord.layout.block_tokens
+        invalid |= not 0 <= lo <= hi <= coord.req_to_host_pool.shape[1]
+        # Slicing itself preserves legacy clipping, including invalid bounds.
+        address_views.append(coord.req_to_host_pool[row, lo:hi])
+    addresses = [value.tolist() for value in spec_phase_to_cpu(address_views)]
+    flag = int(snapshots[5].reshape(-1)[0])
+    identity = [rows, before, counts, snapshots[3].tolist(), snapshots[4].tolist(), addresses, flag]
+    invalid = (invalid or bool(flag) or any(not 1 <= n <= coord.verify_tokens for n in counts)
+               or any(loc < 0 for row in addresses for loc in row))
+    return identity, invalid

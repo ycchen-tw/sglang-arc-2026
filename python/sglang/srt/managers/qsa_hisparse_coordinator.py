@@ -771,6 +771,11 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
     def agree_spec_allocation(self, reqs, current, following, needed):
         if not self.distributed_spec:
             return
+        from sglang.srt.mem_cache.qsa_hisparse_distributed import spec_phase_packed_enabled, spec_phase_allocation_packable, spec_packed_allocation_identity, agree_spec_transition
+        if spec_phase_packed_enabled() and spec_phase_allocation_packable(reqs, current, following, needed):
+            identity, invalid = spec_packed_allocation_identity(self, reqs, current, following, needed)
+            agree_spec_transition(self.spec_protocols["allocation"], "spec-allocate", identity, invalid=invalid)
+            return
         from sglang.srt.mem_cache.qsa_hisparse_distributed import agree_spec_transition, spec_tensor_identity
         logical, host = self.token_to_kv_pool_allocator.logical_attn_allocator, self.mem_pool_host
         rows = [req.kv.req_pool_idx for req in reqs]
@@ -807,6 +812,12 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
     def agree_spec_verify_input(self, batch, verify_input):
         if not self.distributed_spec or batch.forward_mode.is_idle():
             return
+        from sglang.srt.mem_cache.qsa_hisparse_distributed import spec_phase_packed_enabled, spec_packed_verify_identity, agree_spec_transition
+        if spec_phase_packed_enabled():
+            identity = spec_packed_verify_identity(batch, verify_input)
+            agree_spec_transition(self.spec_protocols["forward"], "spec-verify-input", identity,
+                invalid=verify_input.draft_token_num != self.verify_tokens or verify_input.topk != 1)
+            return
         from sglang.srt.mem_cache.qsa_hisparse_distributed import agree_spec_transition, spec_tensor_identity
         # QSA does not read the FULL_MASK prefix/padding; it may be uninitialized.
         # Agree the active tokens, positions and complete initialized tree tables.
@@ -819,6 +830,11 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
 
     def agree_spec_accept(self, batch, predict, accepted, indices):
         if not self.distributed_spec or batch.forward_mode.is_idle():
+            return
+        from sglang.srt.mem_cache.qsa_hisparse_distributed import spec_phase_packed_enabled, spec_packed_accept_identity, agree_spec_transition
+        if spec_phase_packed_enabled():
+            identity, invalid = spec_packed_accept_identity(self, batch, predict, accepted, indices)
+            agree_spec_transition(self.spec_protocols["forward"], "spec-accept", identity, invalid=invalid)
             return
         rows = batch.req_pool_indices.detach().cpu().tolist()
         before = batch.seq_lens.detach().cpu().tolist()
