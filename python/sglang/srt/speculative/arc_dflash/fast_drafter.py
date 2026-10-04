@@ -85,13 +85,15 @@ def install(model):
 def compile_layers(model):
     """Fuse the drafter's elementwise work with inductor: each decoder layer (hyper-connection norms and low-rank
     mixes, grouped convs, residual updates, q/k norm and rotary, router softmax/top-k, shared expert) and the final
-    mixer. The window attention (Triton) and the NVFP4 experts (CUTLASS) stay opaque: graph breaks around them.
+    mixer. The window attention (Triton), the NVFP4 experts and the block-FP8 linears (CUTLASS) stay opaque: graph
+    breaks around them.
     dynamic=True keeps one compile per layer across the CUDA graph buckets; it happens in the eager warm-up that
     precedes each capture, never inside one."""
-    from . import nvfp4
+    from . import fp8, nvfp4
 
     ring_attention.attend = torch.compiler.disable(ring_attention.attend)
     nvfp4.Nvfp4Experts.forward = torch.compiler.disable(nvfp4.Nvfp4Experts.forward)
+    fp8.Fp8BlockLinear.forward = torch.compiler.disable(fp8.Fp8BlockLinear.forward)
     for layer in model.layers:
         layer.forward = torch.compile(layer.forward, dynamic=True)
     model.hyper_connection_mixer.forward = torch.compile(model.hyper_connection_mixer.forward, dynamic=True)
