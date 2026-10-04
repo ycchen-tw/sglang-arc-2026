@@ -128,13 +128,27 @@ def distributed_spec_enabled() -> bool:
     return value == "1"
 
 
+def distributed_mtp_steps() -> int:
+    """Explicit reviewed depth; default retains h29 NEXTN3/verify4."""
+    value = os.environ.get("ARC_HISPARSE_MTP_STEPS", "3")
+    if value not in ("1", "3"):
+        raise ValueError("ARC_HISPARSE_MTP_STEPS must be 1 or 3")
+    if value == "1" and not distributed_spec_enabled():
+        raise ValueError("ARC_HISPARSE_MTP_STEPS=1 requires guarded distributed spec")
+    return int(value)
+
+
 def distributed_spec_shape_needs(view, user) -> dict[str, bool]:
+    steps = distributed_mtp_steps()
+    verify = steps + 1
     return {
-        "distributed spec: NEXTN3/EAGLE alias, top1, verify4":
+        f"distributed spec: NEXTN{steps}/EAGLE alias, top1, verify{verify}":
             view.speculative_algorithm in ("NEXTN", "EAGLE")
-            and view.speculative_num_steps == 3
-            and view.speculative_num_draft_tokens == 4
+            and view.speculative_num_steps == steps
+            and view.speculative_num_draft_tokens == verify
             and view.speculative_eagle_topk == 1,
+        "distributed spec: one-step requires rejection sampling":
+            steps != 1 or view.speculative_use_rejection_sampling,
         "distributed spec: ReplaySSM-spec cache16":
             view.enable_linear_replayssm_spec and view.linear_replayssm_cache_len == 16,
         "distributed spec: native FP8 draft, prefill attention, overlap":
@@ -146,15 +160,15 @@ def distributed_spec_shape_needs(view, user) -> dict[str, bool]:
             os.environ.get("SGLANG_RAGGED_VERIFY_MODE") == "static",
         "distributed spec: full vocabulary draft path":
             os.environ.get("SGLANG_QWEN4_MTP_DISTRIBUTED_TOPK1", "0") == "0",
-        "distributed spec: session snapshots and B>=2048":
+        f"distributed spec: session snapshots and B>={512 * verify}":
             view.radix_cache_backend == "qsa_hisparse_session"
             and user.get("qsa_session_resume") is True
             and isinstance(user.get("qsa_snapshot_interval"), int)
             and not isinstance(user.get("qsa_snapshot_interval"), bool)
-            and user["qsa_snapshot_interval"] > 4
+            and user["qsa_snapshot_interval"] > verify
             and isinstance(user.get("qsa_hot_blocks"), int)
             and not isinstance(user.get("qsa_hot_blocks"), bool)
-            and user["qsa_hot_blocks"] >= 2048
+            and user["qsa_hot_blocks"] >= 512 * verify
             and user.get("qsa_snapshot_staging_slots") == 4
             and user.get("qsa_spec_small_hot_ok", False) is False,
     }

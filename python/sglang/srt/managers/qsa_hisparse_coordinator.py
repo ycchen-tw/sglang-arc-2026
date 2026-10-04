@@ -199,15 +199,15 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=tp_group)
         from sglang.srt.mem_cache.qsa_hisparse_distributed import (
-            AttentionTPConsensus, distributed_hisparse_enabled, distributed_spec_enabled, new_spec_protocols,
+            AttentionTPConsensus, distributed_hisparse_enabled, distributed_spec_enabled, distributed_mtp_steps, new_spec_protocols,
         )
         self.distributed = distributed_hisparse_enabled()
         if self.tp_world_size != 1 and not self.distributed:
             raise NotImplementedError("QSA HiSparse is TP1 unless ARC_HISPARSE_DISTRIBUTED=1")
         self.distributed_spec = distributed_spec_enabled()
-        expected_verify = 4 if self.distributed_spec else 1
+        expected_verify = distributed_mtp_steps() + 1 if self.distributed_spec else 1
         if self.distributed and (self.tp_world_size != 2 or verify_tokens != expected_verify):
-            raise NotImplementedError("distributed HiSparse requires attention TP2 and gated verify1/4")
+            raise NotImplementedError("distributed HiSparse requires attention TP2 and the explicitly gated verify width")
         if self.distributed and host_admission is None:
             raise ValueError("distributed HiSparse requires collective host admission before pin")
         if self.distributed:
