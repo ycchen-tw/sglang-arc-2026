@@ -1364,6 +1364,7 @@ class OpenAIServingChat(OpenAIServingBase):
         prompt = ""
         prompt_ids = []
         decoded_prompt = None
+        prompt_token_count = None  # ARC h42
         openai_compatible_messages = []
         image_data = []
         video_data = []
@@ -1584,6 +1585,11 @@ class OpenAIServingChat(OpenAIServingBase):
                     if decoded_prompt is not None
                     else self.tokenizer_manager.tokenizer.decode(prompt_ids)
                 )
+                # ARC h42: prompt_ids = encode(rendered_prompt, **encode_kwargs). When the prompt string handed
+                # on is that same text and encode_kwargs is empty, encode(prompt) (the Responses max_tokens
+                # default) is prompt_ids exactly: hand its length on instead of encoding the prompt again.
+                if not encode_kwargs and not assistant_prefix and prompt == rendered_prompt:
+                    prompt_token_count = len(prompt_ids)
 
         stop = request.stop
         image_data = image_data if image_data else None
@@ -1598,6 +1604,7 @@ class OpenAIServingChat(OpenAIServingBase):
             audio_data=audio_data,
             modalities=modalities,
             stop=stop,
+            prompt_token_count=prompt_token_count,
         )
 
     def _render_and_encode_chat_template(

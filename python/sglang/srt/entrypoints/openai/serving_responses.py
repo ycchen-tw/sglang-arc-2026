@@ -453,7 +453,18 @@ class OpenAIServingResponses(OpenAIServingChat):
                     if isinstance(engine_prompt, list):
                         prompt_length = len(engine_prompt)
                     elif isinstance(engine_prompt, str):
-                        prompt_length = len(tokenizer.encode(engine_prompt))
+                        # ARC h42: the render path's exact count when it describes this very prompt
+                        known = (
+                            processed_messages.prompt_token_count
+                            if processed_messages is not None
+                            and engine_prompt is processed_messages.prompt
+                            else None
+                        )
+                        prompt_length = (
+                            known
+                            if known is not None
+                            else len(tokenizer.encode(engine_prompt))
+                        )
                     else:
                         prompt_length = 0
 

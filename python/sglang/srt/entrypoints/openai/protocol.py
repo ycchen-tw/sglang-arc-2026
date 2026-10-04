@@ -2111,6 +2111,9 @@ class MessageProcessingResult:
     skip_special_tokens: bool = True
     require_reasoning: bool = False
     reasoning_end_token_ids: Optional[List[int]] = None
+    # ARC h42: len(tokenizer.encode(prompt)) when the render path already knows it exactly (the multimodal
+    # prompt string is the rendered template itself and was encoded with no extra kwargs); None otherwise
+    prompt_token_count: Optional[int] = None
 
 
 class ToolCallProcessingResult(NamedTuple):
