@@ -39,6 +39,7 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_fwd_interface_triton_ck,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.utils.common import is_sm100_supported
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,11 @@ _TRTLLM_SPARSE_PAGE_SIZE = 64
 # scales); decode gathers the selection as bytes and XQA reads FP4 through
 # kv_cache_sf, prefix prefill expands only the request's context transiently.
 _ARC_QSA_NVFP4 = os.environ.get("ARC_QSA_NVFP4") == "1"
+# The sm_100 trtllm-gen FP4 decode kernel reads the *value* scale plane in
+# groups of this many tokens, with the channel blocks interleaved inside each
+# group; the key plane it reads linearly. Derived and gated in
+# work/qwen38fn_eval/probe_trtllm_fp4_kv_sm100.py.
+_SF_TOKEN_GROUP = 4
 # Dtype the prefix-chunk expansion feeds the _ck kernel. FP8 halves what that
 # kernel re-reads per query row (the dominant cost of chunk prefill); BF16
 # exists so the downcast's quantization cost can be measured against it.
@@ -213,6 +219,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         self.token_to_kv_pool = getattr(runner, "token_to_kv_pool", None)
         self.device = getattr(runner, "device", None)
         self.arc_nvfp4 = _pool_kv_quant_name(self.token_to_kv_pool) == "nvfp4"
+        self.arc_nvfp4_sm100 = self.arc_nvfp4 and is_sm100_supported()
         if self.arc_nvfp4:
             if not _ARC_QSA_NVFP4:
                 raise RuntimeError(
@@ -221,8 +228,10 @@ class QwenSparseAttnBackend(AttentionBackend):
                 )
             if _resolve_trtllm_sparse_decode() is None:
                 raise RuntimeError(
-                    "NVFP4 QSA decode needs the trtllm-gen path: set "
-                    "ARC_QSA_SM120_DECODE=xqa"
+                    "NVFP4 QSA decode needs the trtllm-gen/XQA paged decode "
+                    "kernel and _resolve_trtllm_sparse_decode() returned None "
+                    "(device is not SM100/SM120, or flashinfer.decode is not "
+                    "importable)"
                 )
             if _ARC_QSA_NVFP4_PREFILL not in ("fp8", "bf16"):
                 raise RuntimeError(
@@ -230,8 +239,9 @@ class QwenSparseAttnBackend(AttentionBackend):
                     + _ARC_QSA_NVFP4_PREFILL
                 )
             logger.info(
-                "ARC_QSA_NVFP4=1: packed FP4 gather + XQA kv_cache_sf decode; "
+                "ARC_QSA_NVFP4=1: packed FP4 gather + %s kv_cache_sf decode; "
                 "prefix prefill uses the fused NVFP4 expansion to %s",
+                "sm100 trtllm-gen" if self.arc_nvfp4_sm100 else "XQA",
                 _ARC_QSA_NVFP4_PREFILL,
             )
         model_config = getattr(runner, "model_config", None)
@@ -1613,6 +1623,61 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         return output.reshape(q.shape[0], -1)
 
+    def _trtllm_sparse_nvfp4_sm100(
+        self, q, layer, trtllm_decode, packed_k, packed_v, packed_ks, packed_vs,
+        n, page, num_kv_heads, packed_dim, scale_dim, sf_dtype,
+        block_tables, valid_counts, stride, k_global, v_global, device,
+    ):
+        """Hand the gathered selection to sm_100's trtllm-gen FP4 decode kernel.
+
+        That kernel is a different family from the XQA one sm_120 uses, and it
+        differs in three ways that have to be honoured together: it reads HND,
+        it has no BF16-query and no BF16-output FP4 cubin at head_dim 256, and
+        it reads the value scale plane in groups of ``_SF_TOKEN_GROUP`` tokens
+        with the channel blocks interleaved inside each group while reading the
+        key plane linearly.
+
+        The scale layout is the dangerous one. Feeding it the linear plane that
+        ``nvfp4_kv_quantize`` produces raises nothing and returns a finite,
+        strongly correlated, wrong answer, off in proportion to how much the
+        per-block scales vary -- so there is no failure to notice at runtime.
+        ``work/qwen38fn_eval/probe_trtllm_fp4_kv_sm100.py`` derives the layout
+        and gates it.
+        """
+        pages = n // page
+        kv_cache = (
+            packed_k[:n].view(pages, page, num_kv_heads, packed_dim).permute(0, 2, 1, 3),
+            packed_v[:n].view(pages, page, num_kv_heads, packed_dim).permute(0, 2, 1, 3),
+        )
+        # Already in the kernel's order: the gather wrote it there. Only two
+        # strides reach the kernel for the scale planes (head and page), so
+        # their inner [page, scale_dim] tile does have to be contiguous, which
+        # this view is and a permuted one would not be.
+        kv_cache_sf = (
+            packed_ks[:n].view(pages, num_kv_heads, page, scale_dim).view(sf_dtype),
+            packed_vs[:n].view(pages, num_kv_heads, page, scale_dim).view(sf_dtype),
+        )
+        # The query is cast without a scale, as sglang's own trtllm_mha backend
+        # does for FP8 KV. E4M3 is a floating-point format, so folding a
+        # constant into it buys no relative precision -- measured at 0.0267 vs
+        # 0.0265 relative L2 -- while the amax reduction and the divide cost
+        # ~32us per decode step. All it would buy is headroom against the 448
+        # ceiling, and post-norm queries run three orders of magnitude below it.
+        output = trtllm_decode(
+            query=q.to(torch.float8_e4m3fn),
+            kv_cache=kv_cache,
+            workspace_buffer=self._trtllm_workspace,
+            block_tables=block_tables,
+            seq_lens=valid_counts,
+            max_seq_len=stride,
+            bmm1_scale=layer.scaling * k_global,
+            bmm2_scale=v_global,
+            kv_layout="HND",
+            out_dtype=torch.float8_e4m3fn,
+            kv_cache_sf=kv_cache_sf,
+        )
+        return output.to(q.dtype).reshape(q.shape[0], -1)
+
     def _forward_trtllm_sparse_nvfp4(
         self,
         q: torch.Tensor,
@@ -1663,9 +1728,19 @@ class QwenSparseAttnBackend(AttentionBackend):
             if metadata.row_req_pool_indices is not None
             else forward_batch.req_pool_indices
         )
-        for src_k, src_v, dst_k, dst_v in (
-            (k_fp4, v_fp4, packed_k, packed_v),
-            (k_sf.view(torch.uint8), v_sf.view(torch.uint8), packed_ks, packed_vs),
+        # sm_100 wants the scale planes paged and the value plane grouped; the
+        # gather writes that order directly rather than paying a second strided
+        # pass over the scratch afterwards. The packed byte planes stay
+        # token-major because three strides reach the kernel for those, so a
+        # permuted view is enough.
+        sf_dst_layout = (
+            {"dst_page_size": page, "dst_value_group": _SF_TOKEN_GROUP}
+            if self.arc_nvfp4_sm100
+            else {}
+        )
+        for src_k, src_v, dst_k, dst_v, dst_layout in (
+            (k_fp4, v_fp4, packed_k, packed_v, {}),
+            (k_sf.view(torch.uint8), v_sf.view(torch.uint8), packed_ks, packed_vs, sf_dst_layout),
         ):
             qwen_sparse_kv_extraction_compact_triton(
                 src_k,
@@ -1680,8 +1755,19 @@ class QwenSparseAttnBackend(AttentionBackend):
                 batch,
                 topk,
                 zero_fill_cols=stride,
+                **dst_layout,
             )
         n = batch * stride
+        if self._trtllm_workspace is None:
+            self._trtllm_workspace = torch.zeros(
+                128 * 1024 * 1024, dtype=torch.uint8, device=device
+            )
+        if self.arc_nvfp4_sm100:
+            return self._trtllm_sparse_nvfp4_sm100(
+                q, layer, trtllm_decode, packed_k, packed_v, packed_ks, packed_vs,
+                n, page, num_kv_heads, packed_dim, scale_dim, k_sf.dtype,
+                block_tables, valid_counts, stride, k_global, v_global, device,
+            )
         kv_cache = (
             packed_k[:n].view(-1, page, num_kv_heads, packed_dim),
             packed_v[:n].view(-1, page, num_kv_heads, packed_dim),
@@ -1690,10 +1776,6 @@ class QwenSparseAttnBackend(AttentionBackend):
             packed_ks[:n].view(-1, page, num_kv_heads, scale_dim).view(k_sf.dtype),
             packed_vs[:n].view(-1, page, num_kv_heads, scale_dim).view(v_sf.dtype),
         )
-        if self._trtllm_workspace is None:
-            self._trtllm_workspace = torch.zeros(
-                128 * 1024 * 1024, dtype=torch.uint8, device=device
-            )
         output = trtllm_decode(
             query=q.contiguous(),
             kv_cache=kv_cache,

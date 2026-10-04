@@ -392,6 +392,8 @@ def _compact_kv(
     BLOCK_TOPK: tl.constexpr,
     BLOCK_D: tl.constexpr,
     ZERO_FILL: tl.constexpr,
+    DST_PAGE_SIZE: tl.constexpr,
+    DST_V_GROUP: tl.constexpr,
 ):
     batch, head, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     cols = block * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
@@ -411,11 +413,30 @@ def _compact_kv(
     # more than 2^31 / (heads * dim) tokens (~4.2M for 2 x 256), which an FP8 pool
     # on one GPU does reach.
     src = slots.to(tl.int64)[:, None] * heads * dim + head * dim + dims[None, :]
-    dst = (
-        (pack_start + cols).to(tl.int64)[:, None] * heads * dim
-        + head * dim
-        + dims[None, :]
-    )
+    token = (pack_start + cols).to(tl.int64)
+    if DST_PAGE_SIZE > 0:
+        # Write straight into the consumer's paged [page, head, token, dim]
+        # order instead of the token-major default, so a second pass over the
+        # scratch is not needed to hand it to a kernel that wants HND. With
+        # DST_V_GROUP set, the value plane additionally lands in token groups
+        # of that size with dim interleaved inside each group -- the layout the
+        # sm_100 trtllm-gen FP4 decode kernel reads its value scales in.
+        page = token // DST_PAGE_SIZE
+        slot = token % DST_PAGE_SIZE
+        base = page * (heads * DST_PAGE_SIZE * dim) + head * (DST_PAGE_SIZE * dim)
+        dst_k = base[:, None] + slot[:, None] * dim + dims[None, :]
+        if DST_V_GROUP > 0:
+            dst_v = (
+                base[:, None]
+                + (slot // DST_V_GROUP)[:, None] * (DST_V_GROUP * dim)
+                + dims[None, :] * DST_V_GROUP
+                + (slot % DST_V_GROUP)[:, None]
+            )
+        else:
+            dst_v = dst_k
+    else:
+        dst_k = token[:, None] * heads * dim + head * dim + dims[None, :]
+        dst_v = dst_k
     load_mask = valid[:, None] & (dims[None, :] < dim)
     if ZERO_FILL:
         # Strided (page-aligned) packing: the paged decode kernel reads whole pages,
@@ -431,12 +452,12 @@ def _compact_kv(
     # qwen_sparse_attn_backend.py), so no scale is applied here either.
     out_dtype = out_k.dtype.element_ty
     tl.store(
-        out_k + dst,
+        out_k + dst_k,
         tl.load(k + src, mask=load_mask, other=0.0).to(out_dtype),
         mask=store_mask,
     )
     tl.store(
-        out_v + dst,
+        out_v + dst_v,
         tl.load(v + src, mask=load_mask, other=0.0).to(out_dtype),
         mask=store_mask,
     )
@@ -468,6 +489,8 @@ def qwen_sparse_kv_extraction_compact_triton(
     batch,
     topk,
     zero_fill_cols: int = 0,
+    dst_page_size: Optional[int] = None,
+    dst_value_group: Optional[int] = None,
 ):
     """Gather the selected K/V rows into ``out_k``/``out_v``.
 
@@ -484,7 +507,26 @@ def qwen_sparse_kv_extraction_compact_triton(
     Both layouts assume the valid entries of each ``indices`` row are contiguous at
     the front (``expand_qsa_block_indices`` sorts them that way): ``valid_count`` is a
     count, not a mask, so a ``-1`` in the middle of a row would shift the packing.
+
+    ``dst_page_size`` switches the destination from token-major to the consumer's
+    paged ``[page, head, token, dim]`` order; ``dst_value_group`` additionally lands
+    the value plane in token groups of that size with ``dim`` interleaved inside each
+    group. Both are only meaningful for the strided layout, so they require
+    ``zero_fill_cols``.
     """
+    dst_page_size = dst_page_size or 0
+    dst_value_group = dst_value_group or 0
+    if dst_page_size and zero_fill_cols <= 0:
+        raise ValueError("dst_page_size only applies to the strided (zero-fill) layout")
+    if dst_value_group and not dst_page_size:
+        raise ValueError("dst_value_group needs dst_page_size")
+    if dst_page_size and (
+        zero_fill_cols % dst_page_size or dst_page_size % max(dst_value_group, 1)
+    ):
+        raise ValueError(
+            "dst_page_size must divide zero_fill_cols and be a multiple of "
+            "dst_value_group"
+        )
     _, heads, dim = k.shape
     block_topk = 16
     zero_fill = zero_fill_cols > 0
@@ -508,6 +550,8 @@ def qwen_sparse_kv_extraction_compact_triton(
         BLOCK_TOPK=block_topk,
         BLOCK_D=triton.next_power_of_2(dim),
         ZERO_FILL=zero_fill,
+        DST_PAGE_SIZE=dst_page_size,
+        DST_V_GROUP=dst_value_group,
         num_warps=8,
     )
 
