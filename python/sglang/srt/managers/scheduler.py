@@ -1886,6 +1886,10 @@ class Scheduler(
         self.tree_cache.release_host_resources()
         if self.decode_offload_manager is not None:
             self.decode_offload_manager.release_host_resources()
+        # arc-forge h13: the PLE table's registered host memory
+        from sglang.srt.models.qwen4_exp_ple_table import release_ple_host_tables
+
+        release_ple_host_tables()
         destroy_global_experts_capturer()
         destroy_global_indexer_capturer()
 

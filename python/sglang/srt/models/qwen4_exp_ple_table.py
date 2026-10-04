@@ -5,7 +5,12 @@ Qwen3.8-Flash-Next) out of device memory and lets the Triton gather kernel read
 rows straight from a host pointer. Two backends provide that pointer:
 
 ``pinned`` (default)
-    ``torch.empty(..., pin_memory=True)``. On a discrete GPU this frees VRAM.
+    Page-locked host memory. On a discrete GPU this frees VRAM. arc-forge h13: an
+    exact-size anonymous mmap registered with ``cudaHostRegister`` (the host KV
+    pools' allocator), not ``torch.empty(..., pin_memory=True)``: PyTorch's
+    CachingHostAllocator rounds each block up to a power of two, 47.68 GiB to
+    64 GiB for Qwen3.8-Flash-Next. The kernel reads the registered host pointer
+    (UVA); ``release_ple_host_tables`` unregisters it on shutdown.
 
 ``file``
     A file-backed, shared ``mmap`` of a sparse file under
@@ -23,8 +28,8 @@ rows straight from a host pointer. Two backends provide that pointer:
     page-cache folios and the table would otherwise creep towards full
     residency (see ``PleFileRssTrimmer``).
 
-This module has no Triton or CUDA-kernel imports so that its allocator and
-prefetcher can be unit-tested on CPU.
+This module has no Triton or CUDA-kernel imports so that its prefetcher can be
+unit-tested on CPU (the pinned backend needs CUDA for the registration).
 """
 
 from __future__ import annotations
@@ -49,6 +54,8 @@ _SMAPS_HEADER = re.compile(r"^([0-9a-f]+)-([0-9a-f]+) ")
 _SMAPS_RSS = re.compile(r"^Rss:\s+(\d+) kB")
 
 PLE_OFFLOAD_BACKENDS = ("pinned", "file")
+# pinned tables, registered with cudaHostRegister (h13); release_ple_host_tables
+_REGISTERED_TABLES: list[torch.Tensor] = []
 
 # cudaDeviceAttr enum values (cuda_runtime_api.h).
 _CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES = 100
@@ -240,13 +247,13 @@ def allocate_ple_host_table(
         raise ValueError(
             f"unknown PLE offload backend {backend!r}; choose from {PLE_OFFLOAD_BACKENDS}"
         )
-    if backend == "pinned":
-        return torch.empty(tuple(shape), dtype=dtype, device="cpu", pin_memory=True)
-
     numel = 1
     for d in shape:
         numel *= int(d)
     nbytes = numel * torch.empty(0, dtype=dtype).element_size()
+    if backend == "pinned":
+        return _allocate_registered(shape, dtype, nbytes)
+
     table_dir = os.path.expanduser(table_dir or envs.SGLANG_QWEN4_PLE_FILE_DIR.get())
     os.makedirs(table_dir, exist_ok=True)
     path = os.path.join(table_dir, ple_table_file_name(shape, dtype, tag))
@@ -262,6 +269,52 @@ def allocate_ple_host_table(
     table = storage.view(dtype).view(*[int(d) for d in shape])
     table._sglang_ple_file_path = path  # consumed by PleFilePrefetcher
     return table
+
+
+def _allocate_registered(shape: Sequence[int], dtype: torch.dtype, nbytes: int) -> torch.Tensor:
+    """Exactly nbytes of page-locked host memory (arc-forge h13), viewed as the table.
+
+    A prefaulted MAP_SHARED anonymous mmap registered with cudaHostRegister in row-aligned
+    chunks, as the host KV pools allocate; freed with the tensor after
+    release_ple_host_tables has unregistered it.
+    """
+    from sglang.srt.mem_cache.pool_host.common import (
+        HostTensorAllocator,
+        alloc_with_host_register,
+    )
+
+    row_bytes = nbytes // int(shape[0])
+    raw = alloc_with_host_register(
+        (nbytes,),
+        dtype=torch.uint8,
+        device="cpu",
+        pin_memory=True,
+        allocator=HostTensorAllocator(),
+        registration_granularity_bytes=row_bytes,
+    )
+    _REGISTERED_TABLES.append(raw)
+    logger.info(
+        "PLE table: pinned %.2f GiB (%d B, mmap + cudaHostRegister), %s",
+        nbytes / 2**30,
+        nbytes,
+        dtype,
+    )
+    return raw.view(dtype).view(*[int(d) for d in shape])
+
+
+def release_ple_host_tables() -> None:
+    """Unregister every pinned PLE table (graceful shutdown; idempotent).
+
+    Large cudaHostRegister'd buffers are otherwise unpinned during process reclaim,
+    which can stall teardown (see HostKVCache.destroy). No kernel may read a table
+    afterwards.
+    """
+    if not _REGISTERED_TABLES:
+        return
+    from sglang.srt.mem_cache.pool_host.common import _cuda_host_unregister
+
+    while _REGISTERED_TABLES:
+        _cuda_host_unregister(_REGISTERED_TABLES.pop())
 
 
 def make_ple_file_prefetcher(table: torch.Tensor) -> Optional[PleFilePrefetcher]:
