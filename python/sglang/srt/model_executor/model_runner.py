@@ -1330,6 +1330,10 @@ class ModelRunner:
 
         if os.environ.get("ARC_HISPARSE_STARTUP_CACHE_DROP") != "1":
             return
+        # Native MTP loads the same checkpoint after target admission.
+        # Its runner must not join target-only checkpoint advice.
+        if self.is_draft_worker:
+            return
         group = self.tp_group.cpu_group
         if dist.get_backend(group) != "gloo":
             raise RuntimeError("h30 checkpoint cache drop requires the TP CPU/Gloo group")
