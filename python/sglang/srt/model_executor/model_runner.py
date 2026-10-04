@@ -939,6 +939,17 @@ class ModelRunner:
     def maybe_init_hisparse_coordinator(self):
         if not self.enable_hisparse:
             return
+        from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+
+        if isinstance(self.token_to_kv_pool, QSATokenToKVPool):
+            # arc-forge QSA HiSparse (h03): block-granular coordinator over the
+            # two-region device pool; top-k, B and the host size come from the pool.
+            from sglang.srt.managers.qsa_hisparse_coordinator import (
+                create_qsa_hisparse_coordinator,
+            )
+
+            self.hisparse_coordinator = create_qsa_hisparse_coordinator(self)
+            return
         from sglang.srt.managers.hisparse_coordinator import (
             HiSparseCoordinator,
             resolve_shared_index_layers,
