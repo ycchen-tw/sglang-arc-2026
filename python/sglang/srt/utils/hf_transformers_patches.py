@@ -62,6 +62,7 @@ def apply_all():
     _patch_image_processor_kwargs()
     _patch_image_process_cuda_tensor()
     _patch_nemotron_h_pattern()
+    _patch_check_special_mm_tokens()  # ARC h40
 
     # v5 general patches
     _ensure_clean_up_tokenization_compat()
@@ -358,6 +359,76 @@ def _patch_image_process_cuda_tensor():
         logger.debug(
             "_patch_image_process_cuda_tensor: required modules not importable, patch skipped"
         )
+
+
+# ARC h40: sha256 of inspect.getsource(ProcessorMixin._check_special_mm_tokens) in the transformers this
+# replacement was proven equal to (5.12.1). Another implementation must be re-checked before it is replaced.
+_CHECK_SPECIAL_MM_TOKENS_SOURCE_SHA256 = "550527fe89dd866be96e011f0d03c419c9c5c8b42a00aec8c87c5fc2e6ed7eca"
+_CHECK_SPECIAL_MM_TOKENS_INT_DTYPES = ("int32", "int64")
+
+
+def _count_token_rows(ids_batch, token_id):
+    """Per-row count of ``token_id`` for a 2-D int32/int64 torch / numpy batch, else None (caller loops)."""
+    import numpy as np
+    import torch
+
+    if isinstance(token_id, bool) or not isinstance(token_id, int):
+        return None
+    if isinstance(ids_batch, torch.Tensor):
+        if ids_batch.ndim != 2 or str(ids_batch.dtype).split(".")[-1] not in _CHECK_SPECIAL_MM_TOKENS_INT_DTYPES:
+            return None
+        return (ids_batch == token_id).sum(dim=-1).tolist()
+    if isinstance(ids_batch, np.ndarray):
+        if ids_batch.ndim != 2 or ids_batch.dtype.name not in _CHECK_SPECIAL_MM_TOKENS_INT_DTYPES:
+            return None
+        return (ids_batch == token_id).sum(axis=-1).tolist()
+    return None
+
+
+def _patch_check_special_mm_tokens():
+    """Count mm placeholder ids with one tensor comparison instead of a Python loop.
+
+    ``ProcessorMixin._check_special_mm_tokens`` runs after every processor call
+    with text and counts each modality's token id with
+    ``list(ids).count(token_id)`` over the tokenized prompt: one 0-d tensor per
+    token, compared one by one (~3 us per token per modality; ~0.13 s for a
+    40k-token prompt with image + video, held under the GIL). This replacement
+    keeps the same modality loop, the same ``{modality}_token`` /
+    ``{modality}_token_id`` test, the same ``sample.count(token_str)`` text side
+    and the same ValueError; only the id count of a 2-D int32/int64 batch is
+    vectorized (anything else goes through the original expression).
+    """
+    import hashlib
+
+    from transformers.processing_utils import ProcessorMixin
+
+    original = ProcessorMixin._check_special_mm_tokens
+    got = hashlib.sha256(inspect.getsource(original).encode()).hexdigest()
+    if got != _CHECK_SPECIAL_MM_TOKENS_SOURCE_SHA256:
+        raise RuntimeError(
+            "ARC h40: transformers' ProcessorMixin._check_special_mm_tokens is not the "
+            f"implementation the vectorized replacement was checked against (source sha256 {got})"
+        )
+
+    def _check_special_mm_tokens(self, text, text_inputs, modalities):
+        for modality in modalities:
+            token_str = getattr(self, f"{modality}_token", None)
+            token_id = getattr(self, f"{modality}_token_id", None)
+            if token_str is not None and token_id is not None:
+                ids_batch = text_inputs["input_ids"]
+                ids_count = _count_token_rows(ids_batch, token_id)
+                if ids_count is None:
+                    ids_count = [list(ids).count(token_id) for ids in ids_batch]
+                text_count = [sample.count(token_str) for sample in text]
+
+                if ids_count != text_count:
+                    raise ValueError(
+                        f"Mismatch in `{modality}` token count between text and `input_ids`. Got ids={ids_count} and text={text_count}. "
+                        "Likely due to `truncation='max_length'`. Please disable truncation or increase `max_length`."
+                    )
+
+    _check_special_mm_tokens.__wrapped__ = original
+    ProcessorMixin._check_special_mm_tokens = _check_special_mm_tokens
 
 
 def _patch_nemotron_h_pattern():
