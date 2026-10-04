@@ -1294,6 +1294,217 @@ def qwen_sparse_gqa_decode_selected_fp4_triton(
     return (out * v_global).to(q.dtype)
 
 
+
+# ---------------------------------------------------------------- arc-forge h22: direct sparse decode
+# Sparse GQA over the selected slots read straight from the pool (NVFP4 packed or FP8), through any
+# (table, table row) pair: req_to_token over logical positions, or HiSparse's identity table over device
+# rows. Split-K over the selection (flash-decoding) so a 55-row decode fills the GPU; one program per
+# (row, KV head, split) shares the K/V decode across the head group. The query scaling happens in the
+# kernel and the output is cast in the final store, so a call is one launch (two with splits).
+# E2M1 decode variants (bit-identical values): 0 arithmetic (the 0020 ladder), 1 bit construction,
+# 2 the sm_100a / sm_120a cvt.rn.f16x2.e2m1x2 instruction.
+
+
+@triton.jit
+def _e2m1_nibble_f32(nib, DECODE: tl.constexpr):
+    if DECODE == 0:
+        exponent = (nib >> 1) & 0x03
+        mantissa = (nib & 0x01).to(tl.float32)
+        pow2 = (1 << tl.maximum(exponent - 1, 0)).to(tl.float32)
+        magnitude = tl.where(exponent == 0, mantissa * 0.5, pow2 * (1.0 + mantissa * 0.5))
+        return tl.where(((nib >> 3) & 0x01) == 1, -magnitude, magnitude)
+    else:
+        # fp32 bits: exponent e + 126 and the mantissa bit m for em = e:m >= 2; 0.5 / 0 below
+        em = nib & 7
+        bits = tl.where(em >= 2, (em + 252) << 22, tl.where(em == 1, 0x3F000000, 0))
+        return (bits | ((nib & 8) << 28)).to(tl.float32, bitcast=True)
+
+
+@triton.jit
+def _e2m1_pair_f32(b, DECODE: tl.constexpr):
+    """uint8 packed E2M1 pairs -> (low nibble, high nibble) as fp32."""
+    if DECODE == 2:
+        h = tl.inline_asm_elementwise(
+            asm="{ .reg .b8 b0, b1, b2, b3; mov.b32 {b0, b1, b2, b3}, $4; "
+                "cvt.rn.f16x2.e2m1x2 $0, b0; cvt.rn.f16x2.e2m1x2 $1, b1; "
+                "cvt.rn.f16x2.e2m1x2 $2, b2; cvt.rn.f16x2.e2m1x2 $3, b3; }",
+            constraints="=r,=r,=r,=r,r", args=[b], dtype=tl.int32, is_pure=True, pack=4)
+        lo = (h & 0xFFFF).to(tl.int16).to(tl.float16, bitcast=True).to(tl.float32)
+        hi = (h >> 16).to(tl.int16).to(tl.float16, bitcast=True).to(tl.float32)
+        return lo, hi
+    else:
+        bi = b.to(tl.int32)
+        return _e2m1_nibble_f32(bi & 0x0F, DECODE), _e2m1_nibble_f32(bi >> 4, DECODE)
+
+
+@triton.jit
+def _qsa_direct_decode(
+    q, k, v, k_sf, v_sf, table, table_rows, indices, lens, out, part_o, part_ml,
+    sm_scale, k_global, v_global, topk, table_stride, chunk,
+    GROUP: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    Q_HEADS: tl.constexpr, HEADS: tl.constexpr, DIM: tl.constexpr,
+    SPLITS: tl.constexpr, FP4: tl.constexpr, DECODE: tl.constexpr,
+):
+    row, kv_head, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    HALF: tl.constexpr = DIM // 2
+    SF: tl.constexpr = DIM // 16
+    length = tl.load(lens + row)
+    trow = tl.load(table_rows + row).to(tl.int64)
+    offs_h = tl.arange(0, BLOCK_M)
+    hmask = (offs_h < GROUP)[:, None]
+    head_start = kv_head * GROUP
+    q_row = q + row * (Q_HEADS * DIM) + (head_start + offs_h[:, None]) * DIM
+    offs_n = tl.arange(0, BLOCK_N)
+    if FP4:
+        offs_p = tl.arange(0, HALF)
+        offs_s = tl.arange(0, SF)
+        qe = (((tl.load(q_row + 2 * offs_p[None, :], mask=hmask, other=0.0).to(tl.float32) * sm_scale)
+               * 1.4426950408) * k_global).to(tl.bfloat16)
+        qo = (((tl.load(q_row + 2 * offs_p[None, :] + 1, mask=hmask, other=0.0).to(tl.float32) * sm_scale)
+               * 1.4426950408) * k_global).to(tl.bfloat16)
+        acc_e = tl.zeros([BLOCK_M, HALF], tl.float32)
+        acc_o = tl.zeros([BLOCK_M, HALF], tl.float32)
+    else:
+        offs_d = tl.arange(0, DIM)
+        qv = (((tl.load(q_row + offs_d[None, :], mask=hmask, other=0.0).to(tl.float32) * sm_scale)
+               * 1.4426950408) * k_global).to(tl.bfloat16)
+        acc = tl.zeros([BLOCK_M, DIM], tl.float32)
+    m_i = tl.full([BLOCK_M], -float("inf"), tl.float32)
+    l_i = tl.zeros([BLOCK_M], tl.float32)
+    begin = split * chunk
+    end = tl.minimum(begin + chunk, topk)
+    for start in range(begin, end, BLOCK_N):
+        cur = start + offs_n
+        pos = tl.load(indices + row * topk + cur, mask=cur < end, other=-1)
+        valid = (cur < end) & (pos >= 0) & (pos < length)
+        tok = tl.load(table + trow * table_stride + tl.where(valid, pos, 0), mask=valid, other=0).to(tl.int64)
+        if FP4:
+            kb = tl.load(k + tok[None, :] * (HEADS * HALF) + kv_head * HALF + offs_p[:, None],
+                         mask=valid[None, :], other=0)
+            ks = tl.load(k_sf + tok[None, :] * (HEADS * SF) + kv_head * SF + offs_s[:, None],
+                         mask=valid[None, :], other=0.0).to(tl.float32)
+            ks = tl.reshape(tl.broadcast_to(tl.reshape(ks, (SF, 1, BLOCK_N)), (SF, 8, BLOCK_N)), (HALF, BLOCK_N))
+            k_lo, k_hi = _e2m1_pair_f32(kb, DECODE)
+            scores = tl.dot(qe, (k_lo * ks).to(tl.bfloat16)) + tl.dot(qo, (k_hi * ks).to(tl.bfloat16))
+        else:
+            kt = tl.load(k + tok[None, :] * (HEADS * DIM) + kv_head * DIM + offs_d[:, None],
+                         mask=valid[None, :], other=0.0).to(tl.bfloat16)
+            scores = tl.dot(qv, kt)
+        scores = tl.where(valid[None, :], scores, -float("inf"))
+        m_new = tl.maximum(m_i, tl.max(scores, 1))
+        # a split whose slots so far are all invalid keeps the max at -inf: shift by 0 (alpha, p = 0)
+        shift = tl.where(m_new == -float("inf"), 0.0, m_new)
+        alpha = tl.math.exp2(m_i - shift)
+        p = tl.math.exp2(scores - shift[:, None])
+        if FP4:
+            vb = tl.load(v + tok[:, None] * (HEADS * HALF) + kv_head * HALF + offs_p[None, :],
+                         mask=valid[:, None], other=0)
+            vs = tl.load(v_sf + tok[:, None] * (HEADS * SF) + kv_head * SF + offs_s[None, :],
+                         mask=valid[:, None], other=0.0).to(tl.float32)
+            vs = tl.reshape(tl.broadcast_to(tl.reshape(vs, (BLOCK_N, SF, 1)), (BLOCK_N, SF, 8)), (BLOCK_N, HALF))
+            v_lo, v_hi = _e2m1_pair_f32(vb, DECODE)
+            pb = p.to(tl.bfloat16)
+            acc_e = tl.dot(pb, (v_lo * vs).to(tl.bfloat16), acc_e * alpha[:, None])
+            acc_o = tl.dot(pb, (v_hi * vs).to(tl.bfloat16), acc_o * alpha[:, None])
+        else:
+            vt = tl.load(v + tok[:, None] * (HEADS * DIM) + kv_head * DIM + offs_d[None, :],
+                         mask=valid[:, None], other=0.0).to(tl.bfloat16)
+            acc = tl.dot(p.to(tl.bfloat16), vt, acc * alpha[:, None])
+        l_i = l_i * alpha + tl.sum(p, 1)
+        m_i = m_new
+    heads = head_start + offs_h
+    if SPLITS == 1:
+        norm = tl.where(l_i > 0, l_i, 1.0)  # an empty row (a padded graph row) writes zeros
+        base = out + row * (Q_HEADS * DIM) + heads[:, None] * DIM
+        if FP4:
+            tl.store(base + 2 * offs_p[None, :], (acc_e / norm[:, None] * v_global).to(out.dtype.element_ty), mask=hmask)
+            tl.store(base + 2 * offs_p[None, :] + 1, (acc_o / norm[:, None] * v_global).to(out.dtype.element_ty), mask=hmask)
+        else:
+            tl.store(base + offs_d[None, :], (acc / norm[:, None] * v_global).to(out.dtype.element_ty), mask=hmask)
+    else:
+        slot = (row * Q_HEADS + heads) * SPLITS + split
+        base = part_o + slot[:, None] * DIM
+        if FP4:
+            tl.store(base + 2 * offs_p[None, :], acc_e, mask=hmask)
+            tl.store(base + 2 * offs_p[None, :] + 1, acc_o, mask=hmask)
+        else:
+            tl.store(base + offs_d[None, :], acc, mask=hmask)
+        hm = offs_h < GROUP
+        tl.store(part_ml + slot * 2, m_i, mask=hm)
+        tl.store(part_ml + slot * 2 + 1, l_i, mask=hm)
+
+
+@triton.jit
+def _qsa_direct_combine(part_o, part_ml, out, v_global, Q_HEADS: tl.constexpr, DIM: tl.constexpr,
+                        SPLITS: tl.constexpr, BLOCK_S: tl.constexpr):
+    row, head = tl.program_id(0), tl.program_id(1)
+    offs_s = tl.arange(0, BLOCK_S)
+    smask = offs_s < SPLITS
+    slot = (row * Q_HEADS + head) * SPLITS + offs_s
+    m = tl.load(part_ml + slot * 2, mask=smask, other=-float("inf"))
+    l = tl.load(part_ml + slot * 2 + 1, mask=smask, other=0.0)
+    mx = tl.max(m, 0)
+    w = tl.math.exp2(m - tl.where(mx == -float("inf"), 0.0, mx))
+    total = tl.sum(w * l, 0)
+    offs_d = tl.arange(0, DIM)
+    o = tl.load(part_o + slot[:, None] * DIM + offs_d[None, :], mask=smask[:, None], other=0.0)
+    acc = tl.sum(w[:, None] * o, 0)
+    total = tl.where(total > 0, total, 1.0)
+    tl.store(out + (row * Q_HEADS + head) * DIM + offs_d, (acc / total * v_global).to(out.dtype.element_ty))
+
+
+def qsa_sparse_decode_direct(
+    q, k, v, k_sf, v_sf, table, table_rows, indices, lens, scale, k_global=1.0, v_global=1.0,
+    *, block_n=64, warps=4, stages=2, chunk=None, decode=2,
+):
+    """arc-forge h22: sparse GQA decode straight off the pool for the selected slots.
+
+    q [rows, q_heads, dim] BF16; k/v either packed NVFP4 (uint8 [slots, kv_heads, dim/2], low nibble = even
+    feature, with k_sf/v_sf E4M3 [slots, kv_heads, dim/16]) or FP8 E4M3 [slots, kv_heads, dim] (k_sf/v_sf None);
+    slot = table[table_rows[r], indices[r, j]] for 0 <= indices[r, j] < lens[r]. chunk (a multiple of block_n)
+    splits the selection; None = one split. Returns BF16 [rows, q_heads, dim]; a row with no valid slot is 0.
+    """
+    rows, q_heads, dim = q.shape
+    fp4 = k.dtype == torch.uint8
+    if q.dtype != torch.bfloat16 or not q.is_contiguous() or not indices.is_contiguous():
+        raise ValueError("direct decode needs a contiguous BF16 query and contiguous indices")
+    if indices.dtype != torch.int32 or indices.shape[0] != rows:
+        raise ValueError(f"indices must be int32 [{rows}, topk], got {indices.dtype} {tuple(indices.shape)}")
+    if fp4:
+        if k_sf is None or v_sf is None or k.shape[2] * 2 != dim:
+            raise ValueError("packed NVFP4 K/V need their E4M3 scale planes and dim/2 bytes per head")
+    elif k.dtype != torch.float8_e4m3fn or v.dtype != torch.float8_e4m3fn or k.shape[2] != dim:
+        raise ValueError(f"direct decode reads packed NVFP4 or FP8 E4M3 K/V, got {k.dtype}/{v.dtype}")
+    kv_heads = k.shape[1]
+    group = q_heads // kv_heads
+    topk = indices.shape[1]
+    chunk = triton.cdiv(topk, block_n) * block_n if chunk is None else chunk
+    if chunk <= 0 or chunk % block_n:
+        raise ValueError(f"chunk {chunk} is not a multiple of block_n {block_n}")
+    splits = triton.cdiv(topk, chunk)
+    out = torch.empty(rows, q_heads, dim, device=q.device, dtype=q.dtype)
+    if rows == 0:
+        return out
+    if splits > 1:
+        part_o = torch.empty(rows, q_heads, splits, dim, device=q.device, dtype=torch.float32)
+        part_ml = torch.empty(rows, q_heads, splits, 2, device=q.device, dtype=torch.float32)
+    else:
+        part_o = part_ml = out
+    _qsa_direct_decode[(rows, kv_heads, splits)](
+        q, k, v, k_sf if fp4 else k, v_sf if fp4 else v, table, table_rows, indices, lens, out, part_o, part_ml,
+        float(scale), float(k_global), float(v_global), topk, table.stride(0), chunk,
+        GROUP=group, BLOCK_M=max(16, triton.next_power_of_2(group)), BLOCK_N=block_n,
+        Q_HEADS=q_heads, HEADS=kv_heads, DIM=dim, SPLITS=splits, FP4=fp4, DECODE=decode,
+        num_warps=warps, num_stages=stages,
+    )
+    if splits > 1:
+        _qsa_direct_combine[(rows, q_heads)](
+            part_o, part_ml, out, float(v_global), Q_HEADS=q_heads, DIM=dim, SPLITS=splits,
+            BLOCK_S=max(2, triton.next_power_of_2(splits)), num_warps=4,
+        )
+    return out
+
+
 @triton.jit
 def _qsa_nvfp4_expand_kv(
     k_fp4, v_fp4, k_sf, v_sf, req_to_token, req_indices, cu_k, out_k, out_v,
@@ -1343,4 +1554,5 @@ __all__ = [
     "sparse_gqa_fwd_interface_triton_ck",
     "qwen_sparse_gqa_decode_selected_triton",
     "qwen_sparse_gqa_decode_selected_fp4_triton",
+    "qsa_sparse_decode_direct",
 ]

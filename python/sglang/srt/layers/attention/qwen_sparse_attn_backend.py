@@ -41,6 +41,7 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_gqa_decode_selected_triton,
     qwen_sparse_gqa_decode_selected_fp4_triton,
     qwen_sparse_valid_counts_triton,
+    qsa_sparse_decode_direct,
     sparse_gqa_fwd_interface_triton,
     sparse_gqa_fwd_interface_triton_ck,
 )
@@ -64,6 +65,23 @@ _ARC_QSA_NVFP4 = os.environ.get("ARC_QSA_NVFP4") == "1"
 # group; the key plane it reads linearly. Derived and gated in
 # work/qwen38fn_eval/probe_trtllm_fp4_kv_sm100.py.
 _SF_TOKEN_GROUP = 4
+
+# arc-forge h22: sparse decode / target verify straight off the pool (qsa_sparse_decode_direct),
+# reading the selected slots through the same tables the gather uses (HiSparse: identity table
+# over the device rows), instead of gathering them into page-aligned scratch for XQA.
+# ARC_QSA_NVFP4_DIRECT=1: the packed NVFP4 pool (the target); ARC_QSA_FP8_DIRECT=1: an FP8 pool
+# (the MTP draft). Default 0 (off).
+def _arc_flag(name):
+    value = os.environ.get(name, "0")
+    if value not in ("0", "1"):
+        raise ValueError(f"{name} must be 0 or 1, got {value!r}")
+    return value == "1"
+
+
+_ARC_QSA_NVFP4_DIRECT = _arc_flag("ARC_QSA_NVFP4_DIRECT")
+_ARC_QSA_FP8_DIRECT = _arc_flag("ARC_QSA_FP8_DIRECT")
+# (block_n, warps, stages, chunk, decode) per pool kind, from the G4 microbench (h22 note)
+_ARC_QSA_DIRECT_TILE = {"nvfp4": (64, 4, 3, 512, 2), "fp8": (64, 4, 3, 1024, 0)}
 
 # One fused four-plane gather instead of two same-shaped passes over the same
 # address chain. Byte-for-byte identical output, so "split" exists only as a
@@ -2306,6 +2324,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         """Selected tokens are gathered as packed FP4 bytes plus their block
         scales into page-aligned scratch; trtllm-gen XQA reads FP4 directly
         through kv_cache_sf, so no dequantized copy of the selection exists."""
+        if _ARC_QSA_NVFP4_DIRECT and not self.arc_nvfp4_sm100:
+            return self._forward_direct(q, layer, forward_batch, metadata, topk_indices)
         trtllm_decode = _resolve_trtllm_sparse_decode()
         pool = self.token_to_kv_pool
         k_fp4, v_fp4, k_sf, v_sf = pool.get_raw_kv_buffer(layer.layer_id)
@@ -2429,6 +2449,48 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         return output.reshape(q.shape[0], -1)
 
+    def _forward_direct(
+        self,
+        q: torch.Tensor,
+        layer,
+        forward_batch,
+        metadata,
+        topk_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """h22: sparse GQA straight off the pool -- packed NVFP4 (token-major bytes and
+        E4M3 block-16 scales, the sm_120 layout) or FP8 -- for the selected slots, read
+        through the gather's tables: req_to_token over the logical indices, or under
+        HiSparse the identity table over the device rows the hot expansion wrote (one
+        valid pattern with the logical indices). The selection is the XQA path's; only
+        how the selected blocks are read changes. NVFP4 global scales are the pool's
+        host floats (no device sync; graph-safe); FP8 KV is stored and gathered
+        unscaled, so it is read unscaled."""
+        pool = self.token_to_kv_pool
+        if self.arc_nvfp4:
+            k, v, k_sf, v_sf = pool.get_raw_kv_buffer(layer.layer_id)
+            k_global, v_global = pool.get_kv_cache_quant_method().get_bmm_scales(layer.layer_id)
+            if not isinstance(k_global, float) or not isinstance(v_global, float):
+                raise RuntimeError(
+                    f"ARC_QSA_NVFP4_DIRECT needs host float global scales, got "
+                    f"{type(k_global).__name__}/{type(v_global).__name__}"
+                )
+            tile = _ARC_QSA_DIRECT_TILE["nvfp4"]
+        else:
+            k, v = pool.get_key_buffer(layer.layer_id), pool.get_value_buffer(layer.layer_id)
+            k_sf = v_sf = None
+            k_global = v_global = 1.0
+            tile = _ARC_QSA_DIRECT_TILE["fp8"]
+        table, rows, indices, lens = self._decode_gather_tables(
+            metadata, forward_batch, topk_indices
+        )
+        block_n, warps, stages, chunk, decode = tile
+        output = qsa_sparse_decode_direct(
+            q.contiguous(), k, v, k_sf, v_sf, table, rows,
+            indices.to(torch.int32).contiguous(), lens, layer.scaling, k_global, v_global,
+            block_n=block_n, warps=warps, stages=stages, chunk=chunk, decode=decode,
+        )
+        return output.reshape(q.shape[0], -1)
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -2462,6 +2524,12 @@ class QwenSparseAttnBackend(AttentionBackend):
             return self._forward_trtllm_sparse_nvfp4(
                 q, layer, forward_batch, metadata,
                 topk_indices.to(torch.int32).contiguous(),
+            )
+        if _ARC_QSA_FP8_DIRECT and q.is_cuda:
+            # qsa_sparse_decode_direct raises unless the pool is FP8 E4M3
+            metadata = self._resolve_metadata(forward_batch)
+            return self._forward_direct(
+                q, layer, forward_batch, metadata, topk_indices.to(torch.int32).contiguous()
             )
         if (
             _ARC_QSA_FP4_FUSED
