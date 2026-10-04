@@ -136,14 +136,24 @@ def distributed_spec_enabled() -> bool:
     return value == "1"
 
 
+def _dflash_drafter_enabled() -> bool:
+    """speculative/arc_dflash.enabled()'s contract, without importing sglang: this module also loads standalone (the
+    L4 launcher's h25 shape check runs it with runpy under a 30 s timeout). Unset or empty is off; anything else must
+    name the drafter's export directory."""
+    path = os.environ.get("ARC_DFLASH_DRAFTER")
+    if not path:
+        return False
+    if not os.path.isdir(path):
+        raise RuntimeError(f"ARC_DFLASH_DRAFTER={path!r} is not a drafter export directory")
+    return True
+
+
 def distributed_mtp_steps() -> int:
     """Explicit reviewed depth; default retains h29 NEXTN3/verify4."""
     value = os.environ.get("ARC_HISPARSE_MTP_STEPS", "3")
     # arc-forge l01: the DFlash drafter (experimental-dflash/l4) proposes K-1 = 1..7 tokens; the verify-width
     # machinery (h16-h19: ring width, spec backup, union hot blocks) is generic in K. The native MTP keeps 1 / 3.
-    from sglang.srt.speculative import arc_dflash
-
-    allowed = ("1", "2", "3", "4", "5", "6", "7") if arc_dflash.enabled() else ("1", "3")
+    allowed = ("1", "2", "3", "4", "5", "6", "7") if _dflash_drafter_enabled() else ("1", "3")
     if value not in allowed:
         raise ValueError(f"ARC_HISPARSE_MTP_STEPS must be one of {allowed}")
     if value == "1" and not distributed_spec_enabled():
