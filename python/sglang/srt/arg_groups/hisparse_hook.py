@@ -157,6 +157,10 @@ def validate_qsa_hisparse(server_args: ServerArgs) -> None:
     from sglang.srt.arg_groups.model_override_base import mamba_extra_buffer_of
     from sglang.srt.environ import envs
 
+    from sglang.srt.mem_cache.qsa_hisparse_distributed import (
+        distributed_hisparse_enabled, distributed_shape_needs,
+    )
+    distributed = distributed_hisparse_enabled()
     view = resolved_view(server_args)
     # arc-forge M1b h09: the session cache is the one prefix reuse QSA HiSparse has.
     session = view.radix_cache_backend == QSA_HISPARSE_SESSION_BACKEND
@@ -167,10 +171,10 @@ def validate_qsa_hisparse(server_args: ServerArgs) -> None:
     need = {
         f"no --radix-cache-backend other than {QSA_HISPARSE_SESSION_BACKEND}": view.radix_cache_backend
         in (None, QSA_HISPARSE_SESSION_BACKEND),
-        "--tp-size 1": view.tp_size == 1,
+        "--tp-size 1 (or gated distributed shape)": distributed or view.tp_size == 1,
         "--pp-size 1": view.pp_size == 1,
-        "--dp-size 1 and no DP attention": view.dp_size == 1
-        and not view.enable_dp_attention,
+        "--dp-size 1 and no DP attention (or gated distributed shape)": distributed
+        or (view.dp_size == 1 and not view.enable_dp_attention),
         "no context parallelism (--dcp-size / --attn-cp-size 1)": view.dcp_size == 1
         and view.attn_cp_size == 1,
         "--disable-radix-cache": bool(view.disable_radix_cache),
@@ -194,6 +198,8 @@ def validate_qsa_hisparse(server_args: ServerArgs) -> None:
         "no page-major KV layout": not view.enable_page_major_kv_layout,
         "no post-capture KV sizing": not envs.SGLANG_ENABLE_POST_CAPTURE_KV_SIZING.get(),
     }
+    if distributed:
+        need.update(distributed_shape_needs(view))
     if session:
         need.update(_qsa_session_needs(view))
     if view.speculative_algorithm is not None:

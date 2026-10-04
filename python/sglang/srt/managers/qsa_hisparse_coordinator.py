@@ -61,6 +61,7 @@ import torch
 
 from sglang.kernels.ops.kvcache.hisparse import load_cache_to_device_buffer_planar
 from sglang.srt.environ import envs
+from sglang.srt.distributed import get_attn_tp_group
 from sglang.srt.managers.hisparse_coordinator import (
     HiSparseAct,
     HiSparseCoordinator,
@@ -150,6 +151,7 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         session_resume: bool = False,
         snapshot: Optional["QSAHiSparseSnapshotConfig"] = None,
         verify_tokens: int = 1,
+        host_admission: Optional[Tuple[int, int]] = None,
     ):
         # No super().__init__(): upstream's asserts an MLA pool and builds an MLA host pool.
         if not isinstance(token_to_kv_pool_allocator, QSAHiSparseTokenToKVPoolAllocator):
@@ -171,6 +173,7 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
             raise ValueError(
                 f"{num_slots} request slots but the pool has {layout.num_slabs} slabs (+ slot 0)"
             )
+        self.host_admission = host_admission
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.mem_pool_device = pool
@@ -195,8 +198,22 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
 
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=tp_group)
-        if self.tp_world_size != 1:
-            raise NotImplementedError("QSA HiSparse is TP1 only (M1a)")
+        from sglang.srt.mem_cache.qsa_hisparse_distributed import (
+            AttentionTPConsensus, distributed_hisparse_enabled,
+        )
+        self.distributed = distributed_hisparse_enabled()
+        if self.tp_world_size != 1 and not self.distributed:
+            raise NotImplementedError("QSA HiSparse is TP1 unless ARC_HISPARSE_DISTRIBUTED=1")
+        if self.distributed and (self.tp_world_size != 2 or verify_tokens != 1):
+            raise NotImplementedError("h25 requires attention TP2 and no speculative decoding")
+        if self.distributed and host_admission is None:
+            raise ValueError("distributed HiSparse requires collective host admission before pin")
+        if self.distributed:
+            from sglang.srt.layers.dp_attention import get_attention_dp_rank
+            self.namespace = f"attention-dp-{get_attention_dp_rank()}"
+        else:
+            self.namespace = "attention-dp-0"
+        self.consensus = AttentionTPConsensus(tp_group, self.tp_world_size, self.namespace)
 
         max_context_len = req_to_token_pool.max_context_len
         max_blocks = -(-max_context_len // layout.block_tokens)
@@ -209,6 +226,7 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
             )
             # h17: plus the page the verify backup's dummy entries write to
             + (layout.page_blocks if verify_tokens > 1 else 0),
+            admitted_bytes=None if host_admission is None else host_admission[0],
         )
 
         layer_num = pool.layer_num
@@ -364,6 +382,7 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         / abort_staging_request; without it those two call it with keep = 0.
         Idempotent: a row with nothing allocated is left as is.
         """
+        self.consensus.agree("host-row-release", [req_pool_idx, keep])
         r = req_pool_idx
         page = self.layout.page_blocks
         if keep < 0 or keep % page:
@@ -411,6 +430,7 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
     # ------------------------------------------------------------ staging
 
     def admit_request_into_staging(self, req: Req) -> None:
+        self.consensus.agree("staging-admit", [req.rid, req.kv.req_pool_idx])
         r = req.kv.req_pool_idx
         prompt_len = req.extend_range.end
         if prompt_len != req.kv.kv_allocated_len:
@@ -498,10 +518,12 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         self.mem_pool_device.mapping[logical_blocks] = 0
 
     def abort_staging_request(self, req: Req) -> None:
+        self.consensus.agree("staging-abort", [req.rid, req.kv.req_pool_idx])
         self.ack_staging_queue = [
             act for act in self.ack_staging_queue if act.req is not req
         ]
         self.write_staging_stream.synchronize()
+        self.consensus.agree("staging-abort-complete", [req.rid, req.kv.req_pool_idx])
         r = req.kv.req_pool_idx
         prefill_blocks, logical_blocks = self._staging.pop(r)
         self.token_to_kv_pool_allocator.free_prefill_blocks(prefill_blocks)
@@ -608,12 +630,31 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
 
     def collect_ready_reqs(self) -> List[Req]:
         """Staging acks (upstream), plus the snapshot poll and decode registration."""
-        if self.snapshots is None:
-            return super().collect_ready_reqs()
-        self.snapshots.poll()
-        ready = super().collect_ready_reqs()
-        for req in ready:
-            self.snapshots.enter_decode(req)
+        if not self.distributed:
+            if self.snapshots is None:
+                return super().collect_ready_reqs()
+            self.snapshots.poll()
+            ready = super().collect_ready_reqs()
+        else:
+            if self.snapshots is not None:
+                self.snapshots.poll()
+            count = 0
+            for _, done, _ in self.ack_staging_queue:
+                if not done.query():
+                    break
+                count += 1
+            keys = [[act.req.rid, act.req.kv.req_pool_idx] for act in self.ack_staging_queue]
+            count = self.consensus.ready_count("staging-ready", keys, count)
+            ready = []
+            for _ in range(count):
+                _, _, req = self.ack_staging_queue.pop(0)
+                self.alloc_device_buffer(req)
+                self._skip_first_backup[req.kv.req_pool_idx] = True
+                req.hisparse_staging = False
+                ready.append(req)
+        if self.snapshots is not None:
+            for req in ready:
+                self.snapshots.enter_decode(req)
         return ready
 
     def _require_snapshots(self) -> "QSAHiSparseSnapshots":
@@ -922,6 +963,7 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
     # ------------------------------------------------------------ release
 
     def request_finished(self, req: Req):
+        self.consensus.agree("request-finish", [req.rid, req.kv.req_pool_idx])
         r = req.kv.req_pool_idx
         if req.hisparse_staging or r in self._staging:
             raise RuntimeError(
@@ -931,6 +973,7 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
         self.wait_for_pending_backup()
+        self.consensus.agree("request-release", [req.rid, r])
 
         layout = self.layout
         logical_blocks = self._logical_blocks(r, req.kv.kv_allocated_len)
@@ -1323,9 +1366,11 @@ def create_qsa_hisparse_coordinator(model_runner) -> QSAHiSparseCoordinator:
                 "hisparse_config.qsa_session_resume needs qsa_snapshot_interval (h08): "
                 "a session resumes from its latest GDN snapshot"
             )
-        _check_session_host_budget(
-            pool, user, snapshot, model_runner.req_to_token_pool.mamba_pool
-        )
+        from sglang.srt.mem_cache.qsa_hisparse_distributed import distributed_hisparse_enabled
+        if not distributed_hisparse_enabled():
+            _check_session_host_budget(
+                pool, user, snapshot, model_runner.req_to_token_pool.mamba_pool
+            )
     elif snapshot is not None and snapshot.anchor:
         raise ValueError(
             "hisparse_config.qsa_session_anchor (h23) needs qsa_session_resume: "
@@ -1353,17 +1398,24 @@ def create_qsa_hisparse_coordinator(model_runner) -> QSAHiSparseCoordinator:
                 "QSA HiSparse speculative verify with B=%d < K x top-k = %d: relying on "
                 "the overflow flag (qsa_spec_small_hot_ok)", hot, verify_tokens * top_k
             )
+    from sglang.srt.mem_cache.qsa_hisparse_distributed import distributed_hisparse_enabled
+    host_admission = None
+    if distributed_hisparse_enabled():
+        host_admission = _check_distributed_host_budget(
+            model_runner, pool, user, snapshot, session_resume, verify_tokens
+        )
     return QSAHiSparseCoordinator(
         req_to_token_pool=model_runner.req_to_token_pool,
         token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
         top_k=top_k,
         device=model_runner.device,
-        tp_group=model_runner.tp_group.cpu_group,
+        tp_group=get_attn_tp_group().cpu_group,
         swap_in_block_size=parse_hisparse_config().swap_in_block_size,
         max_decode_rows=int(decode_graph.max_bs or 0) * verify_tokens,
         session_resume=session_resume,
         snapshot=snapshot,
         verify_tokens=verify_tokens,
+        host_admission=host_admission,
     )
 
 
@@ -1427,6 +1479,58 @@ def _check_session_host_budget(pool, user: dict, snapshot, mamba_pool) -> None:
         reserve,
         available / (1 << 30),
     )
+
+
+def _check_distributed_host_budget(model_runner, pool, user, snapshot, session_resume, verify_tokens):
+    """Price every rank before any HiSparse pin; PLE/model RAM is already loaded."""
+    from sglang.srt.mem_cache.qsa_hisparse_distributed import (
+        host_admission_totals, host_memory_state,
+    )
+    from sglang.srt.mem_cache.pool_host.base import HICACHE_HOST_MEMORY_RESERVE_BYTES
+
+    reserve = user.get("host_reserve_gib")
+    if isinstance(reserve, bool) or not isinstance(reserve, (float, int)) or reserve < 0:
+        raise ValueError("distributed HiSparse needs explicit hisparse_config.host_reserve_gib >= 0")
+    group = model_runner.tp_group.cpu_group
+    if torch.distributed.get_world_size(group=group) != 4:
+        raise ValueError("h25 host admission requires all four model-TP ranks on one node")
+    layout = pool.layout
+    blocks = (
+        session_host_blocks(layout) if session_resume
+        else layout.host_blocks(model_runner.req_to_token_pool.max_context_len)
+    ) + (layout.page_blocks if verify_tokens > 1 else 0)
+    kv = blocks * pool.layer_num * pool.plane_spec.record_bytes
+    gdn = (
+        0 if snapshot is None else snapshot.host_buffers
+        * model_runner.req_to_token_pool.mamba_pool.host_slot_nbytes()
+    )
+    memory = host_memory_state()
+    record = torch.tensor([
+        kv, gdn, max(int(reserve * (1 << 30)), HICACHE_HOST_MEMORY_RESERVE_BYTES),
+        memory["available_bytes"],
+    ], dtype=torch.int64)
+    peers = [torch.empty_like(record) for _ in range(4)]
+    torch.distributed.all_gather(peers, record, group=group)
+    total = host_admission_totals([peer.tolist() for peer in peers])
+    from sglang.srt.layers.dp_attention import get_attention_dp_rank
+
+    dp_rank = get_attention_dp_rank()
+    ranks = torch.distributed.get_process_group_ranks(get_attn_tp_group().cpu_group)
+    receipt = dict(
+        global_rank=torch.distributed.get_rank(), attn_tp_ranks=ranks,
+        attn_tp_leader_global_rank=ranks[0], attn_dp_rank=dp_rank,
+        namespace=f"attention-dp-{dp_rank}", max_running_requests_per_dp=layout.num_slabs,
+        logical_tokens_per_dp=layout.logical_tokens, hot_blocks=layout.hot_blocks,
+        kv_host_bytes_per_rank=kv, snapshot_host_bytes_per_rank=gdn,
+        kv_host_bytes_all_ranks=total[0], snapshot_host_bytes_all_ranks=total[1],
+        host_reserve_bytes=total[2], host_available_bytes_before_pin=total[3],
+        cgroup_limit_bytes=memory["cgroup_limit_bytes"],
+        cgroup_current_bytes=memory["cgroup_current_bytes"],
+        proc_available_bytes=memory["proc_available_bytes"],
+    )
+    logger.warning("ARC_HISPARSE_STARTUP=%s", json.dumps(receipt, sort_keys=True))
+    return kv, gdn
+
 
 
 def _snapshot_config(
@@ -1528,6 +1632,7 @@ class QSAHiSparseSnapshots:
     def __init__(
         self, coord: QSAHiSparseCoordinator, config: QSAHiSparseSnapshotConfig
     ):
+        self.consensus = coord.consensus
         pool = coord.req_to_token_pool
         if not isinstance(pool, HybridReqToTokenPool):
             raise TypeError(
@@ -1593,7 +1698,12 @@ class QSAHiSparseSnapshots:
 
         self.slot_nbytes = self.mamba.host_slot_nbytes()
         total = self.slot_nbytes * config.host_buffers
-        available = host_memory_budget_bytes()
+        available = (
+            host_memory_budget_bytes() if coord.host_admission is None
+            else coord.host_admission[1]
+        )
+        if coord.host_admission is not None and total != available:
+            raise RuntimeError("GDN snapshot pool differs from collective host admission")
         if total > available:
             raise ValueError(
                 f"GDN host buffers need {total / 1e9:.2f} GB ({config.host_buffers} x "
@@ -1648,6 +1758,7 @@ class QSAHiSparseSnapshots:
         return self.buffer_free.pop() if self.buffer_free else None
 
     def free_buffer(self, buf: int) -> None:
+        self.consensus.agree("snapshot-buffer-release", buf)
         if buf in self.busy:
             raise RuntimeError(f"GDN buffer {buf} freed while a snapshot D2H writes it")
         if not 0 <= buf < len(self.buffers) or buf in self.buffer_free:
@@ -1683,6 +1794,10 @@ class QSAHiSparseSnapshots:
         self, seq_lens_cpu: torch.Tensor, req_pool_indices_cpu: torch.Tensor
     ) -> List[_Snapshot]:
         """The snapshots this step's backup window takes (CPU only)."""
+        self.consensus.agree("snapshot-plan", [
+            [int(x) for x in seq_lens_cpu], [int(x) for x in req_pool_indices_cpu],
+            self.staging_free, self.buffer_free, sorted(self.busy),
+        ])
         due: List[_Snapshot] = []
         for i in range(len(seq_lens_cpu)):
             p = self.layout.snapshot_due(int(seq_lens_cpu[i]), self.interval)
@@ -1711,6 +1826,7 @@ class QSAHiSparseSnapshots:
             )
             self.busy[buf] = snap
             due.append(snap)
+        self.consensus.agree("snapshot-issue", self._snapshot_keys(due))
         return due
 
     # ------------------------------------------------------------ speculative decode (M5 h18)
@@ -1817,6 +1933,7 @@ class QSAHiSparseSnapshots:
             self.start_d2h(due, due[-1].after)
 
     def _free_staging(self, slot: int) -> None:
+        self.consensus.agree("snapshot-staging-release", slot)
         if not self.spec:
             self.staging_free.append(slot)
             return
@@ -1859,8 +1976,22 @@ class QSAHiSparseSnapshots:
         if self.unissued:
             claims, self.unissued = self.unissued, []
             self._issue(claims)
-        while self.pending and self.pending[0].done.query():
+        if self.consensus.world_size == 1:
+            while self.pending and self.pending[0].done.query():
+                self._publish(self.pending.pop(0), d2h_done=True)
+            return
+        count = 0
+        for snap in self.pending:
+            if not snap.done.query():
+                break
+            count += 1
+        count = self.consensus.ready_count("snapshot-publish", self._snapshot_keys(self.pending), count)
+        for _ in range(count):
             self._publish(self.pending.pop(0), d2h_done=True)
+
+    @staticmethod
+    def _snapshot_keys(snaps) -> list:
+        return [[s.req.rid, s.r, s.p, s.buf, s.staging, s.host_blocks] for s in snaps]
 
     def _publish(self, snap: _Snapshot, *, d2h_done: bool) -> None:
         req, p = snap.req, snap.p
@@ -1903,6 +2034,7 @@ class QSAHiSparseSnapshots:
         past the stop (EOS, stop string, max_new_tokens); a P among them is not a prefix
         of the next turn, so that claim is dropped before the owner sees it
         (skip_past_stop); the rest are issued now."""
+        self.consensus.agree("snapshot-request-release", [req.rid, req.kv.req_pool_idx])
         claims = [snap for snap in self.unissued if snap.req is req]
         if claims:
             self.unissued = [snap for snap in self.unissued if snap.req is not req]
@@ -1917,6 +2049,7 @@ class QSAHiSparseSnapshots:
         mine = [snap for snap in self.pending if snap.req is req]
         for snap in mine:
             snap.done.synchronize()
+        self.consensus.agree("snapshot-release-complete", self._snapshot_keys(mine))
         for snap in mine:
             self.pending.remove(snap)
             self._publish(snap, d2h_done=True)

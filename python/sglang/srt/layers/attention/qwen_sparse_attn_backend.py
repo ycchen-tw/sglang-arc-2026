@@ -419,6 +419,16 @@ class QwenSparseAttnBackend(AttentionBackend):
         """HiSparse decode reads KV through coordinator device rows, which only
         the trtllm-gen/XQA gather is wired for; every other decode path indexes
         the device pool with logical req_to_token slots."""
+        self._hisparse_sm89 = (
+            self.hisparse_coordinator.distributed
+            and torch.cuda.get_device_capability(self.device) == (8, 9)
+        )
+        if self._hisparse_sm89:
+            self._check_hisparse_buffers(1)
+            coord = self.hisparse_coordinator
+            if int(coord.rows_limit.max()) > coord.identity_rows.shape[1]:
+                raise RuntimeError("HiSparse rows_limit exceeds the identity table")
+            return
         if self.arc_nvfp4_sm100:
             # h12 wires sm_120's token-major scale planes; the sm_100 paged
             # scale layout goes through the same gather but is unvalidated.
@@ -2491,6 +2501,30 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         return output.reshape(q.shape[0], -1)
 
+    def _forward_hisparse_sm89(self, q, layer, forward_batch, topk_indices):
+        """Read sharded packed/FP8 hot rows through the coordinator identity table."""
+        metadata = self._resolve_metadata(forward_batch)
+        table, rows, indices, lens = self._decode_gather_tables(
+            metadata, forward_batch, topk_indices
+        )
+        pool = self.token_to_kv_pool
+        if self.arc_nvfp4:
+            k, v, ks, vs = pool.get_raw_kv_buffer(layer.layer_id)
+            kg, vg = pool.get_kv_cache_quant_method().get_bmm_scales(layer.layer_id)
+        else:
+            k, v = pool.get_key_buffer(layer.layer_id), pool.get_value_buffer(layer.layer_id)
+            ks = vs = None
+            # Match h22 and the gather path: QSA FP8 storage is unscaled.
+            kg = vg = 1.0
+        # h22 guards padded/all-invalid rows; decode=0 uses Ada-compatible E2M1 arithmetic.
+        output = qsa_sparse_decode_direct(
+            q.contiguous(), k, v, ks, vs, table, rows,
+            indices.to(torch.int32).contiguous(), lens, layer.scaling,
+            float(kg), float(vg), block_n=64, warps=4, stages=2,
+            chunk=512 if self.arc_nvfp4 else 1024, decode=0,
+        )
+        return output.reshape(q.shape[0], -1)
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -2517,6 +2551,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         topk_indices: torch.Tensor,
     ) -> torch.Tensor:
         pool = self.token_to_kv_pool
+        if self.hisparse_coordinator is not None and self._hisparse_sm89:
+            return self._forward_hisparse_sm89(q, layer, forward_batch, topk_indices)
         if self.arc_nvfp4:
             if not q.is_cuda:
                 raise RuntimeError("NVFP4 QSA has no CPU attention path")

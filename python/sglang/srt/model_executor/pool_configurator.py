@@ -1408,6 +1408,8 @@ class QSAHiSparsePoolConfigurator(DefaultPoolConfigurator):
         # arc-forge M1b h09 (design §5.1): with the session cache L is a budget
         # (qsa_logical_tokens, default R * C) and the host-prefix landing zone
         # (h07, one layer of K/V per token of ceil_page(C + 4)) takes VRAM.
+        # h25: L is per attention-DP replica, including parked sessions.
+        self._attn_dp_size = kvc.ps.attn_dp_size
         self._logical_override = extra.get("qsa_logical_tokens")
         if self._logical_override is not None and (
             not isinstance(self._logical_override, int)
@@ -1453,7 +1455,7 @@ class QSAHiSparsePoolConfigurator(DefaultPoolConfigurator):
             num_layers=1,
         )
         page = get_schedule().page_size
-        slots = get_schedule().max_running_requests + 1
+        slots = get_schedule().max_running_requests // kvc.ps.attn_dp_size + 1
         # h19: the pending ring holds ratio + K keys per request slot (experimental-qsa 0018),
         # as kv_cache_configurator builds it (qsa_max_verify_tokens)
         ring_size = profile.compress_ratio + (max_speculative_num_draft_tokens() or 0)
@@ -1469,6 +1471,7 @@ class QSAHiSparsePoolConfigurator(DefaultPoolConfigurator):
         requested = get_schedule().max_running_requests
         if requested is None:
             raise ValueError("QSA HiSparse needs --max-running-requests")
+        requested //= self._attn_dp_size
         logical = (
             ceil_align(requested * self._context_len, page_size)
             if self._logical_override is None

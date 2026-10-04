@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from typing import Optional
 
 import torch
 
@@ -42,6 +43,7 @@ class QSAPlanarHostPool(HiSparseHostPoolMixin, HostKVCache):
         device_pool: HiSparseQSATokenToKVPool,
         num_blocks: int,
         allocator_type: str = "default",
+        admitted_bytes: Optional[int] = None,
     ):
         # Deliberately no HostKVCache.__init__: it sizes by tokens and ratio.
         spec = device_pool.plane_spec
@@ -66,7 +68,9 @@ class QSAPlanarHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.lock = threading.RLock()
 
         requested = self.size * self.size_per_token
-        available = host_memory_budget_bytes()
+        available = host_memory_budget_bytes() if admitted_bytes is None else admitted_bytes
+        if admitted_bytes is not None and requested != admitted_bytes:
+            raise RuntimeError("QSA host pool differs from collective host admission")
         if requested > available:
             raise ValueError(
                 f"QSA HiSparse host pool needs {requested / 1e9:.2f} GB "
