@@ -1322,24 +1322,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # Only the last PP stage runs the draft; other EAGLEWorkerV2 instances
         # return proxies so scheduler dispatch remains rank-uniform.
         self._hosts_draft = get_pp_group().is_last_rank
-        # arc-forge DFlash (experimental-dflash d01): ARC_DFLASH_DRAFTER swaps the native MTP draft worker for the
-        # MTP5-DFlash drafter (work/qwen38fn_dflash/g4/dflash_eagle.py); target, verify and HiSparse are unchanged.
+        # arc-forge DFlash: ARC_DFLASH_DRAFTER swaps the native MTP draft worker for the MTP5-DFlash drafter
+        # (speculative/arc_dflash/worker.py); target, verify and HiSparse are unchanged.
         from sglang.srt.speculative import arc_dflash
 
         self._dflash = arc_dflash.enabled()
         if self._dflash:
             if not self._hosts_draft:
                 raise ValueError("DFlash drafter runs without pipeline parallelism")
-            import sys as _sys
-
-            _sys.path.insert(0, os.environ["ARC_DFLASH_CODE"])
-            import importlib as _importlib
-
-            # l4: ARC_DFLASH_WORKER=module:Class picks the worker (default the G4 single-GPU one)
-            _module, _cls = os.environ.get(
-                "ARC_DFLASH_WORKER", "dflash_eagle:DFlashDraftWorker"
-            ).split(":")
-            DFlashDraftWorker = getattr(_importlib.import_module(_module), _cls)
+            from sglang.srt.speculative.arc_dflash.worker import DFlashDraftWorker
 
             self._draft_worker = DFlashDraftWorker(
                 server_args, gpu_id, ps, nccl_port, target_worker
