@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -9,6 +10,7 @@ import torch
 from sglang.srt.layers.attention.qsa.kernel import (
     average_pool_qsa_keys,
     expand_qsa_block_indices,
+    expand_qsa_block_indices_hot,
     qsa_fast_topk,
 )
 from sglang.srt.layers.attention.qsa.metadata import (
@@ -26,6 +28,77 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 # Cap on the fp32 [query_rows, compressed_keys] prefill logits workspace;
 # top-k is per row, so tiling rows does not change the selection.
 _QSA_PREFILL_LOGITS_BUDGET_BYTES = 128 * 1024 * 1024
+
+
+def _env_flag(name: str) -> bool:
+    value = os.environ.get(name, "0")
+    if value not in ("0", "1"):
+        raise ValueError(f"{name} must be 0 or 1, got {value!r}")
+    return value == "1"
+
+
+# Test flag (arc-forge QSA HiSparse gate): fast_topk returns its picks in
+# atomic-collection order, so two runs of one selection can attend in different
+# orders. Sorting each row's valid blocks ascending (-1 padding stays last)
+# fixes only the order: ties and threshold-bin overflow still change the set,
+# so a bitwise end-to-end comparison needs ARC_QSA_TOPK_EXACT=1 (fast_topk.py).
+_ARC_QSA_TOPK_SORT = _env_flag("ARC_QSA_TOPK_SORT")
+# Eager-only HiSparse checks of the selection the swap-in kernel consumes.
+_ARC_HISPARSE_QSA_DEBUG = _env_flag("ARC_HISPARSE_QSA_DEBUG")
+
+
+def _sort_topk_blocks(block_indices: torch.Tensor) -> torch.Tensor:
+    sentinel = torch.iinfo(block_indices.dtype).max
+    keyed = torch.where(block_indices < 0, sentinel, block_indices)
+    keyed = torch.sort(keyed, dim=1).values
+    return torch.where(keyed == sentinel, -1, keyed)
+
+
+def _check_hisparse_selection(
+    block_indices: torch.Tensor,
+    compressed_lengths: torch.Tensor,
+    device_blocks: torch.Tensor,
+    block_topk: int,
+) -> None:
+    """The swap-in kernel reads -1 as TOKEN_HIT and miscounts duplicates on its
+    LRU path, and a -1 device block would be gathered as an empty key; none of
+    that raises there. Require the fast_topk contract the kernel relies on:
+    min(complete blocks, top-k) distinct complete blocks first, -1 after, and
+    every valid entry resolved to a device block."""
+    valid = block_indices >= 0
+    count = valid.sum(dim=1)
+    lengths = compressed_lengths.to(device=block_indices.device, dtype=torch.long)
+    cols = torch.arange(block_indices.shape[1], device=block_indices.device)
+    sentinel = torch.iinfo(block_indices.dtype).max
+    ordered = torch.sort(torch.where(valid, block_indices, sentinel), dim=1).values
+    checks = (
+        (
+            "-1 before a valid entry",
+            (valid != (cols[None, :] < count[:, None])).any(dim=1),
+        ),
+        (
+            "valid count != min(complete blocks, top-k)",
+            count != lengths.clamp(max=block_topk),
+        ),
+        (
+            "block past the complete blocks",
+            (valid & (block_indices >= lengths[:, None])).any(dim=1),
+        ),
+        (
+            "duplicate block",
+            ((ordered[:, 1:] == ordered[:, :-1]) & (ordered[:, 1:] != sentinel)).any(
+                dim=1
+            ),
+        ),
+        (
+            "selected block without a device block",
+            (valid & (device_blocks < 0)).any(dim=1),
+        ),
+    )
+    for what, bad in checks:
+        if bool(bad.any()):
+            rows = bad.nonzero().flatten()[:8].tolist()
+            raise RuntimeError(f"QSA HiSparse selection: {what} in rows {rows}")
 
 
 def _qsa_grouped_queries_per_request(
@@ -487,6 +560,8 @@ class QSAIndexer(MultiPlatformOp):
                     row_ends[chunk_slice],
                     topk=self.block_topk,
                 )
+                if _ARC_QSA_TOPK_SORT:
+                    block_indices = _sort_topk_blocks(block_indices)
             selected = expand_qsa_block_indices(
                 block_indices,
                 query_positions[chunk_slice],
@@ -507,6 +582,85 @@ class QSAIndexer(MultiPlatformOp):
         max_model_len: int,
         query_positions: torch.Tensor,
         sequence_lengths: torch.Tensor,
+        verify_queries_per_request: Optional[int] = None,
+    ) -> torch.Tensor:
+        block_indices = self._select_decode_blocks(
+            q,
+            compressed_cache,
+            compressed_page_table,
+            compressed_lengths,
+            max_model_len,
+            verify_queries_per_request=verify_queries_per_request,
+        )
+        return expand_qsa_block_indices(
+            block_indices,
+            query_positions,
+            sequence_lengths,
+            compress_ratio=self.compress_ratio,
+            token_topk=self.token_topk,
+        )
+
+    def select_decode_tokens_hisparse(
+        self,
+        q: torch.Tensor,
+        compressed_cache: torch.Tensor,
+        compressed_page_table: torch.Tensor,
+        compressed_lengths: torch.Tensor,
+        max_model_len: int,
+        query_positions: torch.Tensor,
+        sequence_lengths: torch.Tensor,
+        *,
+        hisparse,
+        req_pool_indices: torch.Tensor,
+        pool,
+    ) -> torch.Tensor:
+        """DECODE selection under HiSparse offload: swap the selected blocks into
+        each request's hot buffer, then expand them to the logical indices
+        (returned, unchanged) and to device rows (written to hisparse.rows,
+        which the sparse-attention gather reads)."""
+        block_indices = self._select_decode_blocks(
+            q,
+            compressed_cache,
+            compressed_page_table,
+            compressed_lengths,
+            max_model_len,
+        )
+        rows = block_indices.shape[0]
+        if req_pool_indices.shape[0] != rows or hisparse.seq_blocks.shape[0] != rows:
+            raise ValueError(
+                "QSA HiSparse decode rows disagree: "
+                f"top-k={rows}, req_pool_indices={req_pool_indices.shape[0]}, "
+                f"seq_blocks={hisparse.seq_blocks.shape[0]}"
+            )
+        device_blocks = hisparse.coord.swap_in_selected_pages(
+            req_pool_indices=req_pool_indices,
+            compressed_seq_lens=hisparse.seq_blocks,
+            top_k_result=block_indices,
+            layer_id=pool.full_layer_index(self.layer_id),
+        )
+        if _ARC_HISPARSE_QSA_DEBUG and not get_is_capture_mode():
+            _check_hisparse_selection(
+                block_indices, compressed_lengths, device_blocks, self.block_topk
+            )
+        logical, _ = expand_qsa_block_indices_hot(
+            block_indices,
+            device_blocks,
+            query_positions,
+            sequence_lengths,
+            hisparse.newest_dev,
+            compress_ratio=self.compress_ratio,
+            token_topk=self.token_topk,
+            out_rows=hisparse.rows,
+        )
+        return logical
+
+    def _select_decode_blocks(
+        self,
+        q: torch.Tensor,
+        compressed_cache: torch.Tensor,
+        compressed_page_table: torch.Tensor,
+        compressed_lengths: torch.Tensor,
+        max_model_len: int,
         verify_queries_per_request: Optional[int] = None,
     ) -> torch.Tensor:
         use_fast_decode_topk = q.is_cuda and self.block_topk == 512
@@ -535,13 +689,9 @@ class QSAIndexer(MultiPlatformOp):
             block_indices = qsa_fast_topk(
                 logits, row_starts, compressed_lengths, topk=self.block_topk
             )
-        return expand_qsa_block_indices(
-            block_indices,
-            query_positions,
-            sequence_lengths,
-            compress_ratio=self.compress_ratio,
-            token_topk=self.token_topk,
-        )
+        if _ARC_QSA_TOPK_SORT:
+            block_indices = _sort_topk_blocks(block_indices)
+        return block_indices
 
     def forward_cuda(
         self,
@@ -626,6 +776,24 @@ class QSAIndexer(MultiPlatformOp):
             compressed_cache, page_table, compressed_lengths, max_model_len = (
                 indexer_metadata.get_decode_mqa_inputs(self.layer_id)
             )
+            hisparse = indexer_metadata.hisparse
+            if hisparse is not None:
+                if not forward_mode.is_decode():
+                    raise NotImplementedError(
+                        f"QSA HiSparse offload supports DECODE only, got {forward_mode}"
+                    )
+                return self.select_decode_tokens_hisparse(
+                    q,
+                    compressed_cache,
+                    page_table,
+                    compressed_lengths,
+                    max_model_len,
+                    logical_positions,
+                    indexer_metadata.get_seqlens_int32(),
+                    hisparse=hisparse,
+                    req_pool_indices=indexer_metadata.req_pool_indices,
+                    pool=indexer_metadata.token_to_kv_pool,
+                )
             return self.select_decode_tokens(
                 q,
                 compressed_cache,

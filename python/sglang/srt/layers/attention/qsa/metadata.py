@@ -43,6 +43,23 @@ def build_qsa_row_ranges(
     return row_starts, row_ends, compressed_cu_seqlens
 
 
+class QSAHiSparseDecode(msgspec.Struct, frozen=True):
+    """Per-forward HiSparse decode state (arc-forge QSA HiSparse h04).
+
+    Every tensor is a ``[:bs]`` view of a coordinator buffer that
+    ``coord.prepare_decode_meta`` refreshes in place (eager metadata build,
+    CUDA-graph capture and replay), so a captured graph keeps valid pointers.
+    """
+
+    coord: object
+    # [bs] int32, ceil(seq_len / ratio): the swap-in kernel's sequence lengths.
+    seq_blocks: torch.Tensor
+    # [bs] int32, device block of hot slot min(seq_blocks - 1, B).
+    newest_dev: torch.Tensor
+    # [bs, token_topk + ratio - 1] int32 device rows, rewritten by every layer.
+    rows: torch.Tensor
+
+
 class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     """All per-forward metadata consumed specifically by ``QSAIndexer``.
 
@@ -87,6 +104,8 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     compress_group_ring_locs: Optional[torch.Tensor] = None
     extend_rope_matrix: Optional[torch.Tensor] = None
     graph_ring_group_locs: Optional[torch.Tensor] = None
+    # DECODE forwards with HiSparse offload on; None otherwise.
+    hisparse: Optional[QSAHiSparseDecode] = None
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.sequence_lengths.to(torch.int32)
@@ -304,6 +323,7 @@ def compressed_decode_view(
 
 
 __all__ = [
+    "QSAHiSparseDecode",
     "QSAIndexerMetadata",
     "build_qsa_row_ranges",
     "build_pending_ring_slots",

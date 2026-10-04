@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -268,6 +268,217 @@ def expand_qsa_block_indices(
     )
 
 
+@triton.jit
+def _expand_qsa_block_indices_hot_kernel(
+    block_indices,
+    device_blocks,
+    query_positions,
+    sequence_lengths,
+    newest_device_blocks,
+    output,
+    rows_output,
+    block_stride: tl.constexpr,
+    device_block_stride: tl.constexpr,
+    output_stride: tl.constexpr,
+    rows_stride: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    TOKEN_TOPK: tl.constexpr,
+    FINAL_TOPK: tl.constexpr,
+    OUTPUT_BLOCK_SIZE: tl.constexpr,
+):
+    # _expand_qsa_block_indices_kernel verbatim, plus the same entries as device
+    # rows: a selected block's rows come from its swapped-in device block, the
+    # tail's from the request's newest device block (arc-forge QSA HiSparse h04).
+    row = tl.program_id(0)
+    cols = tl.arange(0, OUTPUT_BLOCK_SIZE)
+    sequence_length = tl.load(sequence_lengths + row)
+
+    source_block_cols = cols // COMPRESS_RATIO
+    offsets = cols % COMPRESS_RATIO
+    blocks = tl.load(
+        block_indices + row * block_stride + source_block_cols,
+        mask=(cols < TOKEN_TOPK) & (source_block_cols < BLOCK_TOPK),
+        other=-1,
+    )
+    expanded = blocks * COMPRESS_RATIO + offsets
+    expanded_valid = (
+        (cols < TOKEN_TOPK)
+        & (blocks >= 0)
+        & (expanded >= 0)
+        & (expanded < sequence_length)
+    )
+
+    valid_block_count = tl.sum(
+        (
+            (cols < BLOCK_TOPK)
+            & (
+                tl.load(
+                    block_indices + row * block_stride + cols,
+                    mask=cols < BLOCK_TOPK,
+                    other=-1,
+                )
+                >= 0
+            )
+        ).to(tl.int32),
+        axis=0,
+    )
+    valid_token_count = tl.minimum(valid_block_count * COMPRESS_RATIO, TOKEN_TOPK)
+
+    query_position = tl.load(query_positions + row)
+    visible_tokens = query_position + 1
+    tail_start = (visible_tokens // COMPRESS_RATIO) * COMPRESS_RATIO
+    tail_offset = cols - valid_token_count
+    tail_count = visible_tokens - tail_start
+    tail = tail_start + tail_offset
+    tail_valid = (
+        (tail_offset >= 0)
+        & (tail_offset < COMPRESS_RATIO - 1)
+        & (tail_offset < tail_count)
+        & (tail < sequence_length)
+    )
+
+    selected = expanded_valid & (cols < valid_token_count)
+    result = tl.where(
+        selected,
+        expanded,
+        tl.where(tail_valid, tail, -1),
+    )
+    tl.store(
+        output + row * output_stride + cols,
+        result,
+        mask=cols < FINAL_TOPK,
+    )
+
+    # tail_start is a ratio multiple, so a tail entry's in-block offset is tail_offset.
+    device = tl.load(
+        device_blocks + row * device_block_stride + source_block_cols,
+        mask=(cols < TOKEN_TOPK) & (source_block_cols < BLOCK_TOPK),
+        other=-1,
+    )
+    newest = tl.load(newest_device_blocks + row)
+    rows = tl.where(
+        selected,
+        device * COMPRESS_RATIO + offsets,
+        tl.where(tail_valid, newest * COMPRESS_RATIO + tail_offset, -1),
+    )
+    tl.store(
+        rows_output + row * rows_stride + cols,
+        rows,
+        mask=cols < FINAL_TOPK,
+    )
+
+
+def expand_qsa_block_indices_hot(
+    block_indices: torch.Tensor,
+    device_blocks: torch.Tensor,
+    query_positions: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    newest_device_blocks: torch.Tensor,
+    *,
+    compress_ratio: int,
+    token_topk: int,
+    out_rows: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """HiSparse decode expansion: the logical indices plus the same entries as
+    rows of the HiSparse device KV buffer.
+
+    ``device_blocks[b, j]`` is the device block holding top-k block
+    ``block_indices[b, j]`` (the swap-in kernel's output) and
+    ``newest_device_blocks[b]`` the one holding the request's newest block,
+    where its incomplete tail tokens live. ``out_rows[b, c]`` is
+    ``device_blocks[b, c // ratio] * ratio + c % ratio`` for a selected entry,
+    ``newest * ratio + tail_offset`` for a tail entry and -1 exactly where the
+    logical output is -1. Returns ``(logical, out_rows)``; ``logical`` is
+    bit-identical to ``expand_qsa_block_indices``. Always runs the Triton
+    kernel (CUDA, or CPU under ``TRITON_INTERPRET=1``).
+    """
+
+    block_topk = (token_topk + compress_ratio - 1) // compress_ratio
+    final_topk = token_topk + compress_ratio - 1
+    if block_indices.ndim != 2 or block_indices.shape[1] != block_topk:
+        raise ValueError(
+            f"expected block indices [M, {block_topk}], got "
+            f"{tuple(block_indices.shape)}"
+        )
+    rows = block_indices.shape[0]
+    if device_blocks.shape != block_indices.shape:
+        raise ValueError(
+            "device blocks must match the block indices: "
+            f"{tuple(device_blocks.shape)} vs {tuple(block_indices.shape)}"
+        )
+    for name, tensor in (
+        ("query_positions", query_positions),
+        ("sequence_lengths", sequence_lengths),
+        ("newest_device_blocks", newest_device_blocks),
+    ):
+        if tensor.shape != (rows,) or not tensor.is_contiguous():
+            raise ValueError(
+                f"{name} must be a contiguous [{rows}] tensor, got "
+                f"{tuple(tensor.shape)} with strides {tensor.stride()}"
+            )
+    if out_rows.shape != (rows, final_topk):
+        raise ValueError(
+            f"out_rows must be [{rows}, {final_topk}], got {tuple(out_rows.shape)}"
+        )
+    for name, tensor in (
+        ("block_indices", block_indices),
+        ("device_blocks", device_blocks),
+        ("newest_device_blocks", newest_device_blocks),
+        ("out_rows", out_rows),
+    ):
+        if tensor.dtype != torch.int32:
+            raise ValueError(f"{name} must be int32, got {tensor.dtype}")
+    for name, tensor in (
+        ("device_blocks", device_blocks),
+        ("query_positions", query_positions),
+        ("sequence_lengths", sequence_lengths),
+        ("newest_device_blocks", newest_device_blocks),
+        ("out_rows", out_rows),
+    ):
+        if tensor.device != block_indices.device:
+            raise ValueError(
+                f"{name} is on {tensor.device}, block indices on "
+                f"{block_indices.device}"
+            )
+    # Row strides are passed through, so persistent [max_rows, width] buffers
+    # need no copy; the columns must be dense.
+    for name, tensor in (
+        ("block_indices", block_indices),
+        ("device_blocks", device_blocks),
+        ("out_rows", out_rows),
+    ):
+        if tensor.stride(1) != 1:
+            raise ValueError(
+                f"{name} columns must be contiguous, got strides {tensor.stride()}"
+            )
+    output = torch.empty(
+        (rows, final_topk), dtype=torch.int32, device=block_indices.device
+    )
+    if rows == 0:
+        return output, out_rows
+    _expand_qsa_block_indices_hot_kernel[(rows,)](
+        block_indices,
+        device_blocks,
+        query_positions,
+        sequence_lengths,
+        newest_device_blocks,
+        output,
+        out_rows,
+        block_indices.stride(0),
+        device_blocks.stride(0),
+        output.stride(0),
+        out_rows.stride(0),
+        BLOCK_TOPK=block_topk,
+        COMPRESS_RATIO=compress_ratio,
+        TOKEN_TOPK=token_topk,
+        FINAL_TOPK=final_topk,
+        OUTPUT_BLOCK_SIZE=triton.next_power_of_2(final_topk),
+        num_warps=8,
+    )
+    return output, out_rows
+
+
 def qsa_sparse_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -324,6 +535,7 @@ def qsa_sparse_attention_reference(
 __all__ = [
     "average_pool_qsa_keys",
     "expand_qsa_block_indices",
+    "expand_qsa_block_indices_hot",
     "torch_expand_qsa_block_indices",
     "triton_expand_qsa_block_indices",
     "qsa_fast_topk",

@@ -390,6 +390,7 @@ def test_qsa_draft_extend_backend_decision_follows_profile():
         runner = SimpleNamespace(
             model_config=SimpleNamespace(hf_config=config),
             draft_attention_backend=None,
+            hisparse_coordinator=None,
         )
         return DraftBackendFactory(
             draft_model_runner=runner,
@@ -419,6 +420,7 @@ def _make_mtp_draft_batch(steps: int, seq_lens=(8, 16), loc_base: int = 40):
             context_len=64,
             hf_config=SimpleNamespace(indexer_compress_ratio=COMPRESS_RATIO),
         ),
+        hisparse_coordinator=None,
     )
     backend = QwenSparseMultiStepDraftBackend(
         runner, topk=1, speculative_num_steps=steps
@@ -739,6 +741,7 @@ def _make_qsa_runner_and_pool(num_reqs=4):
             context_len=64,
             hf_config=SimpleNamespace(indexer_compress_ratio=COMPRESS_RATIO),
         ),
+        hisparse_coordinator=None,
     )
     return runner, pool, runner.req_to_token_pool
 
@@ -986,6 +989,7 @@ class _DispatchIndexer:
 
 class _DispatchMetadata:
     token_to_kv_pool = None
+    hisparse = None
     out_cache_loc = None
     compress_member_rows = None
     decode_logical_positions = None

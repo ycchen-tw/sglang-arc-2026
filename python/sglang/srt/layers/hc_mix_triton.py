@@ -9,11 +9,26 @@ Row counts beyond ``_FUSED_MIX_MAX_ROWS`` stay on the torch.compile path.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
 
 _FUSED_MIX_MAX_ROWS = 16
+
+
+def _env_flag(name: str) -> bool:
+    value = os.environ.get(name, "0")
+    if value not in ("0", "1"):
+        raise ValueError(f"{name} must be 0 or 1, got {value!r}")
+    return value == "1"
+
+
+# Test flag (arc-forge bitwise gates): route decode-size mixes to the same
+# torch path larger batches take, so two runs of one input mix identically.
+# Off by default: production keeps the persistent kernel.
+_ARC_HC_MIX_DETERMINISTIC = _env_flag("ARC_HC_MIX_DETERMINISTIC")
 
 
 @triton.jit
@@ -163,7 +178,7 @@ def fused_hc_mix_supported(
 ) -> bool:
     # The persistent kernel accumulates the down projection with
     # device-scope atomics, so summation order varies across replays.
-    if _deterministic_inference():
+    if _deterministic_inference() or _ARC_HC_MIX_DETERMINISTIC:
         return False
     return (
         hyper_input_normed.is_cuda

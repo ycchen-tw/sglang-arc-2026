@@ -24,6 +24,7 @@ from sglang.srt.layers.attention.qsa.config import (
 )
 from sglang.srt.layers.attention.qsa.kernel import qsa_sparse_attention
 from sglang.srt.layers.attention.qsa.metadata import (
+    QSAHiSparseDecode,
     QSAIndexerMetadata,
     build_group_ring_slots,
     build_pending_ring_slots,
@@ -314,6 +315,113 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._trtllm_workspace = None
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
+        # QSA HiSparse offload (arc-forge h04). ModelRunner builds the
+        # coordinator in alloc_memory_pool, before the attention backends.
+        self.hisparse_coordinator = (
+            None if runner is None else runner.hisparse_coordinator
+        )
+        if self.hisparse_coordinator is not None:
+            self._validate_hisparse()
+
+    def _validate_hisparse(self) -> None:
+        """HiSparse decode reads KV through coordinator device rows, which only
+        the trtllm-gen/XQA gather is wired for; every other decode path indexes
+        the device pool with logical req_to_token slots."""
+        if self.arc_nvfp4:
+            raise NotImplementedError(
+                "QSA HiSparse offload supports the FP8 KV pool only (M1a)"
+            )
+        if _QSA_DIRECT_DECODE:
+            raise RuntimeError(
+                "SGLANG_QSA_DIRECT_DECODE reads req_to_token slots; turn it off "
+                "with HiSparse offload"
+            )
+        if _resolve_trtllm_sparse_decode() is None:
+            raise RuntimeError(
+                "QSA HiSparse offload needs the trtllm-gen/XQA paged decode "
+                "kernel; _resolve_trtllm_sparse_decode() returned None"
+            )
+        if self.runner.is_draft_worker:
+            raise NotImplementedError(
+                "QSA HiSparse offload does not support speculative draft workers"
+            )
+        if torch.device(self.device).type != "cuda":
+            raise RuntimeError(f"QSA HiSparse offload needs CUDA, got {self.device}")
+        self._check_hisparse_buffers(1)
+        coord = self.hisparse_coordinator
+        if int(coord.rows_limit.max()) > coord.identity_rows.shape[1]:
+            raise RuntimeError(
+                "HiSparse rows_limit exceeds the identity table: "
+                f"{int(coord.rows_limit.max())} > {coord.identity_rows.shape[1]}"
+            )
+
+    def _check_hisparse_buffers(self, rows: int) -> None:
+        """The coordinator's persistent decode buffers must hold ``rows`` rows."""
+        coord = self.hisparse_coordinator
+        for name, tensor in (
+            ("seq_blocks", coord.seq_blocks),
+            ("newest_dev", coord.newest_dev),
+            ("zeros_i32", coord.zeros_i32),
+            ("rows_limit", coord.rows_limit),
+        ):
+            if tensor.dtype != torch.int32 or tensor.ndim != 1 or tensor.shape[0] < rows:
+                raise RuntimeError(
+                    f"HiSparse coordinator {name} must be int32 [>= {rows}], "
+                    f"got {tensor.dtype} {tuple(tensor.shape)}"
+                )
+        width = self.token_to_kv_pool.qsa_token_topk + self.compress_ratio - 1
+        buffer = coord.rows
+        if (
+            buffer.dtype != torch.int32
+            or buffer.ndim != 2
+            or buffer.shape[0] < rows
+            or buffer.shape[1] != width
+            or buffer.stride(1) != 1
+        ):
+            raise RuntimeError(
+                f"HiSparse coordinator rows must be int32 [>= {rows}, {width}], "
+                f"got {buffer.dtype} {tuple(buffer.shape)}"
+            )
+        identity = coord.identity_rows
+        if identity.dtype != torch.int32 or identity.ndim != 2 or identity.shape[0] != 1:
+            raise RuntimeError(
+                "HiSparse identity_rows must be int32 [1, device rows], got "
+                f"{identity.dtype} {tuple(identity.shape)}"
+            )
+
+    def _hisparse_decode_state(
+        self, sequence_lengths: torch.Tensor, req_pool_indices: torch.Tensor
+    ) -> QSAHiSparseDecode:
+        """Refresh the coordinator's per-row decode buffers for these rows (on
+        the forward stream) and view them for this forward."""
+        coord = self.hisparse_coordinator
+        bs = sequence_lengths.shape[0]
+        state = QSAHiSparseDecode(
+            coord=coord,
+            seq_blocks=coord.seq_blocks[:bs],
+            newest_dev=coord.newest_dev[:bs],
+            rows=coord.rows[:bs],
+        )
+        if (
+            state.seq_blocks.shape[0] != bs
+            or state.newest_dev.shape[0] != bs
+            or state.rows.shape[0] != bs
+        ):
+            raise RuntimeError(f"HiSparse coordinator buffers hold fewer than {bs} rows")
+        coord.prepare_decode_meta(sequence_lengths, req_pool_indices, bs)
+        return state
+
+    def _refresh_hisparse_graph_state(self, metadata, bs: int) -> None:
+        hisparse = metadata.indexer_metadata.hisparse
+        if (hisparse is None) != (self.hisparse_coordinator is None):
+            raise RuntimeError(
+                "QSA CUDA graph metadata disagrees with the HiSparse coordinator"
+            )
+        if hisparse is None:
+            return
+        self.hisparse_coordinator.prepare_decode_meta(
+            metadata.sequence_lengths, metadata.row_req_pool_indices, bs
+        )
 
     def _store_kv(self, layer, loc, k: torch.Tensor, v: torch.Tensor) -> None:
         if self.arc_nvfp4:
@@ -666,6 +774,12 @@ class QwenSparseAttnBackend(AttentionBackend):
                 "mis-mapped to requests"
             )
         speculative_paged = self._is_speculative_paged_mode(forward_batch.forward_mode)
+        if self.hisparse_coordinator is not None and (
+            speculative_paged or self.should_reuse_mtp_sparse_indices(forward_batch)
+        ):
+            raise NotImplementedError(
+                "QSA HiSparse offload does not support speculative decoding"
+            )
         if speculative_paged:
             logical_positions = forward_batch.positions
             if logical_positions.ndim == 2:
@@ -798,6 +912,14 @@ class QwenSparseAttnBackend(AttentionBackend):
                         sequence_ids=group_sequence_ids.long(),
                         compress_ratio=self.compress_ratio,
                     )
+        hisparse = None
+        if (
+            self.hisparse_coordinator is not None
+            and forward_batch.forward_mode.is_decode()
+        ):
+            hisparse = self._hisparse_decode_state(
+                sequence_lengths, row_req_pool_indices
+            )
         indexer_metadata = QSAIndexerMetadata(
             sequence_lengths=sequence_lengths,
             token_to_batch_idx=token_to_batch_idx,
@@ -817,6 +939,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             pending_ring_slots=pending_ring_slots,
             compress_group_ring_locs=compress_group_ring_locs,
             extend_rope_matrix=extend_rope_matrix,
+            hisparse=hisparse,
         )
         return QwenSparseAttnMetadata(
             sequence_lengths=sequence_lengths,
@@ -868,6 +991,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             raise RuntimeError(
                 "QSA backend requires a ModelRunner to initialize CUDA graph state"
             )
+        if self.hisparse_coordinator is not None:
+            self._check_hisparse_buffers(max_num_tokens)
         self._cuda_graph_max_tokens = max_num_tokens
         max_blocks = math.ceil(self.max_context_len / self.compress_ratio)
         max_pages = max(
@@ -952,6 +1077,10 @@ class QwenSparseAttnBackend(AttentionBackend):
             raise RuntimeError("QSA CUDA graph state is not initialized")
         pool = self.token_to_kv_pool
         speculative_paged = self._is_speculative_paged_mode(forward_mode)
+        if self.hisparse_coordinator is not None and not forward_mode.is_decode():
+            raise NotImplementedError(
+                f"QSA HiSparse offload captures DECODE graphs only, got {forward_mode}"
+            )
         metadata_rows = num_tokens if speculative_paged else bs
         if speculative_paged:
             row_lengths, row_req_pool_indices, row_prefix_lengths = (
@@ -982,6 +1111,11 @@ class QwenSparseAttnBackend(AttentionBackend):
             self._graph_prefix_lengths[:bs].copy_(
                 (seq_lens[:bs] - 1).clamp_min(0).to(torch.int32)
             )
+        hisparse = None
+        if self.hisparse_coordinator is not None:
+            hisparse = self._hisparse_decode_state(
+                self._graph_seq_lens[:bs], self._graph_row_req_pool_indices[:bs]
+            )
         indexer_metadata = QSAIndexerMetadata(
             sequence_lengths=self._graph_seq_lens[:metadata_rows],
             token_to_batch_idx=self._graph_token_to_batch[:metadata_rows],
@@ -1001,6 +1135,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             decode_logical_positions=self._graph_logical_positions[:metadata_rows],
             pending_ring_slots=self._graph_state_slots[:metadata_rows],
             graph_ring_group_locs=self._graph_ring_group_locs[:metadata_rows],
+            hisparse=hisparse,
         )
         metadata = QwenSparseAttnMetadata(
             sequence_lengths=self._graph_seq_lens[:metadata_rows],
@@ -1041,6 +1176,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 seq_lens_cpu=seq_lens_cpu,
                 num_padding=num_padding,
             )
+            self._refresh_hisparse_graph_state(metadata, bs)
             self.forward_metadata = metadata
             return
         if seq_lens_cpu is None:
@@ -1073,6 +1209,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._update_qsa_cuda_graph_metadata(
             metadata.indexer_metadata, metadata.row_req_pool_indices
         )
+        self._refresh_hisparse_graph_state(metadata, bs)
         self.forward_metadata = metadata
 
     def _can_replay_with_gpu_kernels(self, metadata, seq_lens) -> bool:
@@ -1435,7 +1572,6 @@ class QwenSparseAttnBackend(AttentionBackend):
         # The validated chunk-prefill kernel consumes tightly packed full-context
         # K/V. Current-chunk K/V has already been committed to the cache above.
         pool = self.token_to_kv_pool
-        req_to_token = self.req_to_token_pool.req_to_token
         sequence_lens_tensor = torch.tensor(
             sequence_lens, dtype=torch.int32, device=q.device
         )
@@ -1452,13 +1588,16 @@ class QwenSparseAttnBackend(AttentionBackend):
                 layer, forward_batch, cu_seqlens_k, sequence_lens, q
             )
         else:
-            req_indices = forward_batch.req_pool_indices.tolist()
+            slot_table, slot_rows = self._context_slot_table(
+                forward_batch, sequence_lens
+            )
+            req_indices = slot_rows.tolist()
             k_buffer = pool.get_key_buffer(layer.layer_id)
             v_buffer = pool.get_value_buffer(layer.layer_id)
             k_context = torch.cat(
                 [
                     k_buffer.index_select(
-                        0, req_to_token[req_indices[i], : sequence_lens[i]].long()
+                        0, slot_table[req_indices[i], : sequence_lens[i]].long()
                     )
                     for i in range(len(sequence_lens))
                 ]
@@ -1466,7 +1605,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             v_context = torch.cat(
                 [
                     v_buffer.index_select(
-                        0, req_to_token[req_indices[i], : sequence_lens[i]].long()
+                        0, slot_table[req_indices[i], : sequence_lens[i]].long()
                     )
                     for i in range(len(sequence_lens))
                 ]
@@ -1482,6 +1621,37 @@ class QwenSparseAttnBackend(AttentionBackend):
             layer.scaling,
         )
         return self._pad_extend_output(output, num_output_rows)
+
+    def _context_slot_table(
+        self, forward_batch, sequence_lens
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``(table, row per request)`` a prefix chunk gathers its context
+        through: ``table[row[i], :sequence_lens[i]]`` are request i's pool slots.
+
+        Without HiSparse this is req_to_token and the requests' pool rows. With
+        it the pool holds device rows only, so the logical slots are translated
+        (``pool.rows_of``) into a per-request table read with rows ``arange(bs)``.
+        """
+        req_to_token = self.req_to_token_pool.req_to_token
+        req_pool_indices = forward_batch.req_pool_indices
+        if self.hisparse_coordinator is None:
+            return req_to_token, req_pool_indices
+        device = req_to_token.device
+        width = max(sequence_lens)
+        lengths = torch.tensor(sequence_lens, dtype=torch.int64, device=device)
+        live = torch.arange(width, device=device)[None, :] < lengths[:, None]
+        # Past a request's length the table holds stale slots; read slot 0 there.
+        logical = torch.where(live, req_to_token[req_pool_indices.long(), :width], 0)
+        rows = self.token_to_kv_pool.rows_of(logical)
+        # An unmapped slot translates into device block 0, the reserved dump.
+        if bool(((rows < self.compress_ratio) & live).any()):
+            raise RuntimeError(
+                "QSA HiSparse prefill context has a slot with no device row"
+            )
+        rows = rows.to(torch.int32)
+        return rows, torch.arange(
+            rows.shape[0], dtype=req_pool_indices.dtype, device=device
+        )
 
     def _nvfp4_expand_context(
         self, layer, forward_batch, cu_seqlens_k, sequence_lens, q: torch.Tensor
@@ -1502,13 +1672,14 @@ class QwenSparseAttnBackend(AttentionBackend):
         k_context = torch.empty(shape, dtype=dtype, device=q.device)
         v_context = torch.empty(shape, dtype=dtype, device=q.device)
         layer_id = layer.layer_id
+        slot_table, slot_rows = self._context_slot_table(forward_batch, sequence_lens)
         qwen_sparse_nvfp4_expand_triton(
             k_fp4,
             v_fp4,
             k_sf,
             v_sf,
-            self.req_to_token_pool.req_to_token,
-            forward_batch.req_pool_indices,
+            slot_table,
+            slot_rows,
             cu_seqlens_k,
             k_context,
             v_context,
@@ -1607,17 +1778,41 @@ class QwenSparseAttnBackend(AttentionBackend):
             q.dtype,
             k_buffer.device,
         )
-        qwen_sparse_kv_extraction_compact_triton(
-            k_buffer,
-            v_buffer,
-            self.req_to_token_pool.req_to_token,
-            (
+        hisparse = metadata.indexer_metadata.hisparse
+        if (hisparse is None) != (self.hisparse_coordinator is None):
+            raise RuntimeError(
+                "QSA decode metadata disagrees with the HiSparse coordinator"
+            )
+        if hisparse is None:
+            gather_table = self.req_to_token_pool.req_to_token
+            gather_rows = (
                 metadata.row_req_pool_indices
                 if metadata.row_req_pool_indices is not None
                 else forward_batch.req_pool_indices
-            ),
-            topk_indices,
-            sequence_lens,
+            )
+            gather_indices = topk_indices
+            gather_lens = sequence_lens
+        else:
+            # The pool holds device rows only: gather hisparse.rows through an
+            # identity table (one row, bound rows_limit) instead of mapping the
+            # logical indices through req_to_token. valid_counts stay logical;
+            # the two index sets share one valid pattern.
+            if hisparse.rows.shape != topk_indices.shape:
+                raise RuntimeError(
+                    f"HiSparse rows {tuple(hisparse.rows.shape)} do not match "
+                    f"the top-k indices {tuple(topk_indices.shape)}"
+                )
+            gather_table = hisparse.coord.identity_rows
+            gather_rows = hisparse.coord.zeros_i32[:batch]
+            gather_indices = hisparse.rows
+            gather_lens = hisparse.coord.rows_limit[:batch]
+        qwen_sparse_kv_extraction_compact_triton(
+            k_buffer,
+            v_buffer,
+            gather_table,
+            gather_rows,
+            gather_indices,
+            gather_lens,
             cu_strided,
             packed_k,
             packed_v,
