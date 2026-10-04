@@ -2613,7 +2613,9 @@ class QwenSparseAttnBackend(AttentionBackend):
                 if metadata.row_req_pool_indices is not None
                 else forward_batch.req_pool_indices
             )
-            k_scale, v_scale = self._kv_descales(layer, k_buffer.dtype)
+            # QSA _store_kv writes FP8 without scaling, matching prefill and
+            # h22 direct attention. The legacy descale helper is absent in 0.5.20.
+            k_scale, v_scale = 1.0, 1.0
             output = qwen_sparse_gqa_decode_selected_triton(
                 q.contiguous(), k_buffer, v_buffer,
                 self.req_to_token_pool.req_to_token, req_indices,
