@@ -261,3 +261,40 @@ class QSAHiSparseLayout:
             return None
         k = (seq_len - 1) // bt
         return k - 1, min(k - 1, self.hot_blocks)
+
+    # ------------------------------------------------------------ GDN snapshots (M1b h08)
+
+    def snapshot_due(self, seq_len: int, interval: int) -> Optional[int]:
+        """M1b design §3.2: position p the decode step at seq_len snapshots, or None.
+
+        seq_len counts the token this step appends, so before its forward the
+        live GDN / PLE state covers p = seq_len - 1 tokens; the step snapshots
+        when p is a positive multiple of the interval T (a multiple of the page
+        size, so P is page aligned, §4.2).
+        """
+        if interval <= 0 or interval % self.page_size:
+            raise ValueError(
+                f"snapshot interval {interval} must be a positive multiple of "
+                f"page_size {self.page_size}"
+            )
+        p = seq_len - 1
+        return p if p > 0 and p % interval == 0 else None
+
+    def can_publish(
+        self,
+        p: int,
+        *,
+        committed: int,
+        host_blocks_done: int,
+        gdn_d2h_done: bool,
+        overwritten: bool,
+    ) -> bool:
+        """M1b design §2.4 as corrected in §11.6: p <= committed; blocks [0, p / bt)
+        have finished host copies; the GDN D2H finished; no later D2H into the
+        same buffer was issued."""
+        return (
+            p <= committed
+            and host_blocks_done >= p // self.block_tokens
+            and gdn_d2h_done
+            and not overwritten
+        )

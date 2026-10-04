@@ -34,6 +34,10 @@ class SlotIndexedState(Protocol):
 
     def iter_transfer_state_entries(self): ...
 
+    # (name, tensor, slot axis) per state tensor, empty when disabled; the
+    # host round trip without a sync (MambaPool.save_slot_to_host, arc-forge h08).
+    def slot_state_entries(self) -> List[Tuple[str, torch.Tensor, int]]: ...
+
 
 class ShortConvPool:
     def __init__(
@@ -125,6 +129,9 @@ class ShortConvPool:
         if self.conv_state is None or data is None:
             return
         self.conv_state[:, indices] = data.to(self.conv_state.device, non_blocking=True)
+
+    def slot_state_entries(self) -> List[Tuple[str, torch.Tensor, int]]:
+        return [] if self.conv_state is None else [("ple_short_conv", self.conv_state, 1)]
 
     def iter_transfer_state_entries(self):
         """Yield replicated per-layer state for PD transfer."""
@@ -235,6 +242,9 @@ class NGramPool:
         self.context[indices.to(dtype=torch.long)] = data.to(
             self.context.device, non_blocking=True
         )
+
+    def slot_state_entries(self) -> List[Tuple[str, torch.Tensor, int]]:
+        return [] if self.context is None else [("ple_ngram", self.context, 0)]
 
     def iter_transfer_state_entries(self):
         """Yield replicated request-wide N-gram history for PD transfer."""

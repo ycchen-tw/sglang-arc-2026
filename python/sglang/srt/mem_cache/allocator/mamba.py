@@ -36,6 +36,8 @@ class MambaSlotAllocator:
         self.device = device
         # Set by alloc_group_begin(); alloc(1) drains it until alloc_group_end().
         self._alloc_iter: Optional[Iterator] = None
+        # Slots taken for good by reserve(); clear() keeps them out of the pool.
+        self.reserved_slots = torch.empty((0,), dtype=torch.int64, device=device)
         self.clear()
 
     def available_size(self) -> int:
@@ -81,8 +83,23 @@ class MambaSlotAllocator:
             return
         self.free_slots = torch.cat((self.free_slots, free_index))
 
+    def reserve(self, need_size: int) -> torch.Tensor:
+        """Take slots out of the pool for good: clear() never hands them out again
+        (arc-forge QSA HiSparse h08: GDN snapshot staging slots)."""
+        slots = self._do_alloc(need_size)
+        if slots is None:
+            raise RuntimeError(
+                f"cannot reserve {need_size} mamba slots, {self.available_size()} free"
+            )
+        self.reserved_slots = torch.cat((self.reserved_slots, slots))
+        return slots
+
     def clear(self):
         # Slot 0 is reserved as a dummy write target for padded tokens.
         self.free_slots = torch.arange(
             1, self.size + 1, dtype=torch.int64, device=self.device
         )
+        if self.reserved_slots.numel() > 0:
+            self.free_slots = self.free_slots[
+                ~torch.isin(self.free_slots, self.reserved_slots)
+            ]

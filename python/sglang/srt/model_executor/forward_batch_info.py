@@ -438,6 +438,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     mamba_cow_src_indices: Optional[torch.Tensor] = None
     mamba_cow_dst_indices: Optional[torch.Tensor] = None
     mamba_clear_indices: Optional[torch.Tensor] = None
+    # QSA HiSparse host restore (arc-forge h08): GDN host buffer ids and the new
+    # mamba slots they are H2D'd into before the extend (with the COW / clear ops)
+    mamba_restore_bufs: Optional[List[int]] = None
+    mamba_restore_dst_indices: Optional[torch.Tensor] = None
 
     # For input embeddings
     input_embeds: Optional[torch.Tensor] = None
@@ -830,6 +834,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mamba_cow_src_indices=batch.mamba_cow_src_indices,
             mamba_cow_dst_indices=batch.mamba_cow_dst_indices,
             mamba_clear_indices=batch.mamba_clear_indices,
+            mamba_restore_bufs=batch.mamba_restore_bufs,
+            mamba_restore_dst_indices=batch.mamba_restore_dst_indices,
             encoder_lens=batch.encoder_lens,
             encoder_out_cache_loc=batch.encoder_out_cache_loc,
             input_embeds=batch.input_embeds,

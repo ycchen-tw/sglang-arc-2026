@@ -379,6 +379,18 @@ class ReqToTokenPool:
             )
 
 
+HOST_SLOT_ALIGN = 256  # byte alignment of each entry in a host slot buffer (h08)
+
+
+@dataclass(frozen=True)
+class MambaHostSlot:
+    """Host copy of one mamba slot (arc-forge h08): typed views into one pinned
+    byte range, one per MambaPool.slot_state_entries() entry, in that order."""
+
+    raw: torch.Tensor  # uint8 [host_slot_nbytes()], pinned
+    views: Tuple[torch.Tensor, ...]
+
+
 class MambaPool:
     # Axis of each two-dimensional conv state that represents the sliding window.
     # Upstream states use (dim, K-1); subclasses may preserve another layout.
@@ -1100,6 +1112,101 @@ class MambaPool:
             for sibling, data in zip(self._slot_siblings, siblings_cpu):
                 sibling.load_cpu_slots(data, indices)
         current_platform.synchronize()
+
+    # ---- arc-forge QSA HiSparse h08 (M1b design §3): one slot <-> one pinned host
+    # buffer, siblings included, enqueued without a host sync (unlike
+    # get_cpu_copy / load_cpu_copy above).
+
+    def slot_state_entries(self) -> List[Tuple[str, torch.Tensor, int]]:
+        """(name, pool tensor, slot axis) of every persistent per-slot state: conv,
+        temporal, then each registered sibling's. The spec scratch (intermediate_*)
+        belongs to a verify, not to a slot; the ReplaySSM rings are refused."""
+        entries = [
+            (f"conv{i}", conv, 1) for i, conv in enumerate(self.mamba_cache.conv)
+        ]
+        if self.mamba_cache.temporal.numel() > 0:
+            entries.append(("temporal", self.mamba_cache.temporal, 1))
+        for sibling in self._slot_siblings:
+            entries.extend(sibling.slot_state_entries())
+        return entries
+
+    def _require_host_slot_copies(self) -> None:
+        if self.replayssm_write_pos is not None or self.enable_linear_replayssm_spec:
+            raise NotImplementedError(
+                "mamba slot <-> host copies need ReplaySSM off: temporal lags the "
+                "ring until a flush (M1b design §3.6)"
+            )
+
+    def host_slot_layout(self) -> List[Tuple[str, Tuple[int, ...], torch.dtype, int]]:
+        """(name, per-slot shape, dtype, byte offset) of each entry of a host slot buffer."""
+        out, offset = [], 0
+        for name, tensor, axis in self.slot_state_entries():
+            shape = tuple(n for d, n in enumerate(tensor.shape) if d != axis)
+            out.append((name, shape, tensor.dtype, offset))
+            nbytes = math.prod(shape) * tensor.element_size()
+            offset += -(-nbytes // HOST_SLOT_ALIGN) * HOST_SLOT_ALIGN
+        return out
+
+    def host_slot_nbytes(self) -> int:
+        name, shape, dtype, offset = self.host_slot_layout()[-1]
+        nbytes = math.prod(shape) * dtype.itemsize
+        return offset + -(-nbytes // HOST_SLOT_ALIGN) * HOST_SLOT_ALIGN
+
+    def host_slot_view(self, raw: torch.Tensor) -> "MambaHostSlot":
+        """Typed views of one pinned uint8 buffer of host_slot_nbytes() bytes."""
+        self._require_host_slot_copies()
+        nbytes = self.host_slot_nbytes()
+        if raw.dtype != torch.uint8 or raw.dim() != 1 or raw.device.type != "cpu":
+            raise ValueError(
+                f"need a 1-D uint8 CPU buffer, got {raw.dtype} {tuple(raw.shape)} "
+                f"on {raw.device}"
+            )
+        if raw.numel() != nbytes or raw.data_ptr() % HOST_SLOT_ALIGN:
+            raise ValueError(
+                f"host slot buffer of {raw.numel()} B at {raw.data_ptr():#x}; need "
+                f"{nbytes} B aligned to {HOST_SLOT_ALIGN}"
+            )
+        if not raw.is_pinned():
+            raise ValueError("host slot buffer must be pinned: a pageable copy synchronizes")
+        views = tuple(
+            raw[offset : offset + math.prod(shape) * dtype.itemsize].view(dtype).view(shape)
+            for _, shape, dtype, offset in self.host_slot_layout()
+        )
+        return MambaHostSlot(raw=raw, views=views)
+
+    def save_slot_to_host(self, slot: int, buf: "MambaHostSlot", stream) -> None:
+        """Enqueue slot -> buf on `stream` (every entry, siblings included); no host sync.
+
+        The caller orders `stream` after the slot's last write and records an event
+        on it to learn when buf is complete; the slot must not be written before then.
+        """
+        self._require_host_slot_copies()
+        if not 1 <= slot <= self.size:
+            raise ValueError(f"mamba slot {slot} outside [1, {self.size}]")
+        entries = self.slot_state_entries()
+        if len(entries) != len(buf.views):
+            raise ValueError(f"host buffer has {len(buf.views)} entries, pool has {len(entries)}")
+        with torch.cuda.stream(stream):
+            for (_, tensor, axis), view in zip(entries, buf.views):
+                view.copy_(tensor.select(axis, slot), non_blocking=True)
+
+    def load_slot_from_host(self, buf: "MambaHostSlot", slot: torch.Tensor) -> None:
+        """Enqueue buf -> slot on the current stream (H2D, siblings included); no host sync.
+
+        `slot` is a one-element int64 device tensor (e.g. req.kv.mamba_pool_idx).
+        buf must not be written until the copies ran (stream order).
+        """
+        self._require_host_slot_copies()
+        entries = self.slot_state_entries()
+        if len(entries) != len(buf.views):
+            raise ValueError(f"host buffer has {len(buf.views)} entries, pool has {len(entries)}")
+        if slot.numel() != 1 or slot.dtype != torch.int64 or not slot.is_cuda:
+            raise ValueError(f"need a one-element int64 device slot index, got {slot}")
+        index = slot.reshape(1)
+        for (_, tensor, axis), view in zip(entries, buf.views):
+            tensor.index_copy_(
+                axis, index, view.unsqueeze(axis).to(tensor.device, non_blocking=True)
+            )
 
     _NON_TRANSFER_STATE_FIELDS = frozenset(
         {

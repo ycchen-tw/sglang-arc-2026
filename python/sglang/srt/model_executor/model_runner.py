@@ -1788,9 +1788,20 @@ class ModelRunner:
                     pool.translate_mamba_indices(forward_batch.mamba_cow_src_indices),
                     pool.translate_mamba_indices(forward_batch.mamba_cow_dst_indices),
                 )
+        if forward_batch.mamba_restore_bufs is not None:
+            # QSA HiSparse (arc-forge h08): H2D a published GDN snapshot into the
+            # new slot on this (forward) stream, like the COW above.
+            if self.hisparse_coordinator is None:
+                raise RuntimeError("mamba host restore without a QSA HiSparse coordinator")
+            self.hisparse_coordinator.load_snapshots(
+                forward_batch.mamba_restore_bufs,
+                pool.translate_mamba_indices(forward_batch.mamba_restore_dst_indices),
+            )
         forward_batch.mamba_clear_indices = None
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None
+        forward_batch.mamba_restore_bufs = None
+        forward_batch.mamba_restore_dst_indices = None
 
     def _forward_raw(
         self,

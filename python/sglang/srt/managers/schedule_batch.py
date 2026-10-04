@@ -903,6 +903,9 @@ class ReqKvInfo:
     mamba_cow_src_index: Optional[torch.Tensor] = None
     # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
     mamba_needs_clear: bool = False
+    # Deferred host restore (arc-forge QSA HiSparse h08): GDN host buffer the
+    # first extend H2Ds into the newly allocated mamba slot instead of a clear
+    mamba_host_restore: Optional[int] = None
 
     def swa_dead_lo(self, page_size: int) -> int:
         # Lowest SWA position this request may free itself: above the tree-owned
@@ -1915,6 +1918,7 @@ class Req(ReqDllmMixin):
         self.mamba_branching_seqlen = None
         self.kv.mamba_cow_src_index = None
         self.kv.mamba_needs_clear = False
+        self.kv.mamba_host_restore = None
         self.already_computed = 0
         assert not self.kv.holds_kv, "expect it is already released"
         self.kv.kv_committed_len = 0
@@ -2368,6 +2372,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     mamba_cow_src_indices: torch.Tensor = None
     mamba_cow_dst_indices: torch.Tensor = None
     mamba_clear_indices: torch.Tensor = None
+    # QSA HiSparse host restore (h08): GDN host buffer ids -> new mamba slots
+    mamba_restore_bufs: Optional[List[int]] = None
+    mamba_restore_dst_indices: torch.Tensor = None
 
     # Encoder-decoder device tensors (host fields in the host metadata group)
     encoder_lens: Optional[torch.Tensor] = None
@@ -2991,8 +2998,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         cow_src_tensors = []
         cow_dst_tensors = []
         clear_tensors = []
+        restore_bufs = []
+        restore_dst_tensors = []
         for req in reqs:
-            if req.kv.mamba_cow_src_index is not None:
+            if req.kv.mamba_host_restore is not None:
+                # QSA HiSparse (h08): the H2D overwrites every entry of the slot.
+                if req.kv.mamba_cow_src_index is not None:
+                    raise RuntimeError(f"{req.rid}: both a host restore and a COW source")
+                restore_bufs.append(req.kv.mamba_host_restore)
+                restore_dst_tensors.append(req.kv.mamba_pool_idx.unsqueeze(0))
+                req.kv.mamba_host_restore = None
+                req.kv.mamba_needs_clear = False
+            elif req.kv.mamba_cow_src_index is not None:
                 cow_src_tensors.append(req.kv.mamba_cow_src_index)
                 cow_dst_tensors.append(req.kv.mamba_pool_idx.unsqueeze(0))
                 req.kv.mamba_cow_src_index = None
@@ -3007,6 +3024,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             torch.cat(cow_dst_tensors) if cow_dst_tensors else None
         )
         self.mamba_clear_indices = torch.cat(clear_tensors) if clear_tensors else None
+        self.mamba_restore_bufs = restore_bufs or None
+        self.mamba_restore_dst_indices = (
+            torch.cat(restore_dst_tensors) if restore_dst_tensors else None
+        )
 
     def prepare_for_split_prefill(self):
         self.prepare_for_extend()
@@ -3430,6 +3451,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None
         self.mamba_clear_indices = None
+        self.mamba_restore_bufs = None
+        self.mamba_restore_dst_indices = None
 
         # Clear context parallel metadata - CP is only for prefill, not decode
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
@@ -3583,6 +3606,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None
         self.mamba_clear_indices = None
+        self.mamba_restore_bufs = None
+        self.mamba_restore_dst_indices = None
         self.return_logprob = any(req.return_logprob for req in self.reqs)
         if self.return_logprob:
             self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]

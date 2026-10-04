@@ -24,6 +24,11 @@ through the landing zone (fill_host_prefix_context); staging copies only
 host. Host blocks are then released by release_host_row(r, keep) from the
 cache's finish path, never by request_finished / abort_staging_request, which
 run before it; without session_resume those two release the whole row as M1a.
+
+With qsa_snapshot_interval set (M1b h08), decode also snapshots the GDN / PLE
+state every T positions: D2D live -> staging mamba slot in the backup window,
+async D2H to a pinned host buffer, published to an owner (h09) once the D2H is
+seen done (QSAHiSparseSnapshots below).
 """
 
 from __future__ import annotations
@@ -31,7 +36,9 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
+from collections import Counter
+from dataclasses import dataclass
+from typing import Dict, List, NamedTuple, Optional, Protocol, Sequence, Tuple
 
 import torch
 
@@ -43,7 +50,14 @@ from sglang.srt.managers.hisparse_coordinator import (
     HiSparseTokenStats,
 )
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.pool_host.base import host_memory_budget_bytes
+from sglang.srt.mem_cache.pool_host.common import (
+    ALLOC_MEMORY_FUNCS,
+    HostTensorAllocator,
+    _cuda_host_unregister,
+)
 from sglang.srt.mem_cache.pool_host.qsa_planar import QSAPlanarHostPool
 from sglang.srt.mem_cache.qsa_hisparse_pool import (
     HiSparseQSATokenToKVPool,
@@ -113,6 +127,7 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         swap_in_block_size: int = 960,
         max_decode_rows: int = 0,
         session_resume: bool = False,
+        snapshot: Optional["QSAHiSparseSnapshotConfig"] = None,
     ):
         # No super().__init__(): upstream's asserts an MLA pool and builds an MLA host pool.
         if not isinstance(token_to_kv_pool_allocator, QSAHiSparseTokenToKVPoolAllocator):
@@ -241,6 +256,11 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
             self.landing_zone = QSAContextLandingZone(
                 pool, -(-max_context_len // ps) * ps
             )
+
+        # M1b h08: decode GDN snapshots, off unless configured.
+        self.snapshots = (
+            None if snapshot is None else QSAHiSparseSnapshots(self, snapshot)
+        )
 
         self._warmup_kernels()
         logger.info(
@@ -448,7 +468,13 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         seq_lens_cpu: torch.Tensor,
         req_pool_indices_cpu: torch.Tensor,
     ) -> None:
-        """Copy the block the previous step completed to host (design §2 decode row)."""
+        """Copy the block the previous step completed to host (design §2 decode row).
+
+        With snapshots on, the same window also D2Ds every due GDN / PLE state into
+        a staging slot (M1b design §3.2): one event covers both, and the next
+        forward waits for it before it writes the live slot.
+        """
+        snaps = self.snapshots
         device_blocks: List[int] = []
         host_blocks = []
         for i in range(len(seq_lens_cpu)):
@@ -459,6 +485,8 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
             if backup is None:
                 continue
             block, slot = backup
+            if snaps is not None:
+                snaps.note_backup(r, block)
             device_blocks.append(self.layout.slab_block(r, slot))
             host_blocks.append(
                 self.mem_pool_host.alloc_paged_token_slots(
@@ -469,10 +497,14 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
                     1,
                 )
             )
-        if not device_blocks:
+        due = [] if snaps is None else snaps.plan(seq_lens_cpu, req_pool_indices_cpu)
+        if not device_blocks and not due:
             return
-        device_locs = torch.tensor(device_blocks, dtype=torch.int64, device=self.device)
-        host_locs = torch.cat(host_blocks)
+        if device_blocks:
+            device_locs = torch.tensor(device_blocks, dtype=torch.int64, device=self.device)
+            host_locs = torch.cat(host_blocks)
+        if due:
+            live, staging = snaps.staging_indices(due)
 
         self.wait_for_pending_backup()
         schedule_stream = device_module.current_stream()
@@ -480,11 +512,53 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
             self.decode_backup_stream.wait_stream(schedule_stream)
             if self.decode_producer_stream is not None:
                 self.decode_backup_stream.wait_stream(self.decode_producer_stream)
-            self.mem_pool_host.backup_blocks(device_locs, host_locs)
+            if device_blocks:
+                self.mem_pool_host.backup_blocks(device_locs, host_locs)
+                device_locs.record_stream(self.decode_backup_stream)
+                host_locs.record_stream(self.decode_backup_stream)
+            if due:
+                snaps.copy_to_staging(live, staging)
+                live.record_stream(self.decode_backup_stream)
+                staging.record_stream(self.decode_backup_stream)
             self._backup_done_event.record()
-            device_locs.record_stream(self.decode_backup_stream)
-            host_locs.record_stream(self.decode_backup_stream)
         self._has_pending_backup = True
+        if due:
+            snaps.start_d2h(due, self._backup_done_event)
+
+    # ------------------------------------------------------------ GDN snapshots (M1b h08)
+
+    def collect_ready_reqs(self) -> List[Req]:
+        """Staging acks (upstream), plus the snapshot poll and decode registration."""
+        if self.snapshots is None:
+            return super().collect_ready_reqs()
+        self.snapshots.poll()
+        ready = super().collect_ready_reqs()
+        for req in ready:
+            self.snapshots.enter_decode(req)
+        return ready
+
+    def _require_snapshots(self) -> "QSAHiSparseSnapshots":
+        if self.snapshots is None:
+            raise RuntimeError(
+                "QSA HiSparse snapshots are off (hisparse_config.qsa_snapshot_interval)"
+            )
+        return self.snapshots
+
+    def set_snapshot_owner(self, owner: "SnapshotOwner") -> None:
+        self._require_snapshots().set_owner(owner)
+
+    def release_snapshots(self, req: Req) -> None:
+        """Wait for req's in-flight snapshot D2H, publish them, drop its decode state.
+
+        The owner calls it on every exit of an admitted request (h09:
+        cache_finished_req), before the request slot can be reused.
+        """
+        self._require_snapshots().release(req)
+
+    def load_snapshots(self, bufs: List[int], dst_slots: torch.Tensor) -> None:
+        """H2D published GDN buffers into new mamba slots on the current stream
+        (the deferred restore model_runner runs before an extend)."""
+        self._require_snapshots().load(bufs, dst_slots)
 
     # ------------------------------------------------------------ decode (forward side)
 
@@ -693,11 +767,14 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         self,
         parked_logical: Optional[torch.Tensor] = None,
         parked_host: Optional[torch.Tensor] = None,
+        parked_gdn: Optional[List[int]] = None,
     ) -> None:
         """With nothing running or staging, every pool and table is back at its
         start (R3), except what parked session records hold (M1b h07):
         parked_logical / parked_host are their logical token slots and host
-        blocks, concatenated (None: nothing parked, the M1a case)."""
+        blocks, concatenated (None: nothing parked, the M1a case); parked_gdn
+        their GDN host buffers (h08: with snapshots on, exactly those are
+        allocated)."""
         problems = []
         if self.ack_staging_queue or self._staging:
             problems.append(
@@ -756,8 +833,17 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
             problems.append("skip-first-backup flags left set")
         if self._has_pending_backup:
             problems.append("a decode backup is still pending")
+        if self.snapshots is not None:
+            problems.extend(self.snapshots.idle_problems(parked_gdn or []))
+        elif parked_gdn:
+            problems.append(f"parked GDN buffers {parked_gdn} with snapshots off")
         if problems:
             raise RuntimeError("QSA HiSparse idle invariants violated: " + "; ".join(problems))
+
+    def destroy(self) -> None:
+        if self.snapshots is not None:
+            self.snapshots.destroy()
+        super().destroy()
 
     # ------------------------------------------------------------ unsupported
 
@@ -833,4 +919,361 @@ def create_qsa_hisparse_coordinator(model_runner) -> QSAHiSparseCoordinator:
         # one token per request (no spec), so graph rows = its max batch size
         max_decode_rows=int(decode_graph.max_bs or 0),
         session_resume=session_resume,
+        snapshot=_snapshot_config(user, num_reqs),
     )
+
+
+def _snapshot_config(user: dict, num_reqs: int) -> Optional["QSAHiSparseSnapshotConfig"]:
+    """M1b h08 keys of hisparse_config: decode GDN snapshots are off unless
+    qsa_snapshot_interval (T) is set; K staging slots default to 8 and the host
+    buffers to R + 16 (design §3.3, §5.3)."""
+    keys = (
+        "qsa_snapshot_interval",
+        "qsa_snapshot_staging_slots",
+        "qsa_snapshot_host_buffers",
+    )
+    for key in keys:
+        value = user.get(key)
+        if key in user and (not isinstance(value, int) or isinstance(value, bool)):
+            raise ValueError(f"hisparse_config.{key} must be an integer, got {value!r}")
+    if keys[0] not in user:
+        if any(key in user for key in keys[1:]):
+            raise ValueError(f"hisparse_config.{keys[1]} / {keys[2]} need {keys[0]}")
+        return None
+    return QSAHiSparseSnapshotConfig(
+        interval=user[keys[0]],
+        staging_slots=user.get(keys[1], 8),
+        host_buffers=user.get(keys[2], num_reqs + 16),
+    )
+
+
+# ---------------------------------------------------------------- GDN snapshots (M1b h08)
+
+
+class QSAHiSparseSnapshotConfig(NamedTuple):
+    interval: int  # T: snapshot when a decode input position p is a positive multiple of T
+    staging_slots: int  # K mamba slots reserved for the D2D, for good
+    host_buffers: int  # pinned host buffers of one mamba slot each (S_max)
+
+
+class SnapshotOwner(Protocol):
+    """Owner of the GDN host buffers and of what a published snapshot means (h09).
+
+    snapshot_buffer(req, p): the buffer req's snapshot at position p goes to, or
+      None to skip this boundary (req does not own its session, or no buffer).
+      Called at most once per due boundary from the decode prepare, and only
+      when a staging slot is free. The owner allocates buffers with
+      QSAHiSparseSnapshots.alloc_buffer() and keeps them until it frees them.
+    on_snapshot_published(req, p, buf): buf now holds exactly the GDN and PLE
+      state of positions [0, p) -- the state after the forward whose last input
+      is position p - 1 -- host blocks [0, p / 4) of req have finished copies
+      and p <= req.kv.kv_committed_len. Per request in issue order, from
+      collect_ready_reqs or release_snapshots.
+    """
+
+    def snapshot_buffer(self, req: Req, p: int) -> Optional[int]: ...
+
+    def on_snapshot_published(self, req: Req, p: int, buf: int) -> None: ...
+
+
+@dataclass(eq=False)
+class _Snapshot:
+    req: Req
+    r: int  # request slot
+    p: int
+    buf: int
+    staging: int  # staging mamba slot
+    host_blocks: int  # host copies of blocks [0, host_blocks) issued by this window
+    done: Optional[torch.cuda.Event] = None  # D2H finished
+
+
+class QSAHiSparseSnapshots:
+    """Decode GDN / PLE snapshots (M1b design §3.2, §11.6-11.8).
+
+    In the decode backup window of the step whose input is position p (a
+    multiple of T), the live mamba slot is D2D'd into a staging slot (same event
+    as the KV backup, so the next forward cannot overwrite it first); a separate
+    stream D2Hs the staging slot into the owner's pinned buffer; poll() (from
+    collect_ready_reqs) publishes each snapshot once its D2H event is seen done.
+    A buffer with an unpublished snapshot takes no new one (§11.8, counted).
+    """
+
+    def __init__(
+        self, coord: QSAHiSparseCoordinator, config: QSAHiSparseSnapshotConfig
+    ):
+        pool = coord.req_to_token_pool
+        if not isinstance(pool, HybridReqToTokenPool):
+            raise TypeError(
+                f"GDN snapshots need a HybridReqToTokenPool, got {type(pool).__name__}"
+            )
+        if (
+            pool.mamba_v2p_table is not None
+            or type(pool).translate_mamba_indices
+            is not HybridReqToTokenPool.translate_mamba_indices
+            or type(pool.mamba_allocator) is not MambaSlotAllocator
+        ):
+            raise NotImplementedError(
+                "GDN snapshots need physical mamba slot ids (a static mamba pool)"
+            )
+        self.layout = coord.layout
+        self.layout.snapshot_due(config.interval + 1, config.interval)  # validates T
+        if config.staging_slots < 1 or config.host_buffers < 1:
+            raise ValueError(f"need >= 1 staging slot and host buffer, got {config}")
+        self.interval = config.interval
+        self.pool = pool
+        self.mamba = pool.mamba_pool
+        self.device = pool.req_index_to_mamba_index_mapping.device
+        need = self.layout.num_slabs + config.staging_slots
+        free = pool.mamba_allocator.available_size()
+        if free < need:
+            raise ValueError(
+                f"GDN snapshots reserve {config.staging_slots} staging mamba slots next "
+                f"to {self.layout.num_slabs} running requests: --max-mamba-cache-size "
+                f"must be >= {need}, {free} free"
+            )
+        self.staging_slots: List[int] = pool.mamba_allocator.reserve(
+            config.staging_slots
+        ).tolist()
+        self.staging_free = list(self.staging_slots)
+        # Compile the fused conv-slot copy now rather than in the first decode window
+        # (slot 0 is the padding dummy; a staging slot is scratch until a D2D).
+        self.mamba.copy_from(
+            torch.zeros(1, dtype=torch.int64, device=self.device),
+            torch.tensor(self.staging_slots[:1], dtype=torch.int64, device=self.device),
+        )
+
+        self.slot_nbytes = self.mamba.host_slot_nbytes()
+        total = self.slot_nbytes * config.host_buffers
+        available = host_memory_budget_bytes()
+        if total > available:
+            raise ValueError(
+                f"GDN host buffers need {total / 1e9:.2f} GB ({config.host_buffers} x "
+                f"{self.slot_nbytes} B) but only {available / 1e9:.2f} GB of host RAM "
+                "is available"
+            )
+        alloc = ALLOC_MEMORY_FUNCS[torch.device(coord.device).type]
+        self.host_raw = alloc(
+            (config.host_buffers, self.slot_nbytes),
+            dtype=torch.uint8,
+            device="cpu",
+            pin_memory=True,
+            allocator=HostTensorAllocator(),
+        )
+        self.buffers = [
+            self.mamba.host_slot_view(self.host_raw[i])
+            for i in range(config.host_buffers)
+        ]
+        # pop() hands out buffer 0 first
+        self.buffer_free = list(range(config.host_buffers - 1, -1, -1))
+
+        self.busy: Dict[int, _Snapshot] = {}  # buffer -> unpublished snapshot (§11.8)
+        self.pending: List[_Snapshot] = []  # issue order == completion order (one stream)
+        self.decoding: Dict[int, Req] = {}  # request slot -> request, ready to release
+        self.host_blocks: Dict[int, int] = {}  # request slot -> host copies issued [0, n)
+        self.d2h_stream = device_module.Stream()
+        self.owner: Optional[SnapshotOwner] = None
+        self.stats: Counter = Counter()
+        self._destroyed = False
+        logger.info(
+            "QSA HiSparse GDN snapshots: T=%d, staging mamba slots %s, %d host buffers "
+            "x %d B = %.2f GB pinned",
+            self.interval,
+            self.staging_slots,
+            config.host_buffers,
+            self.slot_nbytes,
+            total / 1e9,
+        )
+
+    # ------------------------------------------------------------ owner side
+
+    def set_owner(self, owner: SnapshotOwner) -> None:
+        if self.owner is not None:
+            raise RuntimeError("the GDN snapshot owner is already set")
+        self.owner = owner
+
+    def alloc_buffer(self) -> Optional[int]:
+        return self.buffer_free.pop() if self.buffer_free else None
+
+    def free_buffer(self, buf: int) -> None:
+        if buf in self.busy:
+            raise RuntimeError(f"GDN buffer {buf} freed while a snapshot D2H writes it")
+        if not 0 <= buf < len(self.buffers) or buf in self.buffer_free:
+            raise RuntimeError(f"GDN buffer {buf} is not allocated")
+        self.buffer_free.append(buf)
+
+    # ------------------------------------------------------------ decode side
+
+    def enter_decode(self, req: Req) -> None:
+        """Staging finished: host copies cover the complete prompt blocks."""
+        r = req.kv.req_pool_idx
+        if r in self.decoding:
+            raise RuntimeError(
+                f"request slot {r} still holds the snapshot state of "
+                f"{self.decoding[r].rid}; release_snapshots was not called"
+            )
+        if req.kv.kv_committed_len != req.kv.kv_allocated_len:
+            raise RuntimeError(f"{req.rid} enters decode with uncommitted KV")
+        self.decoding[r] = req
+        self.host_blocks[r] = req.kv.kv_allocated_len // self.layout.block_tokens
+
+    def note_backup(self, r: int, block: int) -> None:
+        if r not in self.host_blocks:
+            raise RuntimeError(f"decode backup for request slot {r}, which is not decoding")
+        if block != self.host_blocks[r]:
+            raise RuntimeError(
+                f"decode backup of block {block} for slot {r}, but host copies cover "
+                f"[0, {self.host_blocks[r]})"
+            )
+        self.host_blocks[r] = block + 1
+
+    def plan(
+        self, seq_lens_cpu: torch.Tensor, req_pool_indices_cpu: torch.Tensor
+    ) -> List[_Snapshot]:
+        """The snapshots this step's backup window takes (CPU only)."""
+        due: List[_Snapshot] = []
+        for i in range(len(seq_lens_cpu)):
+            p = self.layout.snapshot_due(int(seq_lens_cpu[i]), self.interval)
+            if p is None:
+                continue
+            r = int(req_pool_indices_cpu[i])
+            req = self.decoding.get(r)
+            if req is None:
+                raise RuntimeError(f"decode row of request slot {r} never entered decode")
+            if not self.staging_free:
+                self.stats["skip_staging"] += 1
+                continue
+            if self.owner is None:
+                raise RuntimeError("GDN snapshots are on but no owner is registered (h09)")
+            buf = self.owner.snapshot_buffer(req, p)
+            if buf is None:
+                self.stats["skip_owner"] += 1
+                continue
+            if not 0 <= buf < len(self.buffers) or buf in self.buffer_free:
+                raise RuntimeError(f"owner gave GDN buffer {buf}, which is not allocated")
+            if buf in self.busy:
+                self.stats["skip_busy"] += 1
+                continue
+            snap = _Snapshot(
+                req, r, p, buf, self.staging_free.pop(), self.host_blocks[r]
+            )
+            self.busy[buf] = snap
+            due.append(snap)
+        return due
+
+    def staging_indices(
+        self, due: List[_Snapshot]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """(live, staging) mamba slot ids on the device, built on the schedule stream."""
+        rows = torch.tensor([s.r for s in due], dtype=torch.int64, device=self.device)
+        live = self.pool.req_index_to_mamba_index_mapping[rows].to(torch.int64)
+        staging = torch.tensor(
+            [s.staging for s in due], dtype=torch.int64, device=self.device
+        )
+        return live, staging
+
+    def copy_to_staging(self, live: torch.Tensor, staging: torch.Tensor) -> None:
+        """D2D on the decode backup stream, inside the window."""
+        self.mamba.copy_from(live, staging)
+
+    def start_d2h(self, due: List[_Snapshot], after) -> None:
+        with device_module.stream(self.d2h_stream):
+            self.d2h_stream.wait_event(after)
+            for snap in due:
+                self.mamba.save_slot_to_host(
+                    snap.staging, self.buffers[snap.buf], self.d2h_stream
+                )
+                snap.done = device_module.Event()
+                snap.done.record(self.d2h_stream)
+        self.pending.extend(due)
+        self.stats["issued"] += len(due)
+
+    def poll(self) -> None:
+        """Publish, in issue order, every snapshot whose D2H is seen done."""
+        while self.pending and self.pending[0].done.query():
+            self._publish(self.pending.pop(0), d2h_done=True)
+
+    def _publish(self, snap: _Snapshot, *, d2h_done: bool) -> None:
+        req, p = snap.req, snap.p
+        committed = req.kv.kv_committed_len
+        if p > committed:  # §11.7: condition 1 always holds without spec
+            raise RuntimeError(f"{req.rid}: snapshot p={p} beyond kv_committed_len {committed}")
+        overwritten = any(o.buf == snap.buf for o in self.pending)
+        if not self.layout.can_publish(
+            p,
+            committed=committed,
+            host_blocks_done=snap.host_blocks,
+            gdn_d2h_done=d2h_done,
+            overwritten=overwritten,
+        ):
+            raise RuntimeError(
+                f"{req.rid}: snapshot p={p} into GDN buffer {snap.buf} cannot publish: "
+                f"host copies cover [0, {snap.host_blocks}) of "
+                f"{p // self.layout.block_tokens} blocks, D2H done {d2h_done}, "
+                f"overwritten {overwritten} (design §11.6, §11.8)"
+            )
+        if self.busy.pop(snap.buf) is not snap:
+            raise RuntimeError(f"GDN buffer {snap.buf} busy with another snapshot")
+        self.staging_free.append(snap.staging)
+        self.stats["published"] += 1
+        self.owner.on_snapshot_published(req, p, snap.buf)
+
+    def release(self, req: Req) -> None:
+        """Wait for req's in-flight D2H, publish in order, drop its decode state."""
+        mine = [snap for snap in self.pending if snap.req is req]
+        for snap in mine:
+            snap.done.synchronize()
+        for snap in mine:
+            self.pending.remove(snap)
+            self._publish(snap, d2h_done=True)
+        slots = [r for r, q in self.decoding.items() if q is req]
+        if len(slots) > 1:
+            raise RuntimeError(f"{req.rid} is decoding in request slots {slots}")
+        for r in slots:
+            del self.decoding[r], self.host_blocks[r]
+
+    def load(self, bufs: List[int], dst_slots: torch.Tensor) -> None:
+        if len(bufs) != dst_slots.numel():
+            raise ValueError(f"{len(bufs)} buffers for {dst_slots.numel()} mamba slots")
+        for i, buf in enumerate(bufs):
+            if buf in self.busy:
+                raise RuntimeError(
+                    f"restore from GDN buffer {buf} while a snapshot D2H writes it"
+                )
+            if not 0 <= buf < len(self.buffers) or buf in self.buffer_free:
+                raise RuntimeError(f"restore from GDN buffer {buf}, which is not allocated")
+            self.mamba.load_slot_from_host(
+                self.buffers[buf], dst_slots[i : i + 1].to(torch.int64)
+            )
+        self.stats["restored"] += len(bufs)
+
+    # ------------------------------------------------------------ checks
+
+    def idle_problems(self, parked: List[int]) -> List[str]:
+        problems = []
+        held = sorted(set(range(len(self.buffers))) - set(self.buffer_free))
+        if held != sorted(parked) or len(parked) != len(set(parked)):
+            problems.append(f"GDN host buffers {held} allocated, parked records hold {sorted(parked)}")
+        if self.pending or self.busy or self.decoding:
+            problems.append(
+                f"snapshots: {len(self.pending)} D2H pending, busy buffers "
+                f"{sorted(self.busy)}, decoding slots {sorted(self.decoding)}"
+            )
+        if sorted(self.staging_free) != sorted(self.staging_slots):
+            problems.append(
+                f"staging mamba slots {sorted(self.staging_free)} free of "
+                f"{self.staging_slots}"
+            )
+        alloc = self.pool.mamba_allocator
+        if alloc.available_size() != alloc.size - len(self.staging_slots):
+            problems.append(
+                f"mamba allocator {alloc.available_size()} free of {alloc.size} with "
+                f"{len(self.staging_slots)} staging slots reserved"
+            )
+        return problems
+
+    def destroy(self) -> None:
+        if self._destroyed:
+            return
+        self._destroyed = True
+        self.d2h_stream.synchronize()
+        _cuda_host_unregister(self.host_raw)
