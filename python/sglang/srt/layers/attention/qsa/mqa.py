@@ -9,7 +9,10 @@ import torch
 
 from sglang.srt.environ import envs
 
-_GROUPED_QSA_MIN_ROWS_SCALE = {2: 2.0, 4: 1.0}
+# Group 8 needs the same crossover treatment group 2 got: it beats group 4 by
+# 1.10-1.30x from about 128 rows up (B=16/30/64/110 at ctx 8.1k and 32.1k) and
+# loses by 1-2 us below that.
+_GROUPED_QSA_MIN_ROWS_SCALE = {2: 2.0, 4: 1.0, 8: 2.0}
 # Opt-in, default off. `__launch_bounds__(threads, n)`: caps register usage so
 # n blocks fit per SM. ncu on the grouped verify kernel at B=110/ctx 96,000:
 # 71.6% of warp stall cycles wait on an L1TEX scoreboard while theoretical
@@ -26,28 +29,43 @@ if _ARC_QSA_INDEXER_MIN_BLOCKS_PER_SM < 0:
     raise ValueError("ARC_QSA_INDEXER_MIN_BLOCKS_PER_SM must be >= 0 (0 = off)")
 
 
-def _qsa_verify_group_size(queries_per_request: Optional[int]) -> Optional[int]:
-    """Widest supported sub-group that evenly divides the verify window.
+def _qsa_verify_group_size(
+    queries_per_request: Optional[int],
+    rows: Optional[int] = None,
+    configured_min_rows: int = 0,
+) -> Optional[int]:
+    """Widest supported group that divides the verify window and earns its floor.
 
     The grouped kernel's contract is narrower than "the whole verify window":
     it needs ``queries_per_request`` consecutive rows of one request with
-    monotonic context lengths. A width-8 window (MTP 8 steps) splits into two
-    sub-groups of four that both satisfy it, so a width with no table entry of
-    its own can still use the widest divisor that has one. Without this, width
-    8 misses the table, falls back to the per-row kernel, and re-reads each
-    request's whole compressed-K tile once per verify row -- measured at 329 us
-    against 233 us for groups of four at B=110, ctx=32,100 on B200.
+    monotonic context lengths. A window of 8 splits into groups of 8, 4 or 2 and
+    all of them satisfy it, so a width with no table entry of its own can still
+    use the widest divisor that has one. Without this, width 8 misses the table,
+    falls back to the per-row kernel, and re-reads each request's whole
+    compressed-K tile once per verify row -- 426.7 us against 148.7 us for
+    groups of eight at B=110, ctx 32,100 on B200.
 
-    Width 3 keeps returning None: its N=24 three-warp lowering measured slower
-    than baseline, and 3 has no supported divisor above 1.
+    Supported group sizes are the keys of ``_GROUPED_QSA_MIN_ROWS_SCALE``, which
+    are powers of two, and that is not a stylistic choice: the MMA lowering
+    requires ``N = group * heads`` to be divisible by 8 *and* ``N / 8`` to divide
+    the warp count, so group 3 (N=12 raw, 24 padded) and group 9 (36 / 72) fail
+    to build at all. **An odd verify window therefore cannot group** -- and the
+    window is ``speculative_num_steps + 1``, so MTP 8 steps gives width 9 and
+    gets nothing here, while 7 steps gives width 8 and gets 2.9x.
+
+    ``rows`` lets a wider group be skipped when the batch is too small to pay for
+    it; without it the widest divisor is returned.
     """
     if not queries_per_request or queries_per_request < 2:
         return None
-    if queries_per_request in _GROUPED_QSA_MIN_ROWS_SCALE:
-        return queries_per_request
     for group in sorted(_GROUPED_QSA_MIN_ROWS_SCALE, reverse=True):
-        if queries_per_request % group == 0:
-            return group
+        if queries_per_request % group:
+            continue
+        if rows is not None:
+            floor = _grouped_qsa_effective_min_rows(group, configured_min_rows)
+            if floor is not None and rows < floor:
+                continue
+        return group
     return None
 
 
@@ -551,10 +569,11 @@ def tilelang_qsa_mqa_decode(
     if groups_per_cta == 0:
         rows = q.shape[0]
         groups_per_cta = 1 if rows <= 8 else 2 if rows <= 24 else 4
-    grouped_size = _qsa_verify_group_size(verify_queries_per_request)
-    grouped_min_rows = _grouped_qsa_effective_min_rows(
-        grouped_size, envs.SGLANG_QSA_GROUPED_VERIFY_MIN_ROWS.get()
+    configured_min_rows = envs.SGLANG_QSA_GROUPED_VERIFY_MIN_ROWS.get()
+    grouped_size = _qsa_verify_group_size(
+        verify_queries_per_request, q.shape[0], configured_min_rows
     )
+    grouped_min_rows = _grouped_qsa_effective_min_rows(grouped_size, configured_min_rows)
     use_grouped_verify = (
         envs.SGLANG_QSA_GROUPED_VERIFY.get()
         and grouped_min_rows is not None
