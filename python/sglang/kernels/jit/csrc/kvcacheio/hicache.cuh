@@ -126,10 +126,13 @@ SGL_DEVICE void store_nc(uint4* __restrict__ dst, const uint4& value) {
 
 template <int64_t kBytes, uint32_t kNumThreads>
 SGL_DEVICE auto load_vec(const void* __restrict__ src) {
-  static_assert(kBytes % 128 == 0, "kBytes must be multiple of 128 bytes");
-  static_assert(128 % kNumThreads == 0, "kNumThreads must divide 128 bytes");
-  constexpr uint32_t kLoopCount = kBytes / 128;
-  using Package = details::PackageType<128 / kNumThreads>;
+  // h27: one localKVhead makes each NVFP4 scale block exactly64 B.
+  // The legacy128-byte specialization is unchanged for every other supported size.
+  static_assert(kBytes == 64 || kBytes % 128 == 0, "kBytes must be64 or a multiple of128 bytes");
+  constexpr uint32_t kQuantum = kBytes == 64 ? 64 : 128;
+  static_assert(kQuantum % kNumThreads == 0, "threads must divide the transfer quantum");
+  constexpr uint32_t kLoopCount = kBytes / kQuantum;
+  using Package = details::PackageType<kQuantum / kNumThreads>;
   using Storage = details::LocalStorage<Package, kLoopCount>;
 
   const auto src_packed = static_cast<const Package*>(src);

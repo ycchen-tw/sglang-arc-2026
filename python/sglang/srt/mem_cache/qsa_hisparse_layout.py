@@ -37,7 +37,7 @@ from typing import Optional
 MAX_HOT_BLOCKS = 32752
 HOT_BLOCKS_ALIGN = 16  # load_cache_to_device_buffer_planar requires hot % 16 == 0
 MAX_PLANES = 4  # PlanarSpec<P0, P1, P2, P3>
-TRANSFER_ALIGN = 128  # transfer_hicache_all_layer moves elements in 128 B units
+TRANSFER_ALIGN = 128  # legacy transfer quantum; h27 additionally admits exactly64 B
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -62,10 +62,10 @@ class PlaneSpec:
         if len(set(names)) != len(names):
             raise ValueError(f"duplicate plane names in {self.planes}")
         for name, nbytes in self.planes:
-            if nbytes <= 0 or nbytes % TRANSFER_ALIGN:
+            if nbytes <= 0 or (nbytes != 64 and nbytes % TRANSFER_ALIGN):
                 raise ValueError(
                     f"plane {name!r}: {nbytes} B per block is not a positive "
-                    f"multiple of {TRANSFER_ALIGN}"
+                    f"multiple of {TRANSFER_ALIGN} or exactly64 B"
                 )
         for q in range(0, len(self.planes), 2):
             if self.planes[q][1] != self.planes[q + 1][1]:

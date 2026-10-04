@@ -23,6 +23,8 @@ DEFAULT_BLOCK_QUOTA = 32 if _is_hip else 2
 
 @cache_once
 def _jit_hicache_module(*, element_size: int, unroll: int, block_quota: int) -> Module:
+    if element_size == 64 and unroll not in (2, 4, 8):
+        raise ValueError("64-byte HiCache transfers require unroll2,4,8 (4/8/16-byte vector packages)")
     args = make_cpp_args(
         element_size,
         unroll,
@@ -80,7 +82,7 @@ def can_use_hicache_jit_kernel(
     block_quota: int | None = None,  # can be tuned for less interference
 ) -> bool:
     logger = logging.getLogger(__name__)
-    if element_size % 128 != 0:
+    if element_size != 64 and element_size % 128 != 0:
         logger.warning(f"Unsupported {element_size = } for JIT HiCache kernel")
         return False
     try:
