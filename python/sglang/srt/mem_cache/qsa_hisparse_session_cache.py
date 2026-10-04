@@ -28,10 +28,25 @@ adopt_resumed_prefixes (after alloc_for_extend) -> on_snapshot_published
 (h08, commits [P_old, p) to the record) -> cache_finished_req (finish, abort,
 retract: publish pending snapshots, copy rows back, free the rest, park or
 release). A request aborted while waiting leaves through release_aborted_request.
+
+Exact output-id replay (h14, hisparse_config.qsa_session_replay, design §14): the
+client re-renders every earlier message from text on every turn and the server
+re-tokenizes it; where the model had sampled a non-canonical split of the same
+text, the key diverges from the record there (e2e 09-25: 79 of 82 prefix
+mismatches), and on every later turn again. At intake
+(Scheduler.handle_generate_request, before the Req and everything derived from
+its ids exist), replay_request compares each diverging message as text with the
+record's; equal text puts the record's ids back into the request's input ids, and
+the request then resumes at P as usual. With images the record's ids are padded
+(placeholders replaced by per-image values), so the record keeps its raw ids too and
+the comparison runs raw against raw; a replayed message may not touch an image, and
+the processor's ids, padded ids, later image offsets and M-RoPE positions move with
+it.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from array import array
@@ -64,6 +79,10 @@ logger = logging.getLogger(__name__)
 
 BACKEND_NAME = "qsa_hisparse_session"
 DEFAULT_IDLE_TIMEOUT_S = 1800.0
+MM_UNSUPPORTED = ("vision_position_ids", "media_nums_per_sample", "visible_frame_counts", "token_type_ids")
+MM_TOKEN_FIELDS = ("im_token_id", "im_start_id", "im_end_id", "slice_start_id", "slice_end_id", "video_token_id",
+                   "audio_token_id", "audio_start_id", "audio_end_id")  # never inside a replayed message
+REPLAY_END_TOKEN = "<|im_end|>"  # h14: ends an assistant message in the chat template
 
 
 def _i64(tokens) -> np.ndarray:
@@ -100,6 +119,9 @@ class SessionRecord:
     last_used: float = 0.0
     close_on_unpin: bool = False
     released: bool = False
+    prompt_len: int = 0  # h14: the producer's prompt length (its generation starts here)
+    raw: Optional[np.ndarray] = None  # h14: unpadded input + output ids when padding changed them
+    raw_ok: bool = True  # h14: False when the unpadded ids cannot stand for the tokens (length differs)
 
     @property
     def state(self) -> str:
@@ -164,9 +186,17 @@ class QSAHiSparseSessionCache(ChunkCache):
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout < 0:
             raise ValueError(f"hisparse_config.qsa_session_idle_timeout_s must be >= 0, got {timeout!r}")
 
+        replay = parse_hisparse_config().sparse_extra_config.get("qsa_session_replay", False)
+        if not isinstance(replay, bool):
+            raise ValueError(f"hisparse_config.qsa_session_replay must be a bool, got {replay!r}")
+
         self.coord = coordinator
         self.block_tokens = layout.block_tokens
         self.idle_timeout = float(timeout)  # 0: off
+        self.replay = replay  # h14; set_replay_tokenizer must follow
+        self.replay_end: Optional[int] = None
+        self.replay_stop = np.empty(0, np.int64)  # <|im_end|> + the model's stop tokens
+        self.replay_decode = None
         # R15: before 0030 the prefill context is packed whole per QSA layer, so a
         # prefill batch takes resumed prompts up to 2 C tokens (the first always).
         self.resume_context_cap = 2 * coordinator.req_to_token_pool.max_context_len
@@ -175,10 +205,11 @@ class QSAHiSparseSessionCache(ChunkCache):
         coordinator.set_snapshot_owner(self)
         logger.info(
             "QSA HiSparse session cache: snapshot T=%d, idle timeout %.0f s, "
-            "resumed context cap %d tokens per prefill batch",
+            "resumed context cap %d tokens per prefill batch, output-id replay %s",
             coordinator.snapshots.interval,
             self.idle_timeout,
             self.resume_context_cap,
+            "on" if self.replay else "off",
         )
 
     def reset_state(self) -> None:
@@ -255,6 +286,270 @@ class QSAHiSparseSessionCache(ChunkCache):
         elif st.req is not req or st.sid != req.session_id or st.gen != req.session_generation:
             raise RuntimeError(f"{req.rid}: two live requests share one rid, or its session changed")
         return st
+
+    # ------------------------------------------------------------ output-id replay (h14)
+
+    def set_replay_tokenizer(self, tokenizer, eos_token_ids) -> None:
+        """h14: the scheduler's tokenizer decodes the replayed messages; <|im_end|> ends a
+        message the client rendered, <|im_end|> or one of the model's eos tokens
+        (model_config.hf_eos_token_id) ends one in the record."""
+        if not self.replay:
+            raise RuntimeError("set_replay_tokenizer with hisparse_config.qsa_session_replay off")
+        if tokenizer is None:
+            raise ValueError(
+                "hisparse_config.qsa_session_replay needs the scheduler's tokenizer "
+                "(it decodes the replayed spans); do not use --skip-tokenizer-init"
+            )
+        end = tokenizer.convert_tokens_to_ids(REPLAY_END_TOKEN)
+        if not isinstance(end, int) or tokenizer.convert_ids_to_tokens(end) != REPLAY_END_TOKEN:
+            raise ValueError(f"the tokenizer has no single {REPLAY_END_TOKEN} token (got {end!r})")
+        if not eos_token_ids or not all(isinstance(t, int) for t in eos_token_ids):
+            raise ValueError(f"replay needs the model's eos token ids, got {eos_token_ids!r}")
+        self.replay_end = end
+        self.replay_stop = np.array(sorted({end, *eos_token_ids}), dtype=np.int64)
+        self.replay_decode = lambda ids: tokenizer.decode(
+            ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
+        )
+
+    def _first_end(self, tokens: np.ndarray, start: int) -> Optional[int]:
+        hits = np.flatnonzero(tokens[start:] == self.replay_end)
+        return start + int(hits[0]) if hits.size else None
+
+    @staticmethod
+    def _replay_blocker(recv_req, start: int) -> Optional[str]:
+        """Inputs whose positions or side data a changed id count from `start` on would shift
+        (multimodal inputs are handled by _mm_view instead)."""
+        if recv_req.input_embeds is not None:
+            return "embeds"
+        if (
+            recv_req.positional_embed_overrides is not None
+            or recv_req.token_type_ids is not None
+            or recv_req.multi_item_delimiter_indices is not None
+        ):
+            return "position_data"
+        if recv_req.return_routed_experts and recv_req.routed_experts_start_len > start:
+            return "routed_experts"
+        return None
+
+    @staticmethod
+    def _mm_view(mm, key: np.ndarray):
+        """A processor output replay can move: (item ranges [(item, a, b)] inclusive, special ids),
+        or None when it has anything replay does not know how to keep consistent."""
+        from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
+
+        if not isinstance(mm, MultimodalProcessorOutput) or mm.input_ids is None:
+            return None
+        if any(getattr(mm, f) is not None for f in MM_UNSUPPORTED):
+            return None
+        if len(mm.input_ids) != len(key) or not np.array_equal(_i64(mm.input_ids), key):
+            return None  # the processor's ids must be the request's ids
+        if mm.padded_input_ids is not None and len(mm.padded_input_ids) != len(key):
+            return None
+        pos = mm.mrope_positions
+        if pos is not None and (not isinstance(pos, torch.Tensor) or tuple(pos.shape) != (3, len(key))):
+            return None
+        ranges = []
+        for item in mm.mm_items:
+            if item.offsets is None:
+                return None
+            for a, b in item.offsets:
+                if not 0 <= a <= b < len(key):
+                    return None
+                ranges.append((item, int(a), int(b)))
+        ranges.sort(key=lambda r: r[1])
+        if any(r[1] <= q[2] for q, r in zip(ranges, ranges[1:])):
+            return None  # overlapping items
+        special = np.array(
+            [v for f in MM_TOKEN_FIELDS if (v := getattr(mm, f)) is not None], dtype=np.int64
+        )
+        return ranges, special
+
+    @staticmethod
+    def _text_positions(seg: torch.Tensor) -> bool:
+        """M-RoPE positions of plain text: three equal rows counting up by one."""
+        return bool((seg == seg[0:1]).all()) and bool(
+            (seg[0] - seg[0, 0] == torch.arange(seg.shape[1], device=seg.device, dtype=seg.dtype)).all()
+        )
+
+    def replay_request(self, recv_req, max_input_len: int) -> None:
+        """Exact output-id replay at intake (h14, design §14, §15, §16).
+
+        Wherever the key diverges from the session's PARKED record before the record's
+        end, the message around the divergence is compared as text: from the last message
+        end before it (common to both), to the key's next <|im_end|> and the record's next
+        <|im_end|> or eos token (its previous generation may have stopped on another eos
+        token, or not at all: then the record's end). Same text (no U+FFFD, so the same
+        bytes): the key's ids for that message become the record's, and the search goes on
+        after it, since an earlier replayed message diverges again on every later turn.
+        The first message whose text differs (a tool call the parser rewrote) stops it;
+        match_prefix then treats the rest as usual. recv_req.input_ids (and a
+        logprob_start_len past a replaced message) change here, before the Req and
+        everything derived from its ids exist.
+
+        Multimodal requests: the key is raw (placeholders), the record's tokens are padded,
+        so the comparison uses the record's raw ids. A replaced message may not overlap an
+        image range (key side) or hold a multimodal token (record side). The processor
+        output moves with the ids: input_ids and padded_input_ids are spliced the same
+        way (the scheduler adopts padded_input_ids when its length matches: left alone it
+        would bring the client's ids back), and when a message changes length the later
+        image offsets and M-RoPE positions shift by the difference (the message's own
+        positions must be plain text; M-RoPE's delta is unchanged).
+
+        Not made, counted per reason: a replay into a PINNED record, over embeds or
+        position data, a routed-experts or logprob start inside it, a processor output it
+        cannot keep consistent (mm_type), a message touching an image (mm_overlap), positions
+        that are not plain text (mm_shift), a record without a raw view (raw), and one whose
+        prompt reaches max_input_len (the scheduler's max_req_input_len:
+        validate_input_length would abort it, or cut its tail with --allow-auto-truncate,
+        where the client's own ids pass)."""
+        if not self.replay:
+            return
+        if not isinstance(max_input_len, int) or max_input_len < 1:
+            raise ValueError(f"{BACKEND_NAME}: max_input_len must be a positive int, got {max_input_len!r}")
+        if self.replay_decode is None:
+            raise RuntimeError(f"{BACKEND_NAME}: output-id replay is on but no tokenizer was set")
+        sid = recv_req.session_id
+        rec = self.index.get(sid) if sid is not None and sid in self.gen else None
+        if rec is None or rec.tokens is None:
+            return
+        key = _i64(recv_req.input_ids)
+        toks = rec.raw if rec.raw is not None else rec.tokens
+        stop = self.replay_stop
+        lcp = _lcp(key, toks)
+        if lcp >= min(len(key), len(toks)):
+            return  # the key agrees through the record
+        if np.isin(toks[lcp], stop):
+            if lcp < len(toks) - 1:  # a message boundary moved: different text, not a split
+                self.stats["replay_skip_stop"] += 1
+            return  # else only the previous generation's stop token differs (after P)
+        if rec.state != "PARKED":
+            self.stats["replay_skip_pinned"] += 1
+            return
+        if not rec.raw_ok:
+            self.stats["replay_skip_raw"] += 1
+            return
+        first = np.flatnonzero(np.isin(toks[:lcp], stop))
+        blocker = self._replay_blocker(recv_req, int(first[-1]) + 1 if first.size else 0)
+        if blocker is not None:
+            self.stats[f"replay_skip_{blocker}"] += 1
+            return
+        mm = recv_req.mm_inputs
+        view = None
+        if recv_req.need_wait_for_mm_inputs:  # encoder disaggregation: the images come later
+            self.stats["replay_skip_mm_type"] += 1
+            return
+        if mm is not None:
+            view = self._mm_view(mm, key)
+            if view is None:
+                self.stats["replay_skip_mm_type"] += 1
+                return
+        ranges, special = view if view is not None else ([], None)
+        shifts = {id(item): [list(map(int, ab)) for ab in item.offsets] for item, _, _ in ranges}
+        padded = _i64(mm.padded_input_ids).copy() if view is not None and mm.padded_input_ids is not None else None
+        pos = mm.mrope_positions if view is not None else None
+        logprob = recv_req.logprob_start_len if recv_req.return_logprob else None
+        new, spans, lcp0 = key, [], lcp
+        while lcp < min(len(new), len(toks)) and not np.isin(toks[lcp], stop):
+            ends = np.flatnonzero(np.isin(toks[:lcp], stop))
+            start = int(ends[-1]) + 1 if ends.size else 0
+            after = np.flatnonzero(np.isin(toks[lcp:], stop))
+            rec_end = lcp + int(after[0]) if after.size else len(toks)
+            key_end = self._first_end(new, lcp)
+            if key_end is None:
+                self.stats["replay_no_end"] += 1
+                break
+            if logprob is not None and start < logprob < key_end:
+                self.stats["replay_skip_logprob_start"] += 1
+                break
+            if view is not None:
+                cur = [(a, b) for offs in shifts.values() for a, b in offs]
+                if any(a < key_end and b >= start for a, b in cur) or np.isin(toks[start:rec_end], special).any():
+                    self.stats["replay_skip_mm_overlap"] += 1
+                    break
+            text = self.replay_decode(toks[start:rec_end].tolist())
+            if text != self.replay_decode(new[start:key_end].tolist()) or "\ufffd" in text:
+                self.stats["replay_text_differs"] += 1
+                break
+            delta = rec_end - key_end
+            if pos is not None and delta:
+                seg = pos[:, start:key_end]
+                if not self._text_positions(seg):
+                    self.stats["replay_skip_mm_shift"] += 1
+                    spans = []
+                    break
+                grown = seg[:, :1] + torch.arange(rec_end - start, dtype=pos.dtype, device=pos.device)
+                pos = torch.cat((pos[:, :start], grown, pos[:, key_end:] + delta), dim=1)
+            if view is not None:
+                for offs in shifts.values():
+                    for ab in offs:
+                        if ab[0] >= key_end:
+                            ab[0] += delta
+                            ab[1] += delta
+                if padded is not None:
+                    if not np.array_equal(padded[start:key_end], new[start:key_end]):
+                        raise RuntimeError(f"{recv_req.rid}: padded ids differ from the ids in a text message")
+                    padded = np.concatenate((padded[:start], toks[start:rec_end], padded[key_end:]))
+            new = np.concatenate((new[:start], toks[start:rec_end], new[key_end:]))
+            if logprob is not None and logprob >= key_end:
+                logprob += delta
+            spans.append({"s": start, "lcp": lcp, "rec_end": rec_end, "key_end": key_end, "delta": delta})
+            nxt = _lcp(new, toks)
+            if nxt < rec_end:
+                raise RuntimeError(f"{recv_req.rid}: replayed message [{start}, {rec_end}) still diverges at {nxt}")
+            lcp = nxt
+            if lcp < min(len(new), len(toks)) and lcp < len(toks) - 1 and np.isin(toks[lcp], stop):
+                self.stats["replay_skip_stop"] += 1
+        if not spans:
+            return
+        if len(new) >= max_input_len:
+            self.stats["replay_skip_input_len"] += 1
+            return
+        moved = int(len(new) - len(key))
+        if view is not None:
+            if pos is not None and mm.mrope_position_delta is not None:
+                old_delta = int(mm.mrope_positions.max()) + 1 - len(key)
+                if int(pos.max()) + 1 - len(new) != old_delta:
+                    raise RuntimeError(f"{recv_req.rid}: replay changed the M-RoPE position delta")
+            for item, _, _ in ranges:
+                item.offsets = [tuple(ab) for ab in shifts[id(item)]]
+            mm.input_ids = new.tolist()
+            if padded is not None:
+                mm.padded_input_ids = padded.tolist()
+            if pos is not None:
+                mm.mrope_positions = pos
+            self.stats["replay_mm"] += 1
+            self.stats["replay_mm_shift"] += any(s["delta"] for s in spans)
+        if isinstance(recv_req.input_ids, array):
+            recv_req.input_ids = array("q", new.tolist())
+        else:
+            recv_req.input_ids = new.tolist()
+        if logprob is not None:
+            recv_req.logprob_start_len = logprob
+        self.stats["replay"] += 1
+        self.stats["replay_messages"] += len(spans)
+        self.stats["replay_earlier"] += sum(s["lcp"] < rec.prompt_len for s in spans)  # an earlier turn's reply
+        w = max(0, lcp0 - 16)
+        logger.info(
+            "QSA_REPLAY %s",
+            json.dumps(
+                {
+                    "sid": sid,
+                    "rid": recv_req.rid,
+                    "P": rec.P,
+                    "prev_prompt": rec.prompt_len,
+                    "lcp": lcp0,
+                    "rec_end": spans[0]["rec_end"],
+                    "key_end": spans[0]["key_end"],
+                    "delta": moved,
+                    "spans": spans,
+                    "mm": view is not None,
+                    "start": w,
+                    "rec": toks[w : lcp0 + 16].tolist(),
+                    "key": key[w : lcp0 + 16].tolist(),
+                },
+                separators=(",", ":"),
+            ),
+        )
 
     # ------------------------------------------------------------ match / pin / adopt
 
@@ -337,16 +632,39 @@ class QSAHiSparseSessionCache(ChunkCache):
         decision = (id(rec), rec.P, why)
         if st.logged != decision:  # a request waiting for admission matches every round
             st.logged = decision
+            lcp = _lcp(full, rec.tokens)
             logger.info(
                 "QSA session %s: %s at P=%d, LCP=%d, committed=%d, key %d/%d tokens",
                 rec.sid,
                 "resume" if why is None else f"mismatch ({why})",
                 rec.P,
-                _lcp(full, rec.tokens),
+                lcp,
                 rec.committed,
                 len(key),
                 len(full),
             )
+            if why in ("limit", "tokens"):  # h14 diagnostic: both sides around the LCP
+                start = max(0, lcp - 16)
+                logger.info(
+                    "QSA_MISMATCH %s",
+                    json.dumps(
+                        {
+                            "sid": rec.sid,
+                            "rid": req.rid,
+                            "why": why,
+                            "P": rec.P,
+                            "prev_prompt": rec.prompt_len,
+                            "lcp": lcp,
+                            "key_len": len(key),
+                            "full_len": len(full),
+                            "rec_len": len(rec.tokens),
+                            "start": start,
+                            "rec": rec.tokens[start : lcp + 16].tolist(),
+                            "key": full[start : lcp + 16].tolist(),
+                        },
+                        separators=(",", ":"),
+                    ),
+                )
         return why
 
     def inc_lock_ref(self, node: Any) -> IncLockRefResult:
@@ -465,6 +783,7 @@ class QSAHiSparseSessionCache(ChunkCache):
                 pin_req=req,
                 pin_count=1,
                 last_used=self.clock(),
+                prompt_len=len(req.origin_input_ids),
             )
             self.records.append(rec)
             self.index[st.sid] = rec
@@ -509,6 +828,14 @@ class QSAHiSparseSessionCache(ChunkCache):
             rec.logical = self.req_to_token_pool.req_to_token[r, :keep].to(torch.int64, copy=True)
             rec.host_blocks = coord.req_to_host_pool[r, : keep // self.block_tokens].clone()
             rec.tokens = np.concatenate((_i64(req.origin_input_ids), _i64(req.output_ids)))
+            rec.prompt_len = len(req.origin_input_ids)
+            unpadded = req.origin_input_ids_unpadded
+            if unpadded is req.origin_input_ids:  # no multimodal padding: the tokens are the raw ids
+                rec.raw, rec.raw_ok = None, True
+            elif len(unpadded) == len(req.origin_input_ids):
+                rec.raw, rec.raw_ok = np.concatenate((_i64(unpadded), _i64(req.output_ids))), True
+            else:  # e.g. --allow-auto-truncate cut the padded ids: no raw view, no replay
+                rec.raw, rec.raw_ok = None, False
         super().cache_finished_req(req, is_insert, kv_len_to_handle=kv_len_to_handle)
         coord.release_host_row(r, keep // self.block_tokens)
         if rec is not None:

@@ -1274,6 +1274,11 @@ class Scheduler(
             if isinstance(self.tree_cache, QSAHiSparseSessionCache)
             else None
         )
+        if self._qsa_session_cache is not None and self._qsa_session_cache.replay:
+            # h14: output-id replay decodes the previous generation with this tokenizer
+            self._qsa_session_cache.set_replay_tokenizer(
+                self.tokenizer, self.model_config.hf_eos_token_id
+            )
         if not self.enable_hisparse:
             return
 
@@ -2787,6 +2792,11 @@ class Scheduler(
                 # Generate fake input_ids based on the length of input_embeds
                 seq_length = len(recv_req.input_embeds)
                 recv_req.input_ids = array("q", [1]) * seq_length
+
+            if radix_native_session and self._qsa_session_cache is not None:
+                # arc-forge QSA HiSparse h14: put the session's own generated ids back
+                # before anything is derived from the input ids
+                self._qsa_session_cache.replay_request(recv_req, self.max_req_input_len)
 
             is_beam = BeamCoordinator.request_beam_width(recv_req) > 1
             req = Req(
