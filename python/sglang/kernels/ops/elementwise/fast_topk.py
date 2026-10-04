@@ -31,7 +31,13 @@ def _jit_fast_topk_module(topk: int) -> Module:
         "fast_topk",
         *args,
         cuda_files=["elementwise/fast_topk.cuh"],
-        cuda_wrappers=[("fast_topk", f"FastTopKKernel<{args}>::run")],
+        cuda_wrappers=[
+            ("fast_topk", f"FastTopKKernel<{args}>::run"),
+            (
+                "fast_topk_zero_starts",
+                f"FastTopKKernel<{args}>::run_zero_starts",
+            ),
+        ],
     )
 
 
@@ -61,10 +67,13 @@ def fast_topk(
     CUDA int32 tensor [B, topk]
     """
     batch = score.shape[0]
-    if row_starts is None:
-        row_starts = torch.zeros(batch, dtype=torch.int32, device=score.device)
     indices = score.new_empty((batch, topk), dtype=torch.int32)
 
     module = _jit_fast_topk_module(topk)
-    module.fast_topk(score, row_starts, indices, lengths)
+    if row_starts is None:
+        # The CUDA kernel already treats a null pointer as row_start=0. Use a
+        # dedicated wrapper rather than allocate/fill a zeros tensor per call.
+        module.fast_topk_zero_starts(score, indices, lengths)
+    else:
+        module.fast_topk(score, row_starts, indices, lengths)
     return indices

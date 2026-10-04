@@ -509,6 +509,7 @@ class QSAIndexer(MultiPlatformOp):
         sequence_lengths: torch.Tensor,
         verify_queries_per_request: Optional[int] = None,
     ) -> torch.Tensor:
+        use_fast_decode_topk = q.is_cuda and self.block_topk == 512
         logits = qsa_mqa_decode(
             q,
             compressed_cache,
@@ -516,8 +517,9 @@ class QSAIndexer(MultiPlatformOp):
             compressed_lengths,
             max_model_len,
             verify_queries_per_request=verify_queries_per_request,
+            fill_invalid_tail=not use_fast_decode_topk,
         )
-        if logits.is_cuda and self.block_topk == 512:
+        if use_fast_decode_topk:
             # Decode rows start at zero, so compressed lengths double as row lengths;
             # skip the generic zero-fill + subtract.
             from sglang.kernels.ops.elementwise.fast_topk import fast_topk

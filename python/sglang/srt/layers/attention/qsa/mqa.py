@@ -468,6 +468,7 @@ def tilelang_qsa_mqa_decode(
     max_model_len: int,
     score_scale: Optional[float] = None,
     verify_queries_per_request: Optional[int] = None,
+    fill_invalid_tail: bool = True,
 ) -> torch.Tensor:
     """Validated TileLang paged decode kernel with weights removed."""
 
@@ -480,12 +481,22 @@ def tilelang_qsa_mqa_decode(
             "TileLang QSA decode requires a compressed page size of "
             f"8/16/32/64 (64-row GEMM sub-page packing), got {page_size}"
         )
-    logits = torch.full(
-        (q.shape[0], max_model_len),
-        -float("inf"),
-        dtype=torch.float32,
-        device=q.device,
-    )
+    if fill_invalid_tail:
+        logits = torch.full(
+            (q.shape[0], max_model_len),
+            -float("inf"),
+            dtype=torch.float32,
+            device=q.device,
+        )
+    else:
+        # Internal decode selection passes lengths directly to fast_topk, so
+        # columns outside [0, length) are provably unread. Avoid a full
+        # [rows, max_model_len] fill while preserving the public default.
+        logits = torch.empty(
+            (q.shape[0], max_model_len),
+            dtype=torch.float32,
+            device=q.device,
+        )
     if not q.shape[0] or not max_model_len:
         return logits
     # The validated MMA layout requires N (the Q-head dimension) to be a
@@ -563,6 +574,7 @@ def qsa_mqa_decode(
     max_model_len: int,
     score_scale: Optional[float] = None,
     verify_queries_per_request: Optional[int] = None,
+    fill_invalid_tail: bool = True,
 ) -> torch.Tensor:
     if q.is_cuda and HAS_TILELANG:
         return tilelang_qsa_mqa_decode(
@@ -573,6 +585,7 @@ def qsa_mqa_decode(
             max_model_len,
             score_scale,
             verify_queries_per_request,
+            fill_invalid_tail,
         )
     return torch_qsa_mqa_decode(
         q, k_cache, page_table, context_lens, max_model_len, score_scale

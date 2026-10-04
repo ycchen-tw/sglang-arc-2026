@@ -217,7 +217,9 @@ __global__ __launch_bounds__(fast_topk_detail::kThreadsPerBlock) void fast_topk_
   device::PDLWaitPrimary<kUsePDL>();
 
   const auto bid = static_cast<uint64_t>(blockIdx.x);
-  const auto row_start = params.row_starts[bid];
+  // run_zero_starts() passes a null row_starts instead of allocating and filling a
+  // per-call zeros tensor; v0.5.20 dropped this guard, so restore it here.
+  const auto row_start = params.row_starts == nullptr ? 0 : params.row_starts[bid];
   const auto length = params.lengths[bid];
   const auto indice = params.indices + bid * kTopK;
   const auto score = params.input + bid * params.input_stride;
@@ -284,6 +286,48 @@ struct FastTopKKernel {
 
     const auto num_rows = static_cast<uint32_t>(B.unwrap());
     LaunchKernel(num_rows, fast_topk_detail::kThreadsPerBlock, device.unwrap(), fast_topk_detail::kSmemBytes)
+        .enable_pdl(kUsePDL)(kernel, params);
+  }
+
+  static void
+  run_zero_starts(const tvm::ffi::TensorView score,
+                  const tvm::ffi::TensorView indices,
+                  const tvm::ffi::TensorView lengths) {
+    using namespace host;
+    auto B = SymbolicSize{"batch"};
+    auto L = SymbolicSize{"length"};
+    auto S = SymbolicSize{"input_stride"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({B, L})  // score
+        .with_strides({S, 1})
+        .with_dtype<fp32_t>()
+        .with_device(device)
+        .verify(score);
+    TensorMatcher({B, kTopK})  // indices
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(indices);
+    TensorMatcher({B})  // lengths
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(lengths);
+
+    const auto params = fast_topk_detail::FastTopKParams{
+        .input = static_cast<const float*>(score.data_ptr()),
+        .row_starts = nullptr,
+        .indices = static_cast<int32_t*>(indices.data_ptr()),
+        .lengths = static_cast<const int32_t*>(lengths.data_ptr()),
+        .input_stride = S.unwrap(),
+    };
+
+    const auto num_rows = static_cast<uint32_t>(B.unwrap());
+    LaunchKernel(
+        num_rows,
+        fast_topk_detail::kThreadsPerBlock,
+        device.unwrap(),
+        fast_topk_detail::kSmemBytes)
         .enable_pdl(kUsePDL)(kernel, params);
   }
 };
