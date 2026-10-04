@@ -512,10 +512,153 @@ def qwen_sparse_kv_extraction_compact_triton(
     )
 
 
+@triton.jit
+def _nvfp4_decode_nibble(byte, shift):
+    """E2M1: bit3 sign, bits2-1 exponent, bit0 mantissa.
+
+    Exponent 0 is the subnormal pair (0, 0.5); otherwise the value is
+    2^(exponent-1) * (1 + mantissa/2), i.e. the {1,1.5,2,3,4,6} ladder.
+    """
+    nibble = (byte >> (4 * shift)) & 0x0F
+    exponent = (nibble >> 1) & 0x03
+    mantissa = (nibble & 0x01).to(tl.float32)
+    magnitude = tl.where(
+        exponent == 0,
+        mantissa * 0.5,
+        tl.exp2((exponent - 1).to(tl.float32)) * (1.0 + mantissa * 0.5),
+    )
+    return tl.where(((nibble >> 3) & 0x01) == 1, -magnitude, magnitude)
+
+
+@triton.jit
+def _nvfp4_expand_kv(
+    k_fp4,
+    v_fp4,
+    k_sf,
+    v_sf,
+    req_to_token,
+    req_indices,
+    cu_k,
+    out_k,
+    out_v,
+    k_global,
+    v_global,
+    heads: tl.constexpr,
+    dim: tl.constexpr,
+    req_stride: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    OUT_FP8: tl.constexpr,
+):
+    """Gather one request's packed NVFP4 context and write it out dequantized.
+
+    Replaces index_select -> nvfp4_kv_dequantize(BF16) -> .to(FP8) -> torch.cat
+    with a single pass: the packed bytes and their block scales are read once
+    and the result lands directly in the caller's contiguous buffer at the
+    request's cu_k offset, so no BF16 copy of the context ever exists.
+    """
+    PACK: tl.constexpr = dim // 2
+    SF: tl.constexpr = dim // 16
+    pid_b, pid_h, pid_t = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    start = tl.load(cu_k + pid_b).to(tl.int64)
+    length = tl.load(cu_k + pid_b + 1).to(tl.int64) - start
+    tokens = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
+    live = tokens < length
+    req = tl.load(req_indices + pid_b).to(tl.int64)
+    slots = tl.load(
+        req_to_token + req * req_stride + tokens, mask=live, other=0
+    ).to(tl.int64)
+
+    pack = tl.arange(0, PACK)
+    packed_src = slots[:, None] * (heads * PACK) + pid_h * PACK + pack[None, :]
+    scale_src = slots[:, None] * (heads * SF) + pid_h * SF + (pack // 8)[None, :]
+    mask = live[:, None]
+    kb = tl.load(k_fp4 + packed_src, mask=mask, other=0)
+    vb = tl.load(v_fp4 + packed_src, mask=mask, other=0)
+    k_step = tl.load(k_sf + scale_src, mask=mask, other=0.0).to(tl.float32) * tl.load(k_global)
+    v_step = tl.load(v_sf + scale_src, mask=mask, other=0.0).to(tl.float32) * tl.load(v_global)
+    dst = (start + tokens)[:, None] * (heads * dim) + pid_h * dim + 2 * pack[None, :]
+
+    k_low = _nvfp4_decode_nibble(kb, 0) * k_step
+    k_high = _nvfp4_decode_nibble(kb, 1) * k_step
+    v_low = _nvfp4_decode_nibble(vb, 0) * v_step
+    v_high = _nvfp4_decode_nibble(vb, 1) * v_step
+    if OUT_FP8:
+        k_low, k_high = k_low.to(tl.float8e4nv), k_high.to(tl.float8e4nv)
+        v_low, v_high = v_low.to(tl.float8e4nv), v_high.to(tl.float8e4nv)
+    else:
+        k_low, k_high = k_low.to(tl.bfloat16), k_high.to(tl.bfloat16)
+        v_low, v_high = v_low.to(tl.bfloat16), v_high.to(tl.bfloat16)
+    tl.store(out_k + dst, k_low, mask=mask)
+    tl.store(out_k + dst + 1, k_high, mask=mask)
+    tl.store(out_v + dst, v_low, mask=mask)
+    tl.store(out_v + dst + 1, v_high, mask=mask)
+
+
+def qwen_sparse_nvfp4_expand_triton(
+    k_fp4,
+    v_fp4,
+    k_sf,
+    v_sf,
+    req_to_token,
+    req_indices,
+    cu_k,
+    out_k,
+    out_v,
+    k_global,
+    v_global,
+    max_length,
+):
+    """Expand every request's packed NVFP4 context into one contiguous K/V pair.
+
+    ``out_k``/``out_v`` are ``[sum(seq_lens), heads, head_dim]`` in either FP8
+    E4M3 (what the chunk-prefill kernel consumes) or BF16.
+    """
+    if k_fp4.dtype != torch.uint8 or v_fp4.dtype != torch.uint8:
+        raise ValueError(f"Packed NVFP4 K/V must be uint8, got {k_fp4.dtype}/{v_fp4.dtype}")
+    if out_k.dtype != out_v.dtype:
+        raise ValueError("NVFP4 expansion outputs must share a dtype")
+    # Only E4M3 and BF16 are ever written here, so the dtypes are named
+    # outright rather than going through a generic is_fp8 predicate.
+    out_fp8 = out_k.dtype == torch.float8_e4m3fn
+    if not out_fp8 and out_k.dtype != torch.bfloat16:
+        raise ValueError(f"NVFP4 expansion writes FP8 or BF16, got {out_k.dtype}")
+    if k_global.dtype != torch.float32 or v_global.dtype != torch.float32:
+        raise ValueError("NVFP4 global scales must be float32 device tensors")
+    batch = req_indices.shape[0]
+    heads, dim = out_k.shape[1], out_k.shape[2]
+    if k_fp4.shape[1] != heads or k_fp4.shape[2] * 2 != dim:
+        raise ValueError("Packed NVFP4 geometry does not match the expansion output")
+    if k_sf.shape[2] * 16 != dim:
+        raise ValueError("NVFP4 block-scale geometry does not match the expansion output")
+    if not (out_k.is_contiguous() and out_v.is_contiguous()):
+        raise ValueError("NVFP4 expansion outputs must be contiguous")
+    block_t = 8
+    _nvfp4_expand_kv[(batch, heads, triton.cdiv(max_length, block_t))](
+        k_fp4,
+        v_fp4,
+        k_sf.view(torch.float8_e4m3fn),
+        v_sf.view(torch.float8_e4m3fn),
+        req_to_token,
+        req_indices,
+        cu_k,
+        out_k,
+        out_v,
+        k_global,
+        v_global,
+        heads,
+        dim,
+        req_to_token.stride(0),
+        BLOCK_T=block_t,
+        OUT_FP8=out_fp8,
+        num_warps=4,
+    )
+
+
 __all__ = [
     "qwen_sparse_fa2_cu_seqlens_triton",
     "qwen_sparse_valid_counts_triton",
     "qwen_sparse_kv_extraction_compact_triton",
+    "qwen_sparse_nvfp4_expand_triton",
     "sparse_gqa_fwd_interface_triton",
     "sparse_gqa_fwd_interface_triton_ck",
 ]

@@ -33,6 +33,7 @@ from sglang.srt.layers.attention.qsa.metadata import (
 from sglang.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
+    qwen_sparse_nvfp4_expand_triton,
     qwen_sparse_valid_counts_triton,
     sparse_gqa_fwd_interface_triton,
     sparse_gqa_fwd_interface_triton_ck,
@@ -47,6 +48,10 @@ _TRTLLM_SPARSE_PAGE_SIZE = 64
 # scales); decode gathers the selection as bytes and XQA reads FP4 through
 # kv_cache_sf, prefix prefill expands only the request's context transiently.
 _ARC_QSA_NVFP4 = os.environ.get("ARC_QSA_NVFP4") == "1"
+# Dtype the prefix-chunk expansion feeds the _ck kernel. FP8 halves what that
+# kernel re-reads per query row (the dominant cost of chunk prefill); BF16
+# exists so the downcast's quantization cost can be measured against it.
+_ARC_QSA_NVFP4_PREFILL = os.environ.get("ARC_QSA_NVFP4_PREFILL", "fp8")
 
 
 def _pool_kv_quant_name(pool) -> Optional[str]:
@@ -219,9 +224,15 @@ class QwenSparseAttnBackend(AttentionBackend):
                     "NVFP4 QSA decode needs the trtllm-gen path: set "
                     "ARC_QSA_SM120_DECODE=xqa"
                 )
+            if _ARC_QSA_NVFP4_PREFILL not in ("fp8", "bf16"):
+                raise RuntimeError(
+                    "ARC_QSA_NVFP4_PREFILL must be fp8 or bf16, got "
+                    + _ARC_QSA_NVFP4_PREFILL
+                )
             logger.info(
                 "ARC_QSA_NVFP4=1: packed FP4 gather + XQA kv_cache_sf decode; "
-                "prefix prefill expands the request context to the query dtype"
+                "prefix prefill uses the fused NVFP4 expansion to %s",
+                _ARC_QSA_NVFP4_PREFILL,
             )
         model_config = getattr(runner, "model_config", None)
         config = getattr(model_config, "hf_text_config", None)
@@ -1385,45 +1396,45 @@ class QwenSparseAttnBackend(AttentionBackend):
         # K/V. Current-chunk K/V has already been committed to the cache above.
         pool = self.token_to_kv_pool
         req_to_token = self.req_to_token_pool.req_to_token
-        req_indices = forward_batch.req_pool_indices.tolist()
-        if self.arc_nvfp4:
-            # The chunk kernel reads plain rows, so each request's full context
-            # is expanded from packed FP4. One request at a time and straight
-            # to FP8 (the same kernel dtype as the FP8 pool): a continuation
-            # batch can hold 32 requests x 80k tokens, and a BF16 expansion of
-            # all of them at once (5 GB) is what pushed the pool budget into OOM.
-            # The expansion folds the global scale in, and _sparse_gqa_chunk_prefill
-            # casts FP8 K/V to the query dtype with no scale of its own.
-            k_parts, v_parts = [], []
-            for i in range(len(sequence_lens)):
-                slots = req_to_token[req_indices[i], : sequence_lens[i]].long()
-                k_i, v_i = _nvfp4_dequantize_tokens(pool, layer.layer_id, slots, torch.bfloat16)
-                k_parts.append(k_i.to(torch.float8_e4m3fn))
-                v_parts.append(v_i.to(torch.float8_e4m3fn))
-                del k_i, v_i
-        else:
-            k_buffer = pool.get_key_buffer(layer.layer_id)
-            v_buffer = pool.get_value_buffer(layer.layer_id)
-            k_parts = [
-                k_buffer.index_select(
-                    0, req_to_token[req_indices[i], : sequence_lens[i]].long()
-                )
-                for i in range(len(sequence_lens))
-            ]
-            v_parts = [
-                v_buffer.index_select(
-                    0, req_to_token[req_indices[i], : sequence_lens[i]].long()
-                )
-                for i in range(len(sequence_lens))
-            ]
         sequence_lens_tensor = torch.tensor(
             sequence_lens, dtype=torch.int32, device=q.device
         )
         cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
+        if self.arc_nvfp4:
+            # One fused pass per layer: gather + dequantize + downcast write
+            # straight into the buffer the chunk kernel consumes. The previous
+            # index_select -> BF16 -> FP8 -> torch.cat chain held four copies of
+            # the same context alive at once, which is what forced the pool cap.
+            # The expansion folds the global scale in, and
+            # _sparse_gqa_chunk_prefill casts FP8 K/V to the query dtype with no
+            # scale of its own, so no k_scale/v_scale reaches the kernel.
+            k_context, v_context = self._nvfp4_expand_context(
+                layer, forward_batch, cu_seqlens_k, sequence_lens, q
+            )
+        else:
+            req_indices = forward_batch.req_pool_indices.tolist()
+            k_buffer = pool.get_key_buffer(layer.layer_id)
+            v_buffer = pool.get_value_buffer(layer.layer_id)
+            k_context = torch.cat(
+                [
+                    k_buffer.index_select(
+                        0, req_to_token[req_indices[i], : sequence_lens[i]].long()
+                    )
+                    for i in range(len(sequence_lens))
+                ]
+            )
+            v_context = torch.cat(
+                [
+                    v_buffer.index_select(
+                        0, req_to_token[req_indices[i], : sequence_lens[i]].long()
+                    )
+                    for i in range(len(sequence_lens))
+                ]
+            )
         output = sparse_gqa_fwd_interface_triton_ck(
             q.contiguous(),
-            torch.cat(k_parts),
-            torch.cat(v_parts),
+            k_context,
+            v_context,
             topk_indices,
             cu_seqlens_q,
             cu_seqlens_k,
@@ -1431,6 +1442,41 @@ class QwenSparseAttnBackend(AttentionBackend):
             layer.scaling,
         )
         return self._pad_extend_output(output, num_output_rows)
+
+    def _nvfp4_expand_context(
+        self, layer, forward_batch, cu_seqlens_k, sequence_lens, q: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Dequantize every request's packed NVFP4 context into one K/V pair.
+
+        The chunk-prefill kernel re-reads the selected rows once per query row,
+        so FP8 -- half the bytes of the query dtype -- is what it should be
+        handed; ``ARC_QSA_NVFP4_PREFILL=bf16`` keeps the dequantized precision
+        at twice the footprint, for measuring what the downcast costs.
+        """
+        pool = self.token_to_kv_pool
+        k_fp4, v_fp4, k_sf, v_sf = pool.get_raw_kv_buffer(layer.layer_id)
+        method = pool.get_kv_cache_quant_method()
+        heads, dim = k_fp4.shape[1], k_fp4.shape[2] * 2
+        dtype = torch.float8_e4m3fn if _ARC_QSA_NVFP4_PREFILL == "fp8" else q.dtype
+        shape = (sum(sequence_lens), heads, dim)
+        k_context = torch.empty(shape, dtype=dtype, device=q.device)
+        v_context = torch.empty(shape, dtype=dtype, device=q.device)
+        layer_id = layer.layer_id
+        qwen_sparse_nvfp4_expand_triton(
+            k_fp4,
+            v_fp4,
+            k_sf,
+            v_sf,
+            self.req_to_token_pool.req_to_token,
+            forward_batch.req_pool_indices,
+            cu_seqlens_k,
+            k_context,
+            v_context,
+            method.k_scales_gpu[layer_id : layer_id + 1],
+            method.v_scales_gpu[layer_id : layer_id + 1],
+            max(sequence_lens),
+        )
+        return k_context, v_context
 
     @staticmethod
     def _pad_extend_output(output: torch.Tensor, num_rows: int) -> torch.Tensor:
