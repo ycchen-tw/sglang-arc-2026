@@ -482,3 +482,186 @@ def load_cache_to_device_buffer_dsv4_mla(
         miss_count=miss_count,
         skip_io=skip_io,
     )
+
+
+# ---------------------------------------------------------------------------
+# Planar records (arc-forge QSA HiSparse h01)
+#
+# A host item is one record packing every plane of a 4-token QSA block back to
+# back ([K | V] for FP8, [K | V | K scale | V scale] for NVFP4); on the device
+# each plane is its own buffer with per-item stride = that plane's bytes. The
+# resolve/LRU is the same kernel as load_cache_to_device_buffer_mla; only the
+# miss copy differs (see PlanarSpec / copy_record_planar in hisparse.cuh).
+# ---------------------------------------------------------------------------
+
+# lru_slots / s_lru_slots_out / s_hash_vals are int16, so the hot buffer must
+# stay below 32768 slots; the largest multiple of 16 is 32752.
+PLANAR_MAX_HOT_BUFFER = 32752
+PLANAR_MAX_PLANES = 4
+
+
+@functools.cache
+def _jit_planar_module(
+    block_size: int,
+    num_top_k: int,
+    hot_buffer_size: int,
+    plane_bytes: tuple[int, int, int, int],
+    skip_io: bool,
+) -> Module:
+    template_args = make_cpp_args(
+        block_size, num_top_k, hot_buffer_size, *plane_bytes, skip_io
+    )
+    return load_jit(
+        "sparse_cache_planar",
+        *template_args,
+        cuda_files=["kvcacheio/hisparse.cuh"],
+        cuda_wrappers=[
+            (
+                "load_cache_to_device_buffer_planar",
+                f"load_cache_to_device_buffer_planar<{template_args}>",
+            )
+        ],
+    )
+
+
+def _check_index_tensor(name: str, t: torch.Tensor, dtypes: tuple, ndim: int) -> None:
+    if t.dtype not in dtypes or t.dim() != ndim or not t.is_cuda:
+        raise ValueError(
+            f"{name} must be a {ndim}-D CUDA tensor of {dtypes}, "
+            f"got {t.dtype} {tuple(t.shape)} on {t.device}"
+        )
+    if t.stride(-1) != 1:
+        raise ValueError(f"{name} must be contiguous in its last dim")
+
+
+def load_cache_to_device_buffer_planar(
+    *,
+    top_k_tokens: torch.Tensor,
+    device_buffer_tokens: torch.Tensor,
+    host_cache_locs: torch.Tensor,
+    device_buffer_locs: torch.Tensor,
+    host_records: torch.Tensor,
+    device_planes: tuple[torch.Tensor, ...],
+    plane_bytes: tuple[int, ...],
+    top_k_device_locs: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    lru_slots: torch.Tensor,
+    num_top_k: int,
+    hot_buffer_size: int,
+    block_size: int,
+    num_real_reqs: torch.Tensor,
+    skip_io: bool = False,
+) -> None:
+    """HiSparse swap-in whose miss copy moves one planar host record per item.
+
+    host_records: uint8 [items, sum(plane_bytes)] in registered host memory (one
+    layer). device_planes[q]: contiguous CUDA tensor of any dtype whose bytes are
+    items x plane_bytes[q]; item d of plane q starts at byte d * plane_bytes[q].
+    Rows of top_k_tokens beyond num_real_reqs[0] get -1 and are not resolved.
+    All checks are metadata-only, so the call is CUDA-graph capturable.
+    """
+    num_planes = len(plane_bytes)
+    if not 1 <= num_planes <= PLANAR_MAX_PLANES or len(device_planes) != num_planes:
+        raise ValueError(
+            f"need 1..{PLANAR_MAX_PLANES} planes and one tensor per plane, got "
+            f"{num_planes} sizes and {len(device_planes)} tensors"
+        )
+    num_items = None
+    for q, (plane, nbytes) in enumerate(zip(device_planes, plane_bytes)):
+        if nbytes <= 0 or nbytes % 16 != 0:
+            raise ValueError(
+                f"plane {q}: bytes {nbytes} must be a positive multiple of 16"
+            )
+        if not plane.is_cuda or not plane.is_contiguous():
+            raise ValueError(f"plane {q} must be a contiguous CUDA tensor")
+        total = plane.numel() * plane.element_size()
+        if total % nbytes != 0:
+            raise ValueError(
+                f"plane {q}: {total} bytes is not a whole number of {nbytes} B items"
+            )
+        if num_items is not None and total // nbytes != num_items:
+            raise ValueError(
+                f"plane {q} holds {total // nbytes} items, plane 0 holds {num_items}"
+            )
+        num_items = total // nbytes
+    record_bytes = sum(plane_bytes)
+    if (
+        host_records.dtype != torch.uint8
+        or host_records.dim() != 2
+        or host_records.size(1) != record_bytes
+        or host_records.stride() != (record_bytes, 1)
+        or host_records.device.type != "cpu"
+    ):
+        raise ValueError(
+            f"host_records must be contiguous uint8 [items, {record_bytes}] on the host, got "
+            f"{host_records.dtype} {tuple(host_records.shape)} strides {host_records.stride()} "
+            f"on {host_records.device}"
+        )
+    if (
+        not num_top_k <= hot_buffer_size <= PLANAR_MAX_HOT_BUFFER
+        or hot_buffer_size % 16 != 0
+    ):
+        raise ValueError(
+            f"hot_buffer_size {hot_buffer_size} must be a multiple of 16 in "
+            f"[num_top_k={num_top_k}, {PLANAR_MAX_HOT_BUFFER}]"
+        )
+    _check_index_tensor("top_k_tokens", top_k_tokens, (torch.int32,), 2)
+    _check_index_tensor("top_k_device_locs", top_k_device_locs, (torch.int32,), 2)
+    if (
+        top_k_tokens.size(1) != num_top_k
+        or top_k_device_locs.shape != top_k_tokens.shape
+    ):
+        raise ValueError(
+            f"top_k_tokens {tuple(top_k_tokens.shape)} and top_k_device_locs "
+            f"{tuple(top_k_device_locs.shape)} must both be [bs, {num_top_k}]"
+        )
+    _check_index_tensor("device_buffer_tokens", device_buffer_tokens, (torch.int32,), 2)
+    _check_index_tensor("device_buffer_locs", device_buffer_locs, (torch.int32,), 2)
+    if (
+        device_buffer_tokens.shape != device_buffer_locs.shape
+        or device_buffer_tokens.stride(0) != device_buffer_locs.stride(0)
+        or device_buffer_tokens.size(1) <= hot_buffer_size
+    ):
+        raise ValueError(
+            "device_buffer_tokens/locs must share shape and row stride [reqs, > hot_buffer_size] "
+            f"(slot hot_buffer_size is the newest slot), got {tuple(device_buffer_tokens.shape)} "
+            f"and {tuple(device_buffer_locs.shape)}"
+        )
+    _check_index_tensor("lru_slots", lru_slots, (torch.int16,), 2)
+    if lru_slots.size(1) != hot_buffer_size:
+        raise ValueError(
+            f"lru_slots must be [reqs, {hot_buffer_size}], got {tuple(lru_slots.shape)}"
+        )
+    _check_index_tensor("host_cache_locs", host_cache_locs, (torch.int64,), 2)
+    bs = top_k_tokens.size(0)
+    for name, t in (("req_pool_indices", req_pool_indices), ("seq_lens", seq_lens)):
+        _check_index_tensor(name, t, (torch.int32, torch.int64), 1)
+        if t.numel() < bs:
+            raise ValueError(f"{name} has {t.numel()} rows, batch has {bs}")
+    if (
+        num_real_reqs.dtype != torch.int32
+        or num_real_reqs.numel() != 1
+        or not num_real_reqs.is_cuda
+    ):
+        raise ValueError("num_real_reqs must be a 1-element int32 CUDA tensor")
+
+    padded_bytes = tuple(plane_bytes) + (0,) * (PLANAR_MAX_PLANES - num_planes)
+    empty = torch.empty(0, dtype=torch.uint8, device=top_k_tokens.device)
+    planes = tuple(device_planes) + (empty,) * (PLANAR_MAX_PLANES - num_planes)
+    module = _jit_planar_module(
+        block_size, num_top_k, hot_buffer_size, padded_bytes, skip_io
+    )
+    module.load_cache_to_device_buffer_planar(
+        top_k_tokens,
+        device_buffer_tokens,
+        host_cache_locs,
+        device_buffer_locs,
+        host_records,
+        *planes,
+        top_k_device_locs,
+        req_pool_indices,
+        seq_lens,
+        lru_slots,
+        num_real_reqs,
+    )

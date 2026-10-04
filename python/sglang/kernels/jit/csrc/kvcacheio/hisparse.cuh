@@ -175,9 +175,85 @@ __device__ __forceinline__ int popc_mask(BallotMask mask) {
 #endif
 }
 
+// Planar records (arc-forge QSA HiSparse h01). One host item is a record that
+// packs every plane of the item back to back: [P0 | P1 | P2 | P3] bytes, where a
+// zero-sized plane is absent. On the device each plane is its own buffer whose
+// per-item stride equals that plane's bytes (e.g. FP8 QSA: K 2048 B + V 2048 B
+// per 4-token block; NVFP4: K/V payload 1024 B + K/V scale 128 B).
+template <int P0, int P1, int P2, int P3>
+struct PlanarSpec {
+  static_assert(P0 >= 0 && P1 >= 0 && P2 >= 0 && P3 >= 0, "plane bytes must be non-negative");
+  static_assert(P0 % 16 == 0 && P1 % 16 == 0 && P2 % 16 == 0 && P3 % 16 == 0, "planes are copied in 16 B chunks");
+  static_assert((P1 == 0 || P0 > 0) && (P2 == 0 || P1 > 0) && (P3 == 0 || P2 > 0), "planes must be packed from P0");
+  static constexpr int N = (P0 > 0) + (P1 > 0) + (P2 > 0) + (P3 > 0);
+  static constexpr int RECORD = P0 + P1 + P2 + P3;
+  static constexpr int OFF1 = P0;
+  static constexpr int OFF2 = P0 + P1;
+  static constexpr int OFF3 = P0 + P1 + P2;
+};
+using NoPlanar = PlanarSpec<0, 0, 0, 0>;
+
+// Device base of each plane for the current layer; passed to the kernel by value.
+struct PlanePtrs {
+  void* p[4];
+};
+
+// Copy one record host->device planes with one warp, in two phases: every lane
+// first loads all of its 16 B chunks of the record, and only then stores them to
+// the plane each chunk belongs to. transfer_item_warp stores after every load, so
+// a warp keeps only 512 B in flight; here it keeps the whole record (4 KiB for
+// FP8), which is what mapped-host reads need to approach PCIe bandwidth.
+// The loads are deliberately coherent (no .nc): ptxas treats .nc loads as
+// non-aliasing and sinks some of them below the first stores, which splits the
+// record into two round trips (checked in SASS for sm_120f).
+template <class Spec>
+__device__ __forceinline__ void copy_record_planar(
+    int32_t lane_id, const char* __restrict__ src_record, const PlanePtrs& planes, int64_t dst_item) {
+  static_assert(Spec::N > 0, "copy_record_planar needs at least one plane");
+#ifdef USE_ROCM
+  static_assert(Spec::N == 0, "planar HiSparse records are CUDA-only");
+#else
+  constexpr int kChunks = Spec::RECORD / 16;
+  constexpr int kPasses = (kChunks + WARP_SIZE - 1) / WARP_SIZE;
+  constexpr bool kFullPasses = kChunks % WARP_SIZE == 0;
+  uint64_t lo[kPasses];
+  uint64_t hi[kPasses];
+#pragma unroll
+  for (int p = 0; p < kPasses; ++p) {
+    const int chunk = p * WARP_SIZE + lane_id;
+    lo[p] = 0;
+    hi[p] = 0;
+    if (kFullPasses || chunk < kChunks) {
+      asm volatile("ld.global.v2.b64 {%0,%1},[%2];"
+                   : "=l"(lo[p]), "=l"(hi[p])
+                   : "l"(src_record + chunk * 16)
+                   : "memory");
+    }
+  }
+#pragma unroll
+  for (int p = 0; p < kPasses; ++p) {
+    const int chunk = p * WARP_SIZE + lane_id;
+    if (kFullPasses || chunk < kChunks) {
+      const int off = chunk * 16;
+      char* dst;
+      if (Spec::N == 1 || off < Spec::OFF1) {
+        dst = static_cast<char*>(planes.p[0]) + dst_item * Spec::OFF1 + off;
+      } else if (Spec::N == 2 || off < Spec::OFF2) {
+        dst = static_cast<char*>(planes.p[1]) + dst_item * (Spec::OFF2 - Spec::OFF1) + (off - Spec::OFF1);
+      } else if (Spec::N == 3 || off < Spec::OFF3) {
+        dst = static_cast<char*>(planes.p[2]) + dst_item * (Spec::OFF3 - Spec::OFF2) + (off - Spec::OFF2);
+      } else {
+        dst = static_cast<char*>(planes.p[3]) + dst_item * (Spec::RECORD - Spec::OFF3) + (off - Spec::OFF3);
+      }
+      asm volatile("st.global.cg.v2.b64 [%0],{%1,%2};" ::"l"(dst), "l"(lo[p]), "l"(hi[p]) : "memory");
+    }
+  }
+#endif
+}
+
 // Copy one missed item host->device with one warp. Shared by the fused swap-in
 // kernel and copy_cache_planned_kernel so the layout dispatch cannot drift.
-template <bool IsMLA, bool IsDsv4Layout>
+template <bool IsMLA, bool IsDsv4Layout, class Spec = NoPlanar>
 __device__ __forceinline__ void copy_miss_item(
     int32_t lane_id,
     const void* __restrict__ host_cache_k,
@@ -186,9 +262,14 @@ __device__ __forceinline__ void copy_miss_item(
     void* __restrict__ device_buffer_v,
     int64_t src_loc,
     int64_t dst_loc,
-    int64_t item_size_bytes) {
+    int64_t item_size_bytes,
+    const PlanePtrs& planes = PlanePtrs{}) {
   static_assert(!IsDsv4Layout || IsMLA, "DSv4 page-padded layout is K-only (MLA).");
-  if constexpr (IsDsv4Layout) {
+  static_assert(Spec::N == 0 || (IsMLA && !IsDsv4Layout), "planar records are one host item; no V/DSv4 split");
+  if constexpr (Spec::N > 0) {
+    // Planar path: host stride = Spec::RECORD, device plane q stride = its bytes.
+    copy_record_planar<Spec>(lane_id, static_cast<const char*>(host_cache_k) + src_loc * Spec::RECORD, planes, dst_loc);
+  } else if constexpr (IsDsv4Layout) {
 #ifdef USE_ROCM
     // ROCm path: host cache and device buffer both use the page-padded C4
     // layout (same as the write path and the CUDA branch). We can't reuse
@@ -324,6 +405,10 @@ struct SmemLayout {
 // copy_cache_planned_kernel. SkipIO elides only the KV byte movement (timing
 // probe; output is garbage). Both are compile-time flags so the production
 // (false, false) instantiation stays byte-identical.
+//
+// Spec != NoPlanar selects the planar miss copy (h01): host_cache_k is a
+// [items, Spec::RECORD] record array and `planes` holds the device plane bases;
+// device_buffer_k/v and item_size_bytes are then unused.
 template <
     int BLOCK_SIZE,
     int NUM_TOP_K,
@@ -333,7 +418,8 @@ template <
     bool RecordMissPlan,
     bool SkipIO,
     typename SeqLensT,
-    typename ReqPoolIndicesT>
+    typename ReqPoolIndicesT,
+    class Spec = NoPlanar>
 __global__ void load_cache_to_device_buffer_kernel(
     const int32_t* __restrict__ top_k_tokens,
     int32_t* __restrict__ device_buffer_tokens,
@@ -358,7 +444,8 @@ __global__ void load_cache_to_device_buffer_kernel(
     int64_t* __restrict__ miss_src_out,
     int32_t* __restrict__ miss_dst_out,
     int32_t* __restrict__ miss_count_out,
-    int64_t plan_stride) {
+    int64_t plan_stride,
+    const PlanePtrs planes) {
   static_assert(!IsDsv4Layout || IsMLA, "DSv4 page-padded layout is K-only (MLA).");
   // todo hisparse: support page wise sparsity
   constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
@@ -683,9 +770,170 @@ __global__ void load_cache_to_device_buffer_kernel(
       const int64_t src_loc = req_host_cache_locs[miss_token];
       const int64_t dst_loc = static_cast<int64_t>(req_device_buffer_locs[evict_slot]);
 
-      copy_miss_item<IsMLA, IsDsv4Layout>(
-          lane_id, host_cache_k, host_cache_v, device_buffer_k, device_buffer_v, src_loc, dst_loc, item_size_bytes);
+      copy_miss_item<IsMLA, IsDsv4Layout, Spec>(
+          lane_id,
+          host_cache_k,
+          host_cache_v,
+          device_buffer_k,
+          device_buffer_v,
+          src_loc,
+          dst_loc,
+          item_size_bytes,
+          planes);
     }
+  }
+}
+
+// Raw cache addresses of one swap-in launch, resolved by the exported entry
+// points below so the MLA/DSv4 entry and the planar entry share one launcher.
+struct SwapInCaches {
+  const void* host_cache_k;
+  const void* host_cache_v;
+  void* device_buffer_k;
+  void* device_buffer_v;
+  int64_t* miss_src;
+  int32_t* miss_dst;
+  int32_t* miss_count;
+  int64_t plan_stride;
+};
+
+template <
+    int BLOCK_SIZE,
+    int NUM_TOP_K,
+    int HOT_BUFFER_SIZE,
+    bool IsMLA,
+    bool IsDsv4Layout,
+    bool RecordMissPlan,
+    bool SkipIO,
+    class Spec>
+void launch_load_cache_to_device_buffer(
+    tvm::ffi::TensorView top_k_tokens,
+    tvm::ffi::TensorView device_buffer_tokens,
+    tvm::ffi::TensorView host_cache_locs,
+    tvm::ffi::TensorView device_buffer_locs,
+    tvm::ffi::TensorView top_k_device_locs,
+    tvm::ffi::TensorView req_pool_indices,
+    tvm::ffi::TensorView seq_lens,
+    tvm::ffi::TensorView lru_slots,
+    tvm::ffi::TensorView num_real_reqs,
+    const SwapInCaches& caches,
+    const PlanePtrs& planes,
+    int64_t page_size,
+    int64_t item_size_bytes) {
+  using namespace host;
+
+  const int64_t bs = top_k_tokens.shape()[0];
+  const int64_t host_stride = host_cache_locs.shape()[1];
+  const int64_t buffer_stride_0 = device_buffer_tokens.strides()[0];
+  const int64_t lru_slot_stride_0 = lru_slots.strides()[0];
+  const int64_t top_k_tokens_stride = top_k_tokens.strides()[0];
+  const int64_t top_k_device_locs_stride = top_k_device_locs.strides()[0];
+  const auto kernel_device = top_k_tokens.device();
+  const auto device = LaunchKernel::resolve_device(kernel_device);
+
+  // Generic lambda: int32/int64 kernel variants are compiled for both
+  // seq_lens and req_pool_indices; the correct combo is selected at runtime.
+  auto launch = [&](auto kernel_fn, const auto* seq_lens_ptr, const auto* req_pool_indices_ptr) {
+    constexpr size_t smem_bytes = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>::BYTES;
+#ifndef USE_ROCM
+    if constexpr (smem_bytes > 48u * 1024u) {
+      RuntimeDeviceCheck(cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
+    }
+#endif
+    LaunchKernel(bs, BLOCK_SIZE, device, smem_bytes)(
+        kernel_fn,
+        static_cast<const int32_t*>(top_k_tokens.data_ptr()),
+        static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
+        static_cast<const int64_t*>(host_cache_locs.data_ptr()),
+        static_cast<const int32_t*>(device_buffer_locs.data_ptr()),
+        caches.host_cache_k,
+        caches.host_cache_v,
+        caches.device_buffer_k,
+        caches.device_buffer_v,
+        static_cast<int32_t*>(top_k_device_locs.data_ptr()),
+        req_pool_indices_ptr,
+        seq_lens_ptr,
+        static_cast<int16_t*>(lru_slots.data_ptr()),
+        static_cast<const int32_t*>(num_real_reqs.data_ptr()),
+        buffer_stride_0,
+        host_stride,
+        lru_slot_stride_0,
+        top_k_tokens_stride,
+        top_k_device_locs_stride,
+        page_size,
+        item_size_bytes,
+        caches.miss_src,
+        caches.miss_dst,
+        caches.miss_count,
+        caches.plan_stride,
+        planes);
+  };
+
+  const auto seq_dtype = seq_lens.dtype();
+  const auto rpi_dtype = req_pool_indices.dtype();
+  const bool seq_is_i64 = (seq_dtype.code == kDLInt && seq_dtype.bits == 64);
+  const bool rpi_is_i64 = (rpi_dtype.code == kDLInt && rpi_dtype.bits == 64);
+
+  if (seq_is_i64 && rpi_is_i64) {
+    launch(
+        load_cache_to_device_buffer_kernel<
+            BLOCK_SIZE,
+            NUM_TOP_K,
+            HOT_BUFFER_SIZE,
+            IsMLA,
+            IsDsv4Layout,
+            RecordMissPlan,
+            SkipIO,
+            int64_t,
+            int64_t,
+            Spec>,
+        static_cast<const int64_t*>(seq_lens.data_ptr()),
+        static_cast<const int64_t*>(req_pool_indices.data_ptr()));
+  } else if (seq_is_i64 && !rpi_is_i64) {
+    launch(
+        load_cache_to_device_buffer_kernel<
+            BLOCK_SIZE,
+            NUM_TOP_K,
+            HOT_BUFFER_SIZE,
+            IsMLA,
+            IsDsv4Layout,
+            RecordMissPlan,
+            SkipIO,
+            int64_t,
+            int32_t,
+            Spec>,
+        static_cast<const int64_t*>(seq_lens.data_ptr()),
+        static_cast<const int32_t*>(req_pool_indices.data_ptr()));
+  } else if (!seq_is_i64 && rpi_is_i64) {
+    launch(
+        load_cache_to_device_buffer_kernel<
+            BLOCK_SIZE,
+            NUM_TOP_K,
+            HOT_BUFFER_SIZE,
+            IsMLA,
+            IsDsv4Layout,
+            RecordMissPlan,
+            SkipIO,
+            int32_t,
+            int64_t,
+            Spec>,
+        static_cast<const int32_t*>(seq_lens.data_ptr()),
+        static_cast<const int64_t*>(req_pool_indices.data_ptr()));
+  } else {
+    launch(
+        load_cache_to_device_buffer_kernel<
+            BLOCK_SIZE,
+            NUM_TOP_K,
+            HOT_BUFFER_SIZE,
+            IsMLA,
+            IsDsv4Layout,
+            RecordMissPlan,
+            SkipIO,
+            int32_t,
+            int32_t,
+            Spec>,
+        static_cast<const int32_t*>(seq_lens.data_ptr()),
+        static_cast<const int32_t*>(req_pool_indices.data_ptr()));
   }
 }
 
@@ -718,8 +966,6 @@ void load_cache_to_device_buffer(
     tvm::ffi::TensorView miss_count_out) {
   using namespace host;
 
-  const int64_t bs = top_k_tokens.shape()[0];
-  const int64_t host_stride = host_cache_locs.shape()[1];
   // Miss-plan side outputs; 0-dim sentinels when RecordMissPlan is false.
   int64_t* const miss_src_ptr = RecordMissPlan ? static_cast<int64_t*>(miss_src_out.data_ptr()) : nullptr;
   int32_t* const miss_dst_ptr = RecordMissPlan ? static_cast<int32_t*>(miss_dst_out.data_ptr()) : nullptr;
@@ -728,115 +974,115 @@ void load_cache_to_device_buffer(
   if (RecordMissPlan && miss_dst_out.strides()[0] != plan_stride) {
     throw std::runtime_error("load_cache_to_device_buffer: miss_src/miss_dst row strides differ");
   }
-  const int64_t buffer_stride_0 = device_buffer_tokens.strides()[0];
-  const int64_t lru_slot_stride_0 = lru_slots.strides()[0];
-  const int64_t top_k_tokens_stride = top_k_tokens.strides()[0];
-  const int64_t top_k_device_locs_stride = top_k_device_locs.strides()[0];
-  const auto kernel_device = top_k_tokens.device();
-  const auto device = LaunchKernel::resolve_device(kernel_device);
   const void* const host_cache_k_ptr = runtime::get_device_accessible_ptr(host_cache_k);
   const void* const host_cache_v_ptr =
       (IsMLA || host_cache_v.ndim() == 0) ? nullptr : runtime::get_device_accessible_ptr(host_cache_v);
+  const SwapInCaches caches{
+      host_cache_k_ptr,
+      host_cache_v_ptr,
+      device_buffer_k.data_ptr(),
+      (IsMLA || device_buffer_v.ndim() == 0) ? (void*)nullptr : device_buffer_v.data_ptr(),
+      miss_src_ptr,
+      miss_dst_ptr,
+      miss_count_ptr,
+      plan_stride};
+  launch_load_cache_to_device_buffer<
+      BLOCK_SIZE,
+      NUM_TOP_K,
+      HOT_BUFFER_SIZE,
+      IsMLA,
+      IsDsv4Layout,
+      RecordMissPlan,
+      SkipIO,
+      NoPlanar>(
+      top_k_tokens,
+      device_buffer_tokens,
+      host_cache_locs,
+      device_buffer_locs,
+      top_k_device_locs,
+      req_pool_indices,
+      seq_lens,
+      lru_slots,
+      num_real_reqs,
+      caches,
+      PlanePtrs{},
+      page_size,
+      item_size_bytes);
+}
 
-  // Generic lambda: int32/int64 kernel variants are compiled for both
-  // seq_lens and req_pool_indices; the correct combo is selected at runtime.
-  auto launch = [&](auto kernel_fn, const auto* seq_lens_ptr, const auto* req_pool_indices_ptr) {
-    constexpr size_t smem_bytes = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>::BYTES;
-#ifndef USE_ROCM
-    if constexpr (smem_bytes > 48u * 1024u) {
-      cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+// Planar swap-in (h01): same resolve/LRU as load_cache_to_device_buffer, but a
+// miss copies one host record ([items, P0+P1+P2+P3] uint8, registered host
+// memory) into up to four device planes. Absent planes (bytes 0) must be passed
+// as empty tensors. No miss-plan recording: QSA has no shared-index layers.
+template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, int P0, int P1, int P2, int P3, bool SkipIO>
+void load_cache_to_device_buffer_planar(
+    tvm::ffi::TensorView top_k_tokens,
+    tvm::ffi::TensorView device_buffer_tokens,
+    tvm::ffi::TensorView host_cache_locs,
+    tvm::ffi::TensorView device_buffer_locs,
+    tvm::ffi::TensorView host_records,
+    tvm::ffi::TensorView plane0,
+    tvm::ffi::TensorView plane1,
+    tvm::ffi::TensorView plane2,
+    tvm::ffi::TensorView plane3,
+    tvm::ffi::TensorView top_k_device_locs,
+    tvm::ffi::TensorView req_pool_indices,
+    tvm::ffi::TensorView seq_lens,
+    tvm::ffi::TensorView lru_slots,
+    tvm::ffi::TensorView num_real_reqs) {
+  using namespace host;
+  using Spec = PlanarSpec<P0, P1, P2, P3>;
+  static_assert(Spec::N > 0, "planar swap-in needs at least one plane");
+
+  const auto rec_dtype = host_records.dtype();
+  RuntimeCheck(
+      host_records.ndim() == 2 && rec_dtype.code == kDLUInt && rec_dtype.bits == 8,
+      "planar swap-in: host_records must be a 2-D uint8 tensor");
+  RuntimeCheck(
+      host_records.size(1) == Spec::RECORD && host_records.stride(0) == Spec::RECORD && host_records.stride(1) == 1,
+      "planar swap-in: host_records must be contiguous [items, ",
+      Spec::RECORD,
+      "]");
+  RuntimeCheck(
+      reinterpret_cast<uintptr_t>(host_records.data_ptr()) % 16 == 0, "planar swap-in: host_records not 16 B aligned");
+
+  const tvm::ffi::TensorView* views[4] = {&plane0, &plane1, &plane2, &plane3};
+  constexpr int kPlaneBytes[4] = {P0, P1, P2, P3};
+  PlanePtrs planes{};
+  int64_t num_items = -1;
+  for (int q = 0; q < 4; ++q) {
+    const auto& view = *views[q];
+    if (kPlaneBytes[q] == 0) {
+      RuntimeCheck(view.numel() == 0, "planar swap-in: plane ", q, " is absent but a non-empty tensor was passed");
+      continue;
     }
-#endif
-    LaunchKernel(bs, BLOCK_SIZE, device, smem_bytes)(
-        kernel_fn,
-        static_cast<const int32_t*>(top_k_tokens.data_ptr()),
-        static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
-        static_cast<const int64_t*>(host_cache_locs.data_ptr()),
-        static_cast<const int32_t*>(device_buffer_locs.data_ptr()),
-        host_cache_k_ptr,
-        host_cache_v_ptr,
-        device_buffer_k.data_ptr(),
-        (IsMLA || device_buffer_v.ndim() == 0) ? (void*)nullptr : device_buffer_v.data_ptr(),
-        static_cast<int32_t*>(top_k_device_locs.data_ptr()),
-        req_pool_indices_ptr,
-        seq_lens_ptr,
-        static_cast<int16_t*>(lru_slots.data_ptr()),
-        static_cast<const int32_t*>(num_real_reqs.data_ptr()),
-        buffer_stride_0,
-        host_stride,
-        lru_slot_stride_0,
-        top_k_tokens_stride,
-        top_k_device_locs_stride,
-        page_size,
-        item_size_bytes,
-        miss_src_ptr,
-        miss_dst_ptr,
-        miss_count_ptr,
-        plan_stride);
-  };
-
-  const auto seq_dtype = seq_lens.dtype();
-  const auto rpi_dtype = req_pool_indices.dtype();
-  const bool seq_is_i64 = (seq_dtype.code == kDLInt && seq_dtype.bits == 64);
-  const bool rpi_is_i64 = (rpi_dtype.code == kDLInt && rpi_dtype.bits == 64);
-
-  if (seq_is_i64 && rpi_is_i64) {
-    launch(
-        load_cache_to_device_buffer_kernel<
-            BLOCK_SIZE,
-            NUM_TOP_K,
-            HOT_BUFFER_SIZE,
-            IsMLA,
-            IsDsv4Layout,
-            RecordMissPlan,
-            SkipIO,
-            int64_t,
-            int64_t>,
-        static_cast<const int64_t*>(seq_lens.data_ptr()),
-        static_cast<const int64_t*>(req_pool_indices.data_ptr()));
-  } else if (seq_is_i64 && !rpi_is_i64) {
-    launch(
-        load_cache_to_device_buffer_kernel<
-            BLOCK_SIZE,
-            NUM_TOP_K,
-            HOT_BUFFER_SIZE,
-            IsMLA,
-            IsDsv4Layout,
-            RecordMissPlan,
-            SkipIO,
-            int64_t,
-            int32_t>,
-        static_cast<const int64_t*>(seq_lens.data_ptr()),
-        static_cast<const int32_t*>(req_pool_indices.data_ptr()));
-  } else if (!seq_is_i64 && rpi_is_i64) {
-    launch(
-        load_cache_to_device_buffer_kernel<
-            BLOCK_SIZE,
-            NUM_TOP_K,
-            HOT_BUFFER_SIZE,
-            IsMLA,
-            IsDsv4Layout,
-            RecordMissPlan,
-            SkipIO,
-            int32_t,
-            int64_t>,
-        static_cast<const int32_t*>(seq_lens.data_ptr()),
-        static_cast<const int64_t*>(req_pool_indices.data_ptr()));
-  } else {
-    launch(
-        load_cache_to_device_buffer_kernel<
-            BLOCK_SIZE,
-            NUM_TOP_K,
-            HOT_BUFFER_SIZE,
-            IsMLA,
-            IsDsv4Layout,
-            RecordMissPlan,
-            SkipIO,
-            int32_t,
-            int32_t>,
-        static_cast<const int32_t*>(seq_lens.data_ptr()),
-        static_cast<const int32_t*>(req_pool_indices.data_ptr()));
+    RuntimeCheck(view.device().device_type == kDLCUDA, "planar swap-in: plane ", q, " must be a CUDA tensor");
+    const int64_t bytes = view.numel() * static_cast<int64_t>((view.dtype().bits * view.dtype().lanes + 7) / 8);
+    RuntimeCheck(bytes % kPlaneBytes[q] == 0, "planar swap-in: plane ", q, " bytes not a multiple of ", kPlaneBytes[q]);
+    const int64_t items = bytes / kPlaneBytes[q];
+    RuntimeCheck(num_items < 0 || items == num_items, "planar swap-in: planes hold different item counts");
+    num_items = items;
+    RuntimeCheck(
+        reinterpret_cast<uintptr_t>(view.data_ptr()) % 16 == 0, "planar swap-in: plane ", q, " not 16 B aligned");
+    planes.p[q] = view.data_ptr();
   }
+
+  const SwapInCaches caches{
+      runtime::get_device_accessible_ptr(host_records), nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0};
+  launch_load_cache_to_device_buffer<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, true, false, false, SkipIO, Spec>(
+      top_k_tokens,
+      device_buffer_tokens,
+      host_cache_locs,
+      device_buffer_locs,
+      top_k_device_locs,
+      req_pool_indices,
+      seq_lens,
+      lru_slots,
+      num_real_reqs,
+      caches,
+      planes,
+      /*page_size=*/1,
+      /*item_size_bytes=*/Spec::RECORD);
 }
 
 // Copy-only swap-in for shared-index skip layers: replays the anchor's recorded
