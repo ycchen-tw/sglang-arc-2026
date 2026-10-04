@@ -524,19 +524,7 @@ def tilelang_qsa_mqa_decode(
         )
     if not q.shape[0] or not max_model_len:
         return logits
-    # The validated MMA layout requires N (the Q-head dimension) to be a
-    # multiple of eight. Zero-padding preserves the weight-free head sum.
     query_heads, head_dim = q.shape[1:]
-    kernel_heads = max(8, ((query_heads + 7) // 8) * 8)
-    q_kernel = q.to(torch.bfloat16)
-    if kernel_heads != query_heads:
-        q_kernel = torch.cat(
-            [
-                q_kernel,
-                q_kernel.new_zeros(q.shape[0], kernel_heads - query_heads, head_dim),
-            ],
-            dim=1,
-        )
     groups_per_cta = envs.SGLANG_QSA_MQA_GROUPS_PER_CTA.get()
     if groups_per_cta < 0:
         raise ValueError(
@@ -558,6 +546,27 @@ def tilelang_qsa_mqa_decode(
         # request-major.
         and q.shape[0] % verify_queries_per_request == 0
     )
+    # The validated MMA layout requires N (the Q-head dimension) to be a
+    # multiple of eight, and for the per-row kernel N *is* `heads`, so 4 index
+    # heads have to be zero-padded to 8. The grouped kernel's N is
+    # `queries_per_request * heads`, which at the supported group sizes is
+    # already a multiple of eight -- there the pad only buys a torch.cat per
+    # call and a GEMM half of whose columns are zeros. Measured on B200 at
+    # ctx 96,000 / B=110: 356 -> 231 us, logits bitwise identical.
+    if use_grouped_verify and (grouped_size * query_heads) % 8 == 0:
+        kernel_heads = query_heads
+    else:
+        kernel_heads = max(8, ((query_heads + 7) // 8) * 8)
+    q_kernel = q.to(torch.bfloat16)
+    if kernel_heads != query_heads:
+        # Zero-padding preserves the weight-free head sum.
+        q_kernel = torch.cat(
+            [
+                q_kernel,
+                q_kernel.new_zeros(q.shape[0], kernel_heads - query_heads, head_dim),
+            ],
+            dim=1,
+        )
     kernel_args = (
         k_cache.to(torch.bfloat16).contiguous(),
         page_table.to(device=q.device, dtype=torch.int32).contiguous(),
