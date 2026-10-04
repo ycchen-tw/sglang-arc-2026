@@ -1,0 +1,236 @@
+"""Geometry and per-request rules of the QSA HiSparse offload (arc-forge M1a h02).
+
+Pure Python on purpose: the pool, allocator and coordinator take every scalar
+decision (slab numbering, staging copy sets, decode backups, newest slot) from
+here, and arc-forge checks this file against its T0 rule model without torch.
+
+A *block* is one QSA compression group of ``block_tokens`` consecutive
+positions. HiSparse items, host records and hot-buffer slots are blocks; device
+block d owns the token rows [d * block_tokens, (d + 1) * block_tokens).
+
+Device layout in blocks (design §1.2):
+
+    [0, page_blocks)             page 0, the dump that padding writes land in
+    [page_blocks, hot_base)      prefill area, handed out page by page while a
+                                 request is prefilling or staging
+    [hot_base, device_blocks)    one static slab of H = B + page_blocks blocks per
+                                 request slot r >= 1 (slot 0 is never allocated)
+
+Slab slot i < B is an LRU slot, slot B holds the newest block once the request
+is long (seq_blocks > B), slots B+1.. are the kernel's page padding.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
+
+# lru_slots / s_lru_slots_out / s_hash_vals are int16 in hisparse.cuh; the
+# largest multiple of 16 below 2**15.
+MAX_HOT_BLOCKS = 32752
+HOT_BLOCKS_ALIGN = 16  # load_cache_to_device_buffer_planar requires hot % 16 == 0
+MAX_PLANES = 4  # PlanarSpec<P0, P1, P2, P3>
+TRANSFER_ALIGN = 128  # transfer_hicache_all_layer moves elements in 128 B units
+
+
+def _ceil_div(a: int, b: int) -> int:
+    return -(-a // b)
+
+
+@dataclass(frozen=True)
+class PlaneSpec:
+    """Planes of one host record in record order: ((name, bytes per block), ...).
+
+    Planes come in K/V pairs of equal size because one transfer_hicache_all_layer
+    call moves a K plane and a V plane with one element size (FP8: K|V; NVFP4:
+    K|V payload, then K|V scale).
+    """
+
+    planes: tuple[tuple[str, int], ...]
+
+    def __post_init__(self):
+        if not 1 <= len(self.planes) <= MAX_PLANES or len(self.planes) % 2:
+            raise ValueError(f"need 2 or 4 planes in K/V pairs, got {self.planes}")
+        names = [name for name, _ in self.planes]
+        if len(set(names)) != len(names):
+            raise ValueError(f"duplicate plane names in {self.planes}")
+        for name, nbytes in self.planes:
+            if nbytes <= 0 or nbytes % TRANSFER_ALIGN:
+                raise ValueError(
+                    f"plane {name!r}: {nbytes} B per block is not a positive "
+                    f"multiple of {TRANSFER_ALIGN}"
+                )
+        for q in range(0, len(self.planes), 2):
+            if self.planes[q][1] != self.planes[q + 1][1]:
+                raise ValueError(
+                    f"planes {self.planes[q]} and {self.planes[q + 1]} form a K/V "
+                    "pair and must have equal bytes"
+                )
+
+    @property
+    def plane_bytes(self) -> tuple[int, ...]:
+        return tuple(nbytes for _, nbytes in self.planes)
+
+    @property
+    def record_bytes(self) -> int:
+        return sum(self.plane_bytes)
+
+    @property
+    def offsets(self) -> tuple[int, ...]:
+        """Byte offset of each plane inside a record."""
+        out, acc = [], 0
+        for nbytes in self.plane_bytes:
+            out.append(acc)
+            acc += nbytes
+        return tuple(out)
+
+    def pairs(self) -> tuple[tuple[int, int], ...]:
+        """(index of the K plane, bytes per block) of each K/V pair."""
+        return tuple((q, self.planes[q][1]) for q in range(0, len(self.planes), 2))
+
+
+def kv_plane_spec(*, k_row_bytes: int, v_row_bytes: int, block_tokens: int) -> PlaneSpec:
+    """Record of an unquantized (FP8 / BF16) token-major KV pool: [K | V]."""
+    return PlaneSpec(
+        (("k", k_row_bytes * block_tokens), ("v", v_row_bytes * block_tokens))
+    )
+
+
+# NVFP4 KV (M3): 2 heads x 256 dims x 4 tokens -> 1024 B payload and 128 B of
+# per-16 scales per plane. Described here, not wired into the pool yet.
+NVFP4_PLANES = PlaneSpec(
+    (("k", 1024), ("v", 1024), ("k_scale", 128), ("v_scale", 128))
+)
+
+
+@dataclass(frozen=True)
+class StagingPlan:
+    """Copies made when a prompt of S tokens leaves prefill (design §2 staging row).
+
+    D2H: prompt blocks [0, full_blocks) -> host (complete blocks only).
+    D2D: prompt blocks [0, identity_blocks) -> slab slots [0, identity_blocks),
+    plus newest_block -> slot B when a long prompt ends in a partial block.
+    """
+
+    full_blocks: int
+    identity_blocks: int
+    newest_block: Optional[int]
+
+
+@dataclass(frozen=True)
+class QSAHiSparseLayout:
+    block_tokens: int  # QSA compress ratio
+    page_size: int  # KV page, tokens
+    hot_blocks: int  # B
+    num_slabs: int  # request slots owning a slab (R); slot 0 never does
+    prefill_tokens: int  # prefill area (R_pf), tokens
+    logical_tokens: int  # logical token capacity (L), what the scheduler sees
+
+    def __post_init__(self):
+        bt, ps = self.block_tokens, self.page_size
+        if bt < 2 or ps <= 0 or ps % bt:
+            raise ValueError(
+                f"page_size {ps} must be a positive multiple of block_tokens {bt} >= 2"
+            )
+        if not (
+            0 < self.hot_blocks <= MAX_HOT_BLOCKS
+            and self.hot_blocks % HOT_BLOCKS_ALIGN == 0
+        ):
+            raise ValueError(
+                f"hot_blocks {self.hot_blocks} must be a multiple of "
+                f"{HOT_BLOCKS_ALIGN} in (0, {MAX_HOT_BLOCKS}]"
+            )
+        if self.num_slabs < 1:
+            raise ValueError(f"num_slabs must be >= 1, got {self.num_slabs}")
+        for name in ("prefill_tokens", "logical_tokens"):
+            value = getattr(self, name)
+            if value <= 0 or value % ps:
+                raise ValueError(
+                    f"{name} {value} must be a positive multiple of page_size {ps}"
+                )
+
+    # ------------------------------------------------------------ geometry
+
+    @property
+    def page_blocks(self) -> int:
+        return self.page_size // self.block_tokens
+
+    @property
+    def slab_stride(self) -> int:
+        """H = B + page_blocks slab slots per request."""
+        return self.hot_blocks + self.page_blocks
+
+    @property
+    def prefill_blocks(self) -> int:
+        return self.prefill_tokens // self.block_tokens
+
+    @property
+    def prefill_base(self) -> int:
+        return self.page_blocks
+
+    @property
+    def hot_base(self) -> int:
+        return self.page_blocks + self.prefill_blocks
+
+    @property
+    def device_blocks(self) -> int:
+        """Device blocks including the dump page."""
+        return self.hot_base + self.num_slabs * self.slab_stride
+
+    @property
+    def device_tokens(self) -> int:
+        """Device KV rows excluding the dump page: the KV pool's ``size``."""
+        return self.device_blocks * self.block_tokens - self.page_size
+
+    @property
+    def logical_blocks(self) -> int:
+        """Logical blocks including the padding page (mapping length without its sentinel)."""
+        return (self.logical_tokens + self.page_size) // self.block_tokens
+
+    def slab_block(self, r: int, i: int) -> int:
+        if not (1 <= r <= self.num_slabs and 0 <= i < self.slab_stride):
+            raise ValueError(
+                f"slab index (r={r}, i={i}) outside [1, {self.num_slabs}] x [0, {self.slab_stride})"
+            )
+        return self.hot_base + (r - 1) * self.slab_stride + i
+
+    def host_blocks(self, max_context_len: int) -> int:
+        """Worst-case host blocks: every slab owner holds a full context (design §5.2)."""
+        return self.num_slabs * (
+            _ceil_div(max_context_len, self.block_tokens) + self.page_blocks
+        )
+
+    # ------------------------------------------------------------ rules
+
+    def seq_blocks(self, seq_len: int) -> int:
+        """Blocks touched by seq_len tokens; what the swap-in kernel gets as seq_lens."""
+        if seq_len < 1:
+            raise ValueError(f"seq_len must be >= 1, got {seq_len}")
+        return _ceil_div(seq_len, self.block_tokens)
+
+    def newest_slot(self, seq_len: int) -> int:
+        """s* = min(nb - 1, B): identity slot while short, slot B once long (design §1.7)."""
+        return min(self.seq_blocks(seq_len) - 1, self.hot_blocks)
+
+    def staging_plan(self, prompt_len: int) -> StagingPlan:
+        nf, nb = prompt_len // self.block_tokens, self.seq_blocks(prompt_len)
+        if self.seq_blocks(prompt_len + 1) <= self.hot_blocks:
+            # The first decode step still takes the fast path: every block,
+            # a partial tail included, sits in its identity slot.
+            return StagingPlan(nf, nb, None)
+        partial = prompt_len % self.block_tokens != 0
+        return StagingPlan(nf, self.hot_blocks, nb - 1 if partial else None)
+
+    def decode_backup(self, seq_len: int, skip_first: bool) -> Optional[tuple[int, int]]:
+        """(block, slab slot) to copy to host before this decode step's forward, or None.
+
+        seq_len counts the token this step appends. When that token opens block
+        k, block k-1 was completed by the previous step; it still sits in slot
+        min(k-1, B). The first step after staging skips: staging already copied
+        every complete prompt block.
+        """
+        bt = self.block_tokens
+        if skip_first or seq_len <= bt or (seq_len - 1) % bt:
+            return None
+        k = (seq_len - 1) // bt
+        return k - 1, min(k - 1, self.hot_blocks)

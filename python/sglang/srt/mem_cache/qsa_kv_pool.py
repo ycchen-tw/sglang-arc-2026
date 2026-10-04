@@ -68,6 +68,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         full_kv_pool_class: Optional[type] = None,
         quant_method=None,
         post_capture_active: bool = False,
+        index_size: Optional[int] = None,
     ):
         if page_size <= 1 or page_size % qsa_compress_ratio != 0:
             raise ValueError(
@@ -117,7 +118,9 @@ class QSATokenToKVPool(HybridLinearKVPool):
         self.qsa_index_kv_heads = int(qsa_index_kv_heads)
         self.qsa_token_topk = int(qsa_token_topk)
         self.qsa_block_topk = self.qsa_token_topk // self.qsa_compress_ratio
-        state_size = size + page_size
+        # HiSparse (arc-forge h02): `size` counts device KV rows there, while the
+        # index caches stay logically addressed and are sized by `index_size`.
+        state_size = (size if index_size is None else index_size) + page_size
         # Compressed slots mirror the full-KV slot space 1:ratio; the "page"
         # seen by the scoring kernels is one full-KV page's worth of groups.
         self.qsa_compressed_page_size = page_size // self.qsa_compress_ratio
