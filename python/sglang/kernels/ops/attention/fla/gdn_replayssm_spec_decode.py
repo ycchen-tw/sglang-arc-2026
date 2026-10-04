@@ -39,9 +39,25 @@ mask, so this kernel is valid only for linear draft chains
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
+
+
+def _env_flag(name: str, default: str) -> bool:
+    value = os.environ.get(name, default)
+    if value not in ("0", "1"):
+        raise ValueError(f"{name} must be 0 or 1, got {value!r}")
+    return value == "1"
+
+
+# arc-forge 0030: the compact commit loads only the ring rows it folds or tracks
+# (at most the accepted window) instead of all MAX_CACHE_LEN rows. The skipped
+# rows only ever meet a zero decay weight, so the stored state is unchanged;
+# 0 restores the full-ring loads (kill switch, and the reference for the check).
+_ARC_GDN_COMMIT_LIVE_ROWS = _env_flag("ARC_GDN_COMMIT_LIVE_ROWS", "1")
 
 
 @triton.jit
@@ -770,6 +786,7 @@ def gdn_replayssm_compact_commit_kernel(
     NULL_BLOCK_ID: tl.constexpr,
     HAS_TRACK: tl.constexpr,
     HAS_RESIDUAL: tl.constexpr,
+    LIVE_ROWS: tl.constexpr,
 ):
     """Materialize the checkpoint directly from compact ReplaySSM D/K/G."""
     i_v = tl.program_id(0)
@@ -810,6 +827,14 @@ def gdn_replayssm_compact_commit_kernel(
     o_k = tl.arange(0, K)
     o_v = i_v * BV + tl.arange(0, BV)
     mask_v = o_v < V
+    if LIVE_ROWS:
+        # Rows at or past both lengths get a zero weight below; do not fetch them.
+        n_live = tl.where(fold_active, n_history, 0)
+        if HAS_TRACK:
+            n_live = tl.maximum(n_live, tl.where(has_track, track_len, 0))
+        mask_t = o_t < n_live
+    else:
+        mask_t = o_t < MAX_CACHE_LEN
 
     p_h0 = (
         h0
@@ -823,21 +848,25 @@ def gdn_replayssm_compact_commit_kernel(
         k_cache
         + replay_idx * stride_k_slot
         + (i_h * MAX_CACHE_LEN + phys[:, None]) * K
-        + o_k[None, :]
+        + o_k[None, :],
+        mask=mask_t[:, None],
+        other=0.0,
     )
     if HAS_RESIDUAL:
         key_residual = tl.load(
             k_residual_cache
             + replay_idx * stride_k_residual_slot
             + (i_h * MAX_CACHE_LEN + phys[:, None]) * K
-            + o_k[None, :]
+            + o_k[None, :],
+            mask=mask_t[:, None],
+            other=0.0,
         )
     updates = tl.load(
         d_cache
         + replay_idx * stride_d_slot
         + (i_hv * MAX_CACHE_LEN + phys[:, None]) * V
         + o_v[None, :],
-        mask=mask_v[None, :],
+        mask=mask_t[:, None] & mask_v[None, :],
         other=0.0,
     ).to(tl.float32)
     if HAS_RESIDUAL:
@@ -846,11 +875,13 @@ def gdn_replayssm_compact_commit_kernel(
             + replay_idx * stride_d_residual_slot
             + (i_hv * MAX_CACHE_LEN + phys[:, None]) * V
             + o_v[None, :],
-            mask=mask_v[None, :],
+            mask=mask_t[:, None] & mask_v[None, :],
             other=0.0,
         ).to(tl.float32)
     gates = tl.load(
-        g_cache + replay_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + phys
+        g_cache + replay_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + phys,
+        mask=mask_t,
+        other=0.0,
     ).to(tl.float32)
 
     if fold_active:
@@ -1445,6 +1476,63 @@ def commit_gdn_replayssm_circular(
     the exact state at the requested accepted step without disturbing the active
     checkpoint.
     """
+    launch_gdn_replayssm_compact_commit(
+        checkpoint_state=checkpoint_state,
+        d_cache=d_cache,
+        k_cache=k_cache,
+        g_cache=g_cache,
+        d_residual_cache=d_residual_cache,
+        k_residual_cache=k_residual_cache,
+        state_batch_indices=state_batch_indices,
+        replay_indices=replay_indices,
+        write_pos=write_pos,
+        cache_base=cache_base,
+        is_flush=is_flush,
+        accept_lens=accept_lens,
+        mamba_track_indices=mamba_track_indices,
+        mamba_steps_to_track=mamba_steps_to_track,
+        null_block_id=null_block_id,
+        live_rows=_ARC_GDN_COMMIT_LIVE_ROWS,
+    )
+    max_cache_len = d_cache.shape[-2]
+    B = state_batch_indices.shape[0]
+    block = triton.next_power_of_2(max(1, B))
+    _finish_gdn_replayssm_circular_fold_kernel[(1,)](
+        write_pos,
+        cache_base,
+        is_flush,
+        state_batch_indices,
+        replay_indices,
+        B,
+        stride_indices=state_batch_indices.stride(0),
+        stride_replay_indices=replay_indices.stride(0),
+        MAX_CACHE_LEN=max_cache_len,
+        BLOCK=block,
+        NULL_BLOCK_ID=null_block_id,
+    )
+
+
+def launch_gdn_replayssm_compact_commit(
+    *,
+    checkpoint_state: torch.Tensor,
+    d_cache: torch.Tensor,
+    k_cache: torch.Tensor,
+    g_cache: torch.Tensor,
+    d_residual_cache: torch.Tensor | None,
+    k_residual_cache: torch.Tensor | None,
+    state_batch_indices: torch.Tensor,
+    replay_indices: torch.Tensor,
+    write_pos: torch.Tensor,
+    cache_base: torch.Tensor,
+    is_flush: torch.Tensor,
+    accept_lens: torch.Tensor,
+    mamba_track_indices: torch.Tensor | None,
+    mamba_steps_to_track: torch.Tensor | None,
+    null_block_id: int,
+    live_rows: bool,
+) -> None:
+    """The compact commit kernel alone (no cursor finish): reads the cursors,
+    writes the checkpoint and track slots. ``live_rows`` is patch 0030's switch."""
     num_layers, _, HV, V, K = checkpoint_state.shape
     H = k_cache.shape[2]
     max_cache_len = d_cache.shape[-2]
@@ -1506,22 +1594,9 @@ def commit_gdn_replayssm_circular(
         NULL_BLOCK_ID=null_block_id,
         HAS_TRACK=has_track,
         HAS_RESIDUAL=has_residual,
+        LIVE_ROWS=live_rows,
         num_warps=4,
         num_stages=2,
-    )
-    block = triton.next_power_of_2(max(1, B))
-    _finish_gdn_replayssm_circular_fold_kernel[(1,)](
-        write_pos,
-        cache_base,
-        is_flush,
-        state_batch_indices,
-        replay_indices,
-        B,
-        stride_indices=state_batch_indices.stride(0),
-        stride_replay_indices=replay_indices.stride(0),
-        MAX_CACHE_LEN=max_cache_len,
-        BLOCK=block,
-        NULL_BLOCK_ID=null_block_id,
     )
 
 
