@@ -698,6 +698,179 @@ def qwen_sparse_nvfp4_expand_triton(
     )
 
 
+
+@triton.jit
+def _sparse_gqa_decode_selected(
+    q,
+    k,
+    v,
+    req_to_token,
+    req_indices,
+    indices,
+    seq_lens,
+    out,
+    scale,
+    k_scale,
+    v_scale,
+    topk: tl.constexpr,
+    sq_m: tl.constexpr,
+    sq_h: tl.constexpr,
+    sq_d: tl.constexpr,
+    sk_n: tl.constexpr,
+    sk_h: tl.constexpr,
+    sk_d: tl.constexpr,
+    sv_n: tl.constexpr,
+    sv_h: tl.constexpr,
+    sv_d: tl.constexpr,
+    req_stride: tl.constexpr,
+    si_m: tl.constexpr,
+    so_m: tl.constexpr,
+    so_h: tl.constexpr,
+    so_d: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    KV_IS_FP8: tl.constexpr,
+):
+    """Sparse GQA over selected logical tokens without compacting K/V first."""
+    row = tl.program_id(0)
+    kv_head = tl.program_id(1)
+    length = tl.load(seq_lens + row)
+    req = tl.load(req_indices + row)
+    offs_h = tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, HEAD_DIM)
+    head_start = kv_head * GROUP_SIZE
+    q_values = tl.load(
+        q + row * sq_m + (head_start + offs_h[:, None]) * sq_h + offs_d[None, :] * sq_d,
+        mask=(offs_h < GROUP_SIZE)[:, None],
+        other=0.0,
+    )
+    q_values = (q_values * scale * 1.4426950408).to(q_values.dtype)
+    max_value = tl.full([BLOCK_M], -float("inf"), tl.float32)
+    normalizer = tl.zeros([BLOCK_M], tl.float32)
+    accumulator = tl.zeros([BLOCK_M, HEAD_DIM], tl.float32)
+    offs_n = tl.arange(0, BLOCK_N)
+    for start in range(0, topk, BLOCK_N):
+        current = start + offs_n
+        position = tl.load(
+            indices + row * si_m + current,
+            mask=current < topk,
+            other=-1,
+        )
+        valid = (current < topk) & (position >= 0) & (position < length)
+        token = tl.load(
+            req_to_token + req * req_stride + tl.where(valid, position, 0),
+            mask=valid,
+            other=0,
+        ).to(tl.int64)
+        keys = tl.load(
+            k + token[None, :] * sk_n + kv_head * sk_h + offs_d[:, None] * sk_d,
+            mask=valid[None, :],
+            other=0.0,
+        ).to(q_values.dtype)
+        values = tl.load(
+            v + token[:, None] * sv_n + kv_head * sv_h + offs_d[None, :] * sv_d,
+            mask=valid[:, None],
+            other=0.0,
+        ).to(q_values.dtype)
+        scores = tl.dot(q_values, keys)
+        if KV_IS_FP8:
+            scores *= k_scale
+        scores = tl.where(valid[None, :], scores, -float("inf"))
+        next_max = tl.maximum(max_value, tl.max(scores, 1))
+        alpha = tl.math.exp2(max_value - next_max)
+        probabilities = tl.math.exp2(scores - next_max[:, None])
+        accumulator = tl.dot(
+            probabilities.to(values.dtype), values, accumulator * alpha[:, None]
+        )
+        normalizer = normalizer * alpha + tl.sum(probabilities, 1)
+        max_value = next_max
+    output = accumulator / normalizer[:, None]
+    if KV_IS_FP8:
+        output *= v_scale
+    tl.store(
+        out
+        + row * so_m
+        + (head_start + offs_h[:, None]) * so_h
+        + offs_d[None, :] * so_d,
+        output,
+        mask=(offs_h < GROUP_SIZE)[:, None],
+    )
+
+
+def qwen_sparse_gqa_decode_selected_triton(
+    q,
+    k,
+    v,
+    req_to_token,
+    req_indices,
+    indices,
+    seq_lens,
+    scale,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
+):
+    """Decode sparse GQA straight from paged K/V selected by logical indices."""
+    # L4_FP8_DIRECT_SCALES
+    kv_is_fp8 = _validate_sparse_gqa_dtypes(q, k, v)
+    rows, q_heads, head_dim = q.shape
+    kv_heads = k.shape[1]
+    group_size = q_heads // kv_heads
+    block_m = max(16, triton.next_power_of_2(group_size))
+    if rows <= 128:
+        block_n, warps, stages = 128, 4, 3
+    elif rows <= 256:
+        block_n, warps, stages = 64, 8, 3
+    else:
+        block_n, warps, stages = 64, 4, 3
+    # SM89 shared memory is 99 KiB. Measured for 12 q-heads x head_dim 256:
+    # BLOCK_N=128/stages=3 needs 140.5 KiB with BF16 K/V (does not fit) but only
+    # 76.5 KiB with FP8 or packed FP4 (fits). Shrinking unconditionally cost 2.1x
+    # (67 -> 140 us) on exactly the config that ships, so gate on the KV width.
+    if torch.cuda.get_device_capability(q.device) == (8, 9) and not kv_is_fp8:
+        block_n, stages = 64, 2
+    out = torch.empty_like(q)
+    if rows == 0:
+        return out
+    _sparse_gqa_decode_selected[(rows, kv_heads)](
+        q,
+        k,
+        v,
+        req_to_token,
+        req_indices,
+        indices,
+        seq_lens,
+        out,
+        scale,
+        _unit_scale(k_scale),
+        _unit_scale(v_scale),
+        indices.shape[1],
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        req_to_token.stride(0),
+        indices.stride(0),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        GROUP_SIZE=group_size,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        HEAD_DIM=head_dim,
+        KV_IS_FP8=kv_is_fp8,
+        num_warps=warps,
+        num_stages=stages,
+    )
+    return out
+
+
 __all__ = [
     "qwen_sparse_fa2_cu_seqlens_triton",
     "qwen_sparse_valid_counts_triton",
@@ -705,4 +878,5 @@ __all__ = [
     "qwen_sparse_nvfp4_expand_triton",
     "sparse_gqa_fwd_interface_triton",
     "sparse_gqa_fwd_interface_triton_ck",
+    "qwen_sparse_gqa_decode_selected_triton",
 ]

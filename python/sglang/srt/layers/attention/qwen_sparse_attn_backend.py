@@ -34,6 +34,7 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
     qwen_sparse_nvfp4_expand_triton,
+    qwen_sparse_gqa_decode_selected_triton,
     qwen_sparse_valid_counts_triton,
     sparse_gqa_fwd_interface_triton,
     sparse_gqa_fwd_interface_triton_ck,
@@ -42,9 +43,12 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils.common import is_sm100_supported
 
 logger = logging.getLogger(__name__)
+from sglang.srt.environ import envs
 
 
 _TRTLLM_SPARSE_PAGE_SIZE = 64
+_QSA_DIRECT_DECODE = envs.SGLANG_QSA_DIRECT_DECODE.get()
+_QSA_DIRECT_MIN_ROWS = envs.SGLANG_QSA_DIRECT_MIN_ROWS.get()
 # NVFP4 target KV under QSA: the pool stays packed FP4 (E2M1 + block-16 E4M3
 # scales); decode gathers the selection as bytes and XQA reads FP4 through
 # kv_cache_sf, prefix prefill expands only the request's context transiently.
@@ -1840,6 +1844,24 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
         k_buffer = pool.get_key_buffer(layer.layer_id)
         v_buffer = pool.get_value_buffer(layer.layer_id)
+        if _QSA_DIRECT_DECODE and q.is_cuda and q.shape[0] >= _QSA_DIRECT_MIN_ROWS:
+            # Ada: trtllm-gen/XQA is SM100+, and the FA4 cute fallback does not
+            # build here, so this Triton path is the only working QSA decode.
+            metadata = self._resolve_metadata(forward_batch)
+            req_indices = (
+                metadata.row_req_pool_indices
+                if metadata.row_req_pool_indices is not None
+                else forward_batch.req_pool_indices
+            )
+            k_scale, v_scale = self._kv_descales(layer, k_buffer.dtype)
+            output = qwen_sparse_gqa_decode_selected_triton(
+                q.contiguous(), k_buffer, v_buffer,
+                self.req_to_token_pool.req_to_token, req_indices,
+                topk_indices.to(torch.int32).contiguous(),
+                metadata.sequence_lengths, layer.scaling,
+                k_scale=k_scale, v_scale=v_scale,
+            )
+            return output.reshape(q.shape[0], -1)
         if not q.is_cuda:
             metadata = self._resolve_metadata(forward_batch)
             slots = self._logical_to_physical(topk_indices, metadata)

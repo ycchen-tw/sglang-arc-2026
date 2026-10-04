@@ -330,6 +330,8 @@ class Envs:
     # stay on the baseline kernel.
     SGLANG_QSA_GROUPED_VERIFY = EnvBool(True)
     SGLANG_QSA_GROUPED_VERIFY_MIN_ROWS = EnvInt(64)
+    SGLANG_QSA_DIRECT_DECODE = EnvBool(False)
+    SGLANG_QSA_DIRECT_MIN_ROWS = EnvInt(1)
     # Copy rank-local MoE slices into independent CPU storage before H2D when
     # they reference a larger mmap-backed checkpoint storage.
     SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D = EnvBool(False)
