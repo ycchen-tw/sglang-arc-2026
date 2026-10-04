@@ -799,22 +799,53 @@ def _verify_commit_step_indices(
     accept_index: torch.Tensor,
     accept_lens: torch.Tensor,
     draft_token_num: int,
+    mamba_track_interval: Optional[int] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Step indices for a post-verify state commit: per req, the tree step of
     the last accepted node (reduces to accept_lens - 1 for topk == 1), and the
     mamba-track interval-crossing step (-1 = no crossing; None when tracking
-    is off)."""
+    is off).
+
+    mamba_track_interval (arc-forge M5 h18): the QSA HiSparse snapshot interval
+    T, used instead of mamba_track_grid; its mamba_track_indices are staging
+    slots or -1, and a row without a slot gets step -1 here as well."""
+    if mamba_track_interval is not None:
+        if batch.mamba_track_indices is None or mamba_track_interval <= 0:
+            raise RuntimeError(
+                f"a track interval ({mamba_track_interval}) needs mamba_track_indices"
+            )
+        track_grid = mamba_track_interval
+    elif batch.mamba_track_indices is not None:
+        track_grid = mamba_track_grid(batch.tree_cache.page_size)
+    else:
+        track_grid = 0
+    last, steps = _verify_commit_step_indices_at(
+        batch=batch,
+        accept_index=accept_index,
+        accept_lens=accept_lens,
+        draft_token_num=draft_token_num,
+        track_grid=track_grid,
+    )
+    if mamba_track_interval is not None:
+        steps = torch.where(batch.mamba_track_indices >= 0, steps, -1)
+    return last, steps
+
+
+def _verify_commit_step_indices_at(
+    *,
+    batch: ScheduleBatch,
+    accept_index: torch.Tensor,
+    accept_lens: torch.Tensor,
+    draft_token_num: int,
+    track_grid: int,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """_verify_commit_step_indices with the track interval given (0: tracking off)."""
     bs = accept_lens.shape[0]
     if accept_index.is_cuda:
         from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
             fused_commit_track_indices,
         )
 
-        track_grid = (
-            mamba_track_grid(batch.tree_cache.page_size)
-            if batch.mamba_track_indices is not None
-            else 0
-        )
         return fused_commit_track_indices(
             accept_index,
             accept_lens,
@@ -833,11 +864,11 @@ def _verify_commit_step_indices(
     last_correct_step_indices = (
         accept_index[req_idx, (accept_lens - 1).to(torch.int64)] - accept_indices_offset
     )
-    if batch.mamba_track_indices is None:
+    if track_grid <= 0:
         return last_correct_step_indices, None
     seq_lens_pre_verify = batch.seq_lens
     seq_lens_post_verify = batch.seq_lens + accept_lens
-    mamba_track_interval = mamba_track_grid(batch.tree_cache.page_size)
+    mamba_track_interval = track_grid
     to_track_mask = (
         seq_lens_pre_verify // mamba_track_interval
         != seq_lens_post_verify // mamba_track_interval
@@ -900,6 +931,7 @@ def commit_mamba_states_after_verify(
     accept_lens: torch.Tensor,
     accept_index: torch.Tensor,
     draft_token_num: int,
+    mamba_track_interval: Optional[int] = None,
 ) -> None:
     """Commit accepted per-step mamba states into the persistent caches.
 
@@ -908,6 +940,8 @@ def commit_mamba_states_after_verify(
     conv/ssm caches. After acceptance, the state of each request's last
     accepted step is committed back, plus the interval-crossing state used
     for prefix-cache tracking (mamba extra_buffer mode).
+
+    mamba_track_interval: see _verify_commit_step_indices (arc-forge M5 h18).
 
     No-op for models without mamba-style state or backends without the
     commit hook.
@@ -948,6 +982,7 @@ def commit_mamba_states_after_verify(
             accept_index=accept_index,
             accept_lens=accept_lens,
             draft_token_num=draft_token_num,
+            mamba_track_interval=mamba_track_interval,
         )
         commit_gdn_replayssm_fold_after_verify(
             spec_state=spec_state,
@@ -984,6 +1019,7 @@ def commit_mamba_states_after_verify(
             accept_index=accept_index,
             accept_lens=accept_lens,
             draft_token_num=draft_token_num,
+            mamba_track_interval=mamba_track_interval,
         )
         # Advance the per-request circular cursors by the accepted count (incl. the
         # bonus token). max_cache_len = ring length L = replayssm_d.shape[-2].
@@ -1060,6 +1096,8 @@ def commit_mamba_states_after_verify(
             commit_kda_replayssm_after_verify,
         )
 
+        if mamba_track_interval is not None:
+            raise NotImplementedError("KDA ReplaySSM has no QSA HiSparse snapshot track")
         spec_state = req_pool.get_speculative_mamba2_params_all_layers()
         bs = accept_lens.shape[0]
         state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
@@ -1115,6 +1153,7 @@ def commit_mamba_states_after_verify(
             accept_index=accept_index,
             accept_lens=accept_lens,
             draft_token_num=draft_token_num,
+            mamba_track_interval=mamba_track_interval,
         )
 
         if hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):

@@ -830,11 +830,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Inputs aliased by reference from ScheduleBatch
             seq_lens_cpu=seq_lens_cpu,
             # ScheduleBatch documents its mirror as stale in the speculative
-            # draft window: only non-speculative extend forwards carry it (h15)
+            # draft window: only non-speculative extend forwards carry it (h15),
+            # and a speculative server's prefill, whose mirror prepare_for_extend
+            # has just built (h18: a resumed request's host prefix needs it)
             req_pool_indices_cpu=(
                 batch.req_pool_indices_cpu
-                if batch.spec_algorithm.is_none()
-                and not batch.forward_mode.is_decode_or_idle()
+                if (
+                    batch.spec_algorithm.is_none()
+                    and not batch.forward_mode.is_decode_or_idle()
+                )
+                or batch.forward_mode == ForwardMode.EXTEND
                 else None
             ),
             orig_seq_lens=batch.orig_seq_lens,

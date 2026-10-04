@@ -197,7 +197,7 @@ def validate_qsa_hisparse(server_args: ServerArgs) -> None:
     if session:
         need.update(_qsa_session_needs(view))
     if view.speculative_algorithm is not None:
-        need.update(_qsa_spec_needs(view, session))
+        need.update(_qsa_spec_needs(view))
     missing = [what for what, ok in need.items() if not ok]
     if missing:
         raise ValueError(
@@ -242,18 +242,20 @@ def _qsa_session_needs(view) -> dict:
     }
 
 
-def _qsa_spec_needs(view, session: bool) -> dict:
+def _qsa_spec_needs(view) -> dict:
     """M5 h17 (design §9): the speculative shape QSA HiSparse serves. The target
     verifies K rows per request (h16) and backs up after accept (h17) only on the
     overlap EAGLEWorkerV2 path; the draft keeps a resident plain QSA pool priced
-    per logical token (fp8_e4m3 / bfloat16 only). GDN snapshots and session
-    resume under spec need the ReplaySSM track into staging slots (h18)."""
+    per logical token (fp8_e4m3 / bfloat16 only). GDN snapshots (and so session
+    resume) under spec take the ReplaySSM commit's track into staging slots the
+    device claims after accept (h18), which needs one crossing per step: T > K."""
     import json
 
     from sglang.srt.environ import envs
 
     user = json.loads(view.hisparse_config) if view.hisparse_config else {}
     k = view.speculative_num_draft_tokens
+    t = user.get("qsa_snapshot_interval")
     return {
         "--speculative-algorithm NEXTN / EAGLE": view.speculative_algorithm
         in ("EAGLE", "NEXTN"),
@@ -272,11 +274,11 @@ def _qsa_spec_needs(view, session: bool) -> dict:
         "SGLANG_RAGGED_VERIFY_MODE=static (K rows per request)": envs.SGLANG_RAGGED_VERIFY_MODE.get()
         == "static",
         "no SGLANG_SIMULATE_ACC_LEN": envs.SGLANG_SIMULATE_ACC_LEN.get() < 0,
-        "no session cache with speculative decoding (h18)": not session,
-        "no qsa_session_resume / qsa_snapshot_interval with speculative decoding (h18)": not user.get(
-            "qsa_session_resume", False
-        )
-        and "qsa_snapshot_interval" not in user,
+        # h18: the verify commit tracks the state of at most one boundary per step
+        "--enable-linear-replayssm-spec with GDN snapshots": t is None
+        or view.enable_linear_replayssm_spec,
+        "hisparse_config qsa_snapshot_interval > --speculative-num-draft-tokens": t is None
+        or (isinstance(t, int) and k is not None and t > k),
     }
 
 

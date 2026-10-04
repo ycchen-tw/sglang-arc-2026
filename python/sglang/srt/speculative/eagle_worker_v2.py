@@ -1503,6 +1503,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                             batch.req_pool_indices, batch.seq_lens, batch_output.accept_lens
                         )
                     batch_output.hisparse_verify_overflow = coord.verify_overflow
+                    if coord.snapshots is not None:
+                        # h18: the staging slots the commit tracked into ride the result
+                        # to the host (on_verify_result); the draft extend sees none
+                        batch_output.hisparse_track_slots = batch.mamba_track_indices
+                        batch.mamba_track_indices = None
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
@@ -1820,6 +1825,17 @@ class EAGLEWorkerV2(BaseSpecWorker):
             dw._rebuild_topk1_chain_buffers()
 
     def verify(self, batch: ScheduleBatch, grammar_barrier=None):
+        # arc-forge M5 h18: QSA HiSparse GDN snapshots claim staging slots after the
+        # accept and have the mamba commit track into them
+        before_mamba_commit = None
+        coord = self.target_worker.model_runner.hisparse_coordinator
+        if coord is not None:
+            from sglang.srt.managers.qsa_hisparse_coordinator import (
+                QSAHiSparseCoordinator,
+            )
+
+            if isinstance(coord, QSAHiSparseCoordinator) and coord.snapshots is not None:
+                before_mamba_commit = coord.snapshots.track_before_commit
         return run_eagle_verify(
             batch,
             target_worker=self.target_worker,
@@ -1833,6 +1849,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             metadata_ready_pre_pad=False,
             finalize_tree_path=True,
             grammar_barrier=grammar_barrier,
+            before_mamba_commit=before_mamba_commit,
         )
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):

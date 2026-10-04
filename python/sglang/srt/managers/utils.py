@@ -94,6 +94,9 @@ class GenerationBatchResult:
     # arc-forge M5 h16: QSA HiSparse verify swap-in overflow flag (int32 [1]); copied
     # with the result and checked before the step's tokens are sent.
     hisparse_verify_overflow: Optional[torch.Tensor] = None
+    # arc-forge M5 h18: the staging mamba slot each verify row's commit tracked a GDN
+    # snapshot into (int64 [bs], -1: none); the result processor issues the D2H.
+    hisparse_track_slots: Optional[torch.Tensor] = None
 
     block_accept_lens: Optional[torch.Tensor] = None
 
@@ -173,6 +176,9 @@ class GenerationBatchResult:
 
         if self.hisparse_verify_overflow is not None:
             self.hisparse_verify_overflow = _async_d2h(self.hisparse_verify_overflow)
+
+        if self.hisparse_track_slots is not None:
+            self.hisparse_track_slots = _async_d2h(self.hisparse_track_slots)
 
         if self.block_accept_lens is not None:
             self.block_accept_lens = _async_d2h(self.block_accept_lens)

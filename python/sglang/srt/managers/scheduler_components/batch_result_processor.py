@@ -931,6 +931,12 @@ class SchedulerBatchResultProcessor:
             )
 
             raise_on_verify_overflow(result.hisparse_verify_overflow)
+        if result.hisparse_track_slots is not None:
+            # arc-forge M5 h18: this verify's GDN snapshot claims, before its accept
+            # is committed below and before any request of it finishes (release)
+            self.hisparse_coordinator.snapshots.on_verify_result(
+                batch.reqs, result.hisparse_track_slots, result.accept_lens, result.copy_done
+            )
         auxiliary_output_starts = self.snapshot_auxiliary_output_starts(batch, result)
         auxiliary_output = result.auxiliary_host_output
         if result.routed_experts_output is not None:

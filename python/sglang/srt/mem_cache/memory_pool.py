@@ -1131,10 +1131,15 @@ class MambaPool:
         return entries
 
     def _require_host_slot_copies(self) -> None:
-        if self.replayssm_write_pos is not None or self.enable_linear_replayssm_spec:
+        # The decode ring (--enable-linear-replayssm) keeps temporal behind the ring
+        # until a flush (M1b design §3.6). ReplaySSM-spec is fine for the slots these
+        # copies see (arc-forge M5 h18): a staging slot holds the full state the
+        # verify commit tracked into it, and a restore goes into a fresh slot of a new
+        # request row, whose ring cursors alloc zeroed.
+        if self.replayssm_write_pos is not None:
             raise NotImplementedError(
-                "mamba slot <-> host copies need ReplaySSM off: temporal lags the "
-                "ring until a flush (M1b design §3.6)"
+                "mamba slot <-> host copies need the ReplaySSM decode ring off: temporal "
+                "lags the ring until a flush (M1b design §3.6)"
             )
 
     def host_slot_layout(self) -> List[Tuple[str, Tuple[int, ...], torch.dtype, int]]:

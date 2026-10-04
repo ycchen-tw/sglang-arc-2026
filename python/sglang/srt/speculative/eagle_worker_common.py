@@ -473,8 +473,14 @@ def run_eagle_verify(
     finalize_tree_path: bool,
     grammar_barrier=None,
     uno_target_max_top_k: Optional[int] = None,
+    before_mamba_commit=None,
 ) -> GenerationBatchResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
+
+    before_mamba_commit(batch, accept_lens) (arc-forge M5 h18): runs after the
+    accept and before the mamba commit on the forward stream; it may set
+    batch.mamba_track_indices and returns the track interval for the commit
+    (None: the commit's own).
 
     The single-layer eagle verify body is the source of truth (superset). Two
     switches encode the multi-layer worker's preserved-verbatim differences:
@@ -610,6 +616,9 @@ def run_eagle_verify(
             num_draft_tokens,
         )
 
+    mamba_track_interval = (
+        None if before_mamba_commit is None else before_mamba_commit(batch, accept_lens)
+    )
     # Update mamba state for hybrid GDN models after verification
     commit_mamba_states_after_verify(
         target_worker,
@@ -617,6 +626,7 @@ def run_eagle_verify(
         accept_lens,
         accept_index,
         num_draft_tokens,
+        mamba_track_interval=mamba_track_interval,
     )
 
     if not batch.forward_mode.is_idle():

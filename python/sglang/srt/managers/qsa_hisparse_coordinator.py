@@ -1309,7 +1309,10 @@ def create_qsa_hisparse_coordinator(model_runner) -> QSAHiSparseCoordinator:
             "hisparse_config.qsa_session_resume needs --radix-cache-backend "
             f"qsa_hisparse_session (M1b h09), got {get_memory().radix_cache_backend!r}"
         )
-    snapshot = _snapshot_config(user, num_reqs)
+    verify_tokens = 1
+    if get_spec().speculative_algorithm is not None:
+        verify_tokens = int(max_speculative_num_draft_tokens() or 1)
+    snapshot = _snapshot_config(user, num_reqs, verify_tokens)
     if session_resume:
         # M1b h09: register the session cache backend (build_kv_cache comes next)
         # and check the host budget of what the records park before pinning it.
@@ -1326,9 +1329,7 @@ def create_qsa_hisparse_coordinator(model_runner) -> QSAHiSparseCoordinator:
     # M5 h16: a TARGET_VERIFY forward has K rows per request (the decode graph
     # runner captures TARGET_VERIFY with bs * K tokens), so the per-row buffers hold
     # K x the graph's max batch size.
-    verify_tokens = 1
-    if get_spec().speculative_algorithm is not None:
-        verify_tokens = int(max_speculative_num_draft_tokens() or 1)
+    if verify_tokens > 1:
         # h17 (design §3.3): B >= K x top-k makes the swap-in overflow impossible;
         # below it only the flag stands between a large selection and a raise.
         small_ok = user.get("qsa_spec_small_hot_ok", False)
@@ -1423,10 +1424,14 @@ def _check_session_host_budget(pool, user: dict, snapshot, mamba_pool) -> None:
     )
 
 
-def _snapshot_config(user: dict, num_reqs: int) -> Optional["QSAHiSparseSnapshotConfig"]:
+def _snapshot_config(
+    user: dict, num_reqs: int, verify_tokens: int = 1
+) -> Optional["QSAHiSparseSnapshotConfig"]:
     """M1b h08 keys of hisparse_config: decode GDN snapshots are off unless
     qsa_snapshot_interval (T) is set; K staging slots default to 8 and the host
-    buffers to R + 16 (design §3.3, §5.3)."""
+    buffers to R + 16 (design §3.3, §5.3). Under speculative decoding a staging
+    slot stays claimed until the CPU sees the step and its D2H ends, about two
+    steps: 16 by default (M5 design §7.2, §16 decision 2)."""
     keys = (
         "qsa_snapshot_interval",
         "qsa_snapshot_staging_slots",
@@ -1442,7 +1447,7 @@ def _snapshot_config(user: dict, num_reqs: int) -> Optional["QSAHiSparseSnapshot
         return None
     return QSAHiSparseSnapshotConfig(
         interval=user[keys[0]],
-        staging_slots=user.get(keys[1], 8),
+        staging_slots=user.get(keys[1], 16 if verify_tokens > 1 else 8),
         host_buffers=user.get(keys[2], num_reqs + 16),
     )
 
@@ -1485,6 +1490,7 @@ class _Snapshot:
     staging: int  # staging mamba slot
     host_blocks: int  # host copies of blocks [0, host_blocks) issued by this window
     done: Optional[torch.cuda.Event] = None  # D2H finished
+    after: Optional[torch.cuda.Event] = None  # spec (h18): the claiming verify's copy_done
 
 
 class QSAHiSparseSnapshots:
@@ -1496,6 +1502,14 @@ class QSAHiSparseSnapshots:
     stream D2Hs the staging slot into the owner's pinned buffer; poll() (from
     collect_ready_reqs) publishes each snapshot once its D2H event is seen done.
     A buffer with an unpublished snapshot takes no new one (§11.8, counted).
+
+    Under speculative decoding (M5 design §7.2, h18) there is no D2D: the
+    device claims a free staging slot for every verify row whose accept crosses
+    a multiple of T (claim, before the mamba commit), the commit tracks the
+    state at that multiple into it, and the CPU sees the claims with the step
+    result one step late (on_verify_result): it asks the owner for a buffer
+    and D2Hs, or frees the slot. staging_busy on the device is the truth about
+    which staging slots are taken; the CPU only clears entries it saw claimed.
     """
 
     def __init__(
@@ -1535,12 +1549,33 @@ class QSAHiSparseSnapshots:
             config.staging_slots
         ).tolist()
         self.staging_free = list(self.staging_slots)
-        # Compile the fused conv-slot copy now rather than in the first decode window
-        # (slot 0 is the padding dummy; a staging slot is scratch until a D2D).
-        self.mamba.copy_from(
-            torch.zeros(1, dtype=torch.int64, device=self.device),
-            torch.tensor(self.staging_slots[:1], dtype=torch.int64, device=self.device),
-        )
+        self.spec = coord.verify_tokens > 1
+        if self.spec:
+            # M5 h18: one boundary per verify at most, and the commit tracks exactly
+            # the entries a host slot holds (conv[0], temporal, the PLE siblings)
+            if self.interval <= coord.verify_tokens:
+                raise ValueError(
+                    f"snapshot interval T={self.interval} must exceed K={coord.verify_tokens}"
+                )
+            if len(self.mamba.mamba_cache.conv) != 1:
+                raise NotImplementedError(
+                    f"the verify commit tracks conv[0] only, the pool has "
+                    f"{len(self.mamba.mamba_cache.conv)} conv states"
+                )
+            n = len(self.staging_slots)
+            # entry n: where rows without a claim write (never cleared, never read)
+            self.staging_busy = torch.zeros(n + 1, dtype=torch.int32, device=self.device)
+            self.staging_ids = torch.tensor(
+                self.staging_slots + [-1], dtype=torch.int64, device=self.device
+            )
+            self._staging_index = {slot: i for i, slot in enumerate(self.staging_slots)}
+        else:
+            # Compile the fused conv-slot copy now rather than in the first decode
+            # window (slot 0 is the padding dummy; a staging slot is scratch until a D2D).
+            self.mamba.copy_from(
+                torch.zeros(1, dtype=torch.int64, device=self.device),
+                torch.tensor(self.staging_slots[:1], dtype=torch.int64, device=self.device),
+            )
 
         self.slot_nbytes = self.mamba.host_slot_nbytes()
         total = self.slot_nbytes * config.host_buffers
@@ -1567,6 +1602,9 @@ class QSAHiSparseSnapshots:
         self.buffer_free = list(range(config.host_buffers - 1, -1, -1))
 
         self.busy: Dict[int, _Snapshot] = {}  # buffer -> unpublished snapshot (§11.8)
+        # M5 h18: claims seen with a verify result, D2H not issued yet (poll issues them, or
+        # release, which alone knows whether a finishing request's P is past its stop)
+        self.unissued: List[_Snapshot] = []
         self.pending: List[_Snapshot] = []  # issue order == completion order (one stream)
         self.decoding: Dict[int, Req] = {}  # request slot -> request, ready to release
         self.host_blocks: Dict[int, int] = {}  # request slot -> host copies issued [0, n)
@@ -1660,6 +1698,119 @@ class QSAHiSparseSnapshots:
             due.append(snap)
         return due
 
+    # ------------------------------------------------------------ speculative decode (M5 h18)
+
+    def track_before_commit(self, batch, accept_lens: torch.Tensor) -> Optional[int]:
+        """run_eagle_verify's before_mamba_commit: claim staging slots for the rows
+        this verify's accept carries across a multiple of T and hand them to the
+        commit as mamba_track_indices (-1: no track), with T as its interval."""
+        if batch.forward_mode.is_idle():
+            return None
+        if batch.mamba_track_indices is not None:
+            raise RuntimeError("QSA HiSparse snapshots: the verify batch already has track indices")
+        batch.mamba_track_indices = self.claim(batch.seq_lens, accept_lens)
+        return self.interval
+
+    def claim(self, seq_lens: torch.Tensor, accept_lens: torch.Tensor) -> torch.Tensor:
+        """Device side of design §7.2 step 2, on the current (forward) stream, no host
+        sync. Row i crosses when seq_lens[i] // T != (seq_lens[i] + accept_lens[i]) // T;
+        the k-th crossing row takes the k-th free staging slot, and a crossing row
+        past the free count gets none (the CPU counts it as skip_staging). Returns
+        int64 [bs]: the claimed mamba slot, or -1."""
+        t = self.interval
+        pre = seq_lens.to(torch.int64)
+        cross = pre // t != (pre + accept_lens.to(torch.int64)) // t
+        n = len(self.staging_slots)
+        free_rank = torch.cumsum((self.staging_busy[:n] == 0).to(torch.int64), 0)
+        k = torch.cumsum(cross.to(torch.int64), 0)  # 1-based rank among crossing rows
+        ok = cross & (k <= free_rank[-1])
+        idx = torch.searchsorted(free_rank, k)  # the k-th free entry
+        idx = torch.where(ok, idx, torch.full_like(idx, n))
+        self.staging_busy.index_put_((idx,), torch.ones_like(idx, dtype=torch.int32))
+        return self.staging_ids[idx]
+
+    def on_verify_result(self, reqs, track_slots: torch.Tensor, accept_lens: torch.Tensor, after) -> None:
+        """CPU side of design §7.2 step 4 for one verify's result, before its accept
+        is committed on the host (req.kv.kv_committed_len is still the verify's
+        seq_lens). track_slots / accept_lens: host copies from the result; after: its
+        copy_done event (the commit's track and the backup after accept precede it).
+        A claim of a request that finished, was retracted or left decode since the
+        verify was launched (overlap) is discarded. The others wait unissued: whether
+        this verify finishes the request is decided later in the same result, and a P
+        past the stop must never reach the owner's buffer (a record's buffer would be
+        overwritten with a state its P does not describe). poll issues them from the
+        next iteration on; release issues or drops a finishing request's own."""
+        slots, accepts = track_slots.tolist(), accept_lens.tolist()
+        if not len(slots) == len(accepts) == len(reqs):
+            raise RuntimeError(
+                f"verify result with {len(slots)} track slots, {len(accepts)} accept lengths, "
+                f"{len(reqs)} requests"
+            )
+        t, bt = self.interval, self.layout.block_tokens
+        for req, slot, a in zip(reqs, slots, accepts):
+            r = req.kv.req_pool_idx
+            live = (
+                not req.finished()
+                and not req.is_retracted
+                and r is not None
+                and self.decoding.get(r) is req
+            )
+            if not live:
+                if slot >= 0:
+                    self.stats["claim_discarded"] += 1
+                    self._free_staging(slot)
+                continue
+            pre = req.kv.kv_committed_len
+            post = pre + a
+            crossed = pre // t != post // t
+            if slot < 0:
+                if crossed:
+                    self.stats["skip_staging"] += 1
+                continue
+            if not crossed or slot not in self._staging_index:
+                raise RuntimeError(
+                    f"{req.rid}: staging slot {slot} claimed for a verify {pre} -> {post} "
+                    f"(T={t}, staging slots {self.staging_slots})"
+                )
+            self.stats["claimed"] += 1
+            # the verify's backup after accept put blocks [0, post // bt) on host; buf is
+            # filled in when the claim is issued
+            self.unissued.append(_Snapshot(req, r, post // t * t, -1, slot, post // bt, after=after))
+
+    def _issue(self, claims: List[_Snapshot]) -> None:
+        """Ask the owner for each claim's buffer and D2H it, or free the staging slot."""
+        due: List[_Snapshot] = []
+        if claims and self.owner is None:
+            raise RuntimeError("GDN snapshots are on but no owner is registered (h09)")
+        for snap in claims:
+            buf = self.owner.snapshot_buffer(snap.req, snap.p)
+            if buf is None:
+                self.stats["skip_owner"] += 1
+                self._free_staging(snap.staging)
+                continue
+            if not 0 <= buf < len(self.buffers) or buf in self.buffer_free:
+                raise RuntimeError(f"owner gave GDN buffer {buf}, which is not allocated")
+            if buf in self.busy:
+                self.stats["skip_busy"] += 1
+                self._free_staging(snap.staging)
+                continue
+            snap.buf = buf
+            self.busy[buf] = snap
+            due.append(snap)
+        # copy_done events of one forward stream, in order: the last covers the others
+        if due:
+            self.start_d2h(due, due[-1].after)
+
+    def _free_staging(self, slot: int) -> None:
+        if not self.spec:
+            self.staging_free.append(slot)
+            return
+        # a device write on the scheduler stream: the next forward waits for it,
+        # the one in flight may or may not see it (either is safe: it only ever
+        # claims an entry it read as 0, and this entry reads 1 until now)
+        i = self._staging_index[slot]
+        self.staging_busy[i : i + 1].zero_()
+
     def staging_indices(
         self, due: List[_Snapshot]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1688,7 +1839,11 @@ class QSAHiSparseSnapshots:
         self.stats["issued"] += len(due)
 
     def poll(self) -> None:
-        """Publish, in issue order, every snapshot whose D2H is seen done."""
+        """Publish, in issue order, every snapshot whose D2H is seen done (spec: first
+        issue the claims earlier results left, h18)."""
+        if self.unissued:
+            claims, self.unissued = self.unissued, []
+            self._issue(claims)
         while self.pending and self.pending[0].done.query():
             self._publish(self.pending.pop(0), d2h_done=True)
 
@@ -1697,6 +1852,11 @@ class QSAHiSparseSnapshots:
         committed = req.kv.kv_committed_len
         if p > committed:  # §11.7: condition 1 always holds without spec
             raise RuntimeError(f"{req.rid}: snapshot p={p} beyond kv_committed_len {committed}")
+        if self.spec and req.finished() and p > self._emitted(req):
+            # release drops these before they are issued (h18)
+            raise RuntimeError(
+                f"{req.rid}: snapshot p={p} past the stop ({self._emitted(req)} tokens emitted) was issued"
+            )
         overwritten = any(o.buf == snap.buf for o in self.pending)
         if not self.layout.can_publish(
             p,
@@ -1713,12 +1873,32 @@ class QSAHiSparseSnapshots:
             )
         if self.busy.pop(snap.buf) is not snap:
             raise RuntimeError(f"GDN buffer {snap.buf} busy with another snapshot")
-        self.staging_free.append(snap.staging)
+        self._free_staging(snap.staging)
         self.stats["published"] += 1
         self.owner.on_snapshot_published(req, p, snap.buf)
 
+    @staticmethod
+    def _emitted(req: Req) -> int:
+        return len(req.origin_input_ids) + len(req.output_ids_through_stop)
+
     def release(self, req: Req) -> None:
-        """Wait for req's in-flight D2H, publish in order, drop its decode state."""
+        """Wait for req's in-flight D2H, publish in order, drop its decode state.
+
+        Spec (h18): req's unissued claims first. The finishing verify may commit tokens
+        past the stop (EOS, stop string, max_new_tokens); a P among them is not a prefix
+        of the next turn, so that claim is dropped before the owner sees it
+        (skip_past_stop); the rest are issued now."""
+        claims = [snap for snap in self.unissued if snap.req is req]
+        if claims:
+            self.unissued = [snap for snap in self.unissued if snap.req is not req]
+            keep = []
+            for snap in claims:
+                if req.finished() and snap.p > self._emitted(req):
+                    self.stats["skip_past_stop"] += 1
+                    self._free_staging(snap.staging)
+                else:
+                    keep.append(snap)
+            self._issue(keep)
         mine = [snap for snap in self.pending if snap.req is req]
         for snap in mine:
             snap.done.synchronize()
@@ -1753,12 +1933,16 @@ class QSAHiSparseSnapshots:
         held = sorted(set(range(len(self.buffers))) - set(self.buffer_free))
         if held != sorted(parked) or len(parked) != len(set(parked)):
             problems.append(f"GDN host buffers {held} allocated, parked records hold {sorted(parked)}")
-        if self.pending or self.busy or self.decoding:
+        if self.pending or self.busy or self.decoding or self.unissued:
             problems.append(
-                f"snapshots: {len(self.pending)} D2H pending, busy buffers "
+                f"snapshots: {len(self.unissued)} claims unissued, {len(self.pending)} D2H pending, busy buffers "
                 f"{sorted(self.busy)}, decoding slots {sorted(self.decoding)}"
             )
-        if sorted(self.staging_free) != sorted(self.staging_slots):
+        if self.spec:
+            busy = self.staging_busy[: len(self.staging_slots)].tolist()
+            if any(busy):
+                problems.append(f"staging slots claimed on the device: {busy}")
+        elif sorted(self.staging_free) != sorted(self.staging_slots):
             problems.append(
                 f"staging mamba slots {sorted(self.staging_free)} free of "
                 f"{self.staging_slots}"
