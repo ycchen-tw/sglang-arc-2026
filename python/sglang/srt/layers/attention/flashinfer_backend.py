@@ -65,6 +65,23 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def arc_nvfp4_paged_forward(wrapper, q, kv_cache, *, causal, sm_scale,
+                            window_left, logits_soft_cap, k_scale, v_scale,
+                            kv_cache_sf):
+    """Legacy forward semantics with NVFP4 scales passed to the supported run API."""
+    wrapper._causal = causal
+    wrapper._pos_encoding_mode = "NONE"
+    wrapper._use_fp16_qk_reduction = False
+    wrapper._window_left = window_left
+    wrapper._logits_soft_cap = logits_soft_cap
+    wrapper._sm_scale = sm_scale
+    wrapper._rope_scale = None
+    wrapper._rope_theta = None
+    return wrapper.run(q, kv_cache, k_scale=k_scale, v_scale=v_scale,
+                       kv_cache_sf=kv_cache_sf)
+
+
+
 if envs.SGLANG_ENABLE_TORCH_COMPILE.get():
     torch._logging.set_logs(dynamo=logging.ERROR)
     torch._dynamo.config.suppress_errors = True
@@ -1360,7 +1377,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 not layer.is_cross_attention
                 and layer.attn_type != AttentionType.ENCODER_ONLY
             )
-            o = prefill_wrapper_paged.forward(
+            paged_forward = (
+                partial(arc_nvfp4_paged_forward, prefill_wrapper_paged)
+                if self.arc_native_nvfp4 else prefill_wrapper_paged.forward
+            )
+            o = paged_forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 kv_cache,
                 causal=causal,
