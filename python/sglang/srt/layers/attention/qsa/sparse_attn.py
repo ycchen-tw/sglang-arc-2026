@@ -1094,13 +1094,16 @@ def _sparse_gqa_decode_selected(
             scores *= k_scale
         scores = tl.where(valid[None, :], scores, -float("inf"))
         next_max = tl.maximum(max_value, tl.max(scores, 1))
-        alpha = tl.math.exp2(max_value - next_max)
-        probabilities = tl.math.exp2(scores - next_max[:, None])
+        # Empty/padding tiles have no finite maximum; keep their mass zero.
+        safe_max = tl.where(next_max == -float("inf"), 0.0, next_max)
+        alpha = tl.math.exp2(max_value - safe_max)
+        probabilities = tl.math.exp2(scores - safe_max[:, None])
         accumulator = tl.dot(
             probabilities.to(values.dtype), values, accumulator * alpha[:, None]
         )
         normalizer = normalizer * alpha + tl.sum(probabilities, 1)
         max_value = next_max
+    normalizer = tl.where(normalizer > 0.0, normalizer, 1.0)
     output = accumulator / normalizer[:, None]
     if KV_IS_FP8:
         output *= v_scale
@@ -1112,6 +1115,22 @@ def _sparse_gqa_decode_selected(
         output,
         mask=(offs_h < GROUP_SIZE)[:, None],
     )
+
+
+def _validate_sparse_gqa_dtypes(q, k, v):
+    """The legacy QSA compute contract, formerly supplied by frozen patch 0004."""
+    if k.dtype != v.dtype:
+        raise ValueError(f"QSA K/V dtypes must match, got {k.dtype} and {v.dtype}")
+    fp8 = k.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2)
+    if q.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(f"QSA expects BF16/FP16 queries, got {q.dtype}")
+    if not fp8 and k.dtype != q.dtype:
+        raise ValueError(f"QSA K/V must match query dtype {q.dtype} or use FP8, got {k.dtype}")
+    return fp8
+
+
+def _unit_scale(scale: Optional[float]) -> float:
+    return 1.0 if scale is None else float(scale)
 
 
 def qwen_sparse_gqa_decode_selected_triton(
