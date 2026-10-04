@@ -38,6 +38,67 @@ def _draft_topk1_partial_argmax_kernel(
 
 
 @triton.jit
+def _draft_topk1_local_candidate_kernel(
+    partial_vals,
+    partial_indices,
+    candidates,
+    vocab_start,
+    num_splits: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < num_splits
+    vals = tl.load(
+        partial_vals + row * num_splits + offsets,
+        mask=mask,
+        other=-float("inf"),
+    )
+    split = tl.argmax(vals, axis=0)
+    max_val = tl.load(partial_vals + row * num_splits + split)
+    local_index = tl.load(partial_indices + row * num_splits + split)
+    tl.store(candidates + row * 2, max_val)
+    # Global token ids are below 2^24, hence exactly representable in fp32.
+    tl.store(candidates + row * 2 + 1, (vocab_start + local_index).to(tl.float32))
+
+
+@triton.jit
+def _draft_topk1_global_finalize_kernel(
+    gathered_candidates,
+    topk_p,
+    topk_index,
+    positions,
+    draft_tokens,
+    draft_tokens_stride,
+    draft_token_column,
+    TP_SIZE: tl.constexpr,
+    WRITE_DRAFT_TOKEN: tl.constexpr,
+    ADVANCE_POSITIONS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    ranks = tl.arange(0, BLOCK)
+    mask = ranks < TP_SIZE
+    row_base = row * (2 * TP_SIZE)
+    vals = tl.load(
+        gathered_candidates + row_base + ranks * 2,
+        mask=mask,
+        other=-float("inf"),
+    )
+    # Rank order follows global vocab order, so tl.argmax's first tie matches
+    # argmax over the fully gathered logits.
+    winner = tl.argmax(vals, axis=0)
+    index = tl.load(gathered_candidates + row_base + winner * 2 + 1).to(tl.int64)
+    tl.store(topk_index + row, index)
+    tl.store(topk_p + row, 1.0)
+    if WRITE_DRAFT_TOKEN:
+        tl.store(draft_tokens + row * draft_tokens_stride + draft_token_column, index)
+    if ADVANCE_POSITIONS:
+        position = tl.load(positions + row)
+        tl.store(positions + row, position + 1)
+
+
+@triton.jit
 def _draft_topk1_finalize_kernel(
     partial_vals,
     partial_indices,
@@ -145,6 +206,107 @@ def draft_topk1_postprocess(
         num_splits,
         WRITE_DRAFT_TOKEN=write_draft_token,
         BLOCK=triton.next_power_of_2(num_splits),
+        num_warps=1,
+    )
+    return topk_p, topk_index
+
+
+def draft_topk1_postprocess_distributed(
+    local_next_token_logits: torch.Tensor,
+    positions: torch.Tensor | None,
+    *,
+    vocab_start_index: int,
+    global_vocab_size: int,
+    draft_tokens: torch.Tensor | None = None,
+    draft_token_column: int = 0,
+):
+    """Exact global argmax from vocab-parallel draft logits.
+
+    Each rank reduces only its local vocabulary shard, all-gathers one
+    ``(max_logit, global_token_id)`` pair per row, then selects the winning
+    rank. This replaces the full ``[batch, vocab]`` all-gather used by greedy
+    top-1 MTP drafting. The candidate id is carried as fp32, which is exact for
+    all supported vocabulary sizes. If ``positions`` is ``None``, the helper
+    selects a token without advancing decode positions (draft-extend seeding).
+    """
+    from sglang.srt.distributed import tensor_model_parallel_all_gather
+
+    assert local_next_token_logits.ndim == 2
+    assert local_next_token_logits.stride(1) == 1
+    advance_positions = positions is not None
+    if advance_positions:
+        assert positions.ndim == 1 and positions.is_contiguous()
+        assert positions.shape[0] == local_next_token_logits.shape[0]
+        assert positions.device == local_next_token_logits.device
+    assert vocab_start_index >= 0
+    assert global_vocab_size > vocab_start_index
+    assert global_vocab_size < 1 << 24
+
+    write_draft_token = draft_tokens is not None
+    if write_draft_token:
+        assert draft_tokens.ndim == 2
+        assert draft_tokens.dtype == torch.long
+        assert draft_tokens.device == local_next_token_logits.device
+        assert draft_tokens.shape[0] == local_next_token_logits.shape[0]
+        assert draft_tokens.stride(1) == 1
+        assert 0 <= draft_token_column < draft_tokens.shape[1]
+
+    bs, local_width = local_next_token_logits.shape
+    valid_local_vocab = min(local_width, global_vocab_size - vocab_start_index)
+    assert valid_local_vocab > 0
+    topk_p = torch.empty(
+        (bs, 1), dtype=torch.float32, device=local_next_token_logits.device
+    )
+    topk_index = torch.empty(
+        (bs, 1), dtype=torch.int64, device=local_next_token_logits.device
+    )
+    if bs == 0:
+        return topk_p, topk_index
+
+    block = _DRAFT_TOPK1_BLOCK
+    num_splits = triton.cdiv(valid_local_vocab, block)
+    partial_vals = torch.empty(
+        (bs, num_splits), dtype=torch.float32, device=local_next_token_logits.device
+    )
+    partial_indices = torch.empty(
+        (bs, num_splits), dtype=torch.int32, device=local_next_token_logits.device
+    )
+    _draft_topk1_partial_argmax_kernel[(bs, num_splits)](
+        local_next_token_logits,
+        partial_vals,
+        partial_indices,
+        local_next_token_logits.stride(0),
+        valid_local_vocab,
+        num_splits,
+        BLOCK=block,
+        num_warps=8,
+    )
+    candidates = torch.empty(
+        (bs, 2), dtype=torch.float32, device=local_next_token_logits.device
+    )
+    _draft_topk1_local_candidate_kernel[(bs,)](
+        partial_vals,
+        partial_indices,
+        candidates,
+        vocab_start_index,
+        num_splits,
+        BLOCK=triton.next_power_of_2(num_splits),
+        num_warps=1,
+    )
+    gathered = tensor_model_parallel_all_gather(candidates, dim=-1)
+    tp_size = gathered.shape[-1] // 2
+    _draft_topk1_global_finalize_kernel[(bs,)](
+        gathered,
+        topk_p,
+        topk_index,
+        positions if advance_positions else topk_index,
+        draft_tokens if write_draft_token else topk_index,
+        draft_tokens.stride(0) if write_draft_token else 0,
+        draft_token_column,
+        TP_SIZE=tp_size,
+        WRITE_DRAFT_TOKEN=write_draft_token,
+        ADVANCE_POSITIONS=advance_positions,
+        BLOCK=triton.next_power_of_2(tp_size),
         num_warps=1,
     )
     return topk_p, topk_index

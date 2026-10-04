@@ -1461,6 +1461,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return LogitsProcessorOutput(
                 next_token_logits=next_token_logits,
                 full_logits=full_logits,
+                next_token_logits_vocab_start=output.next_token_logits_vocab_start,
+                next_token_logits_global_vocab_size=(
+                    output.next_token_logits_global_vocab_size
+                ),
                 hidden_states=(
                     output.hidden_states[: self.raw_num_token]
                     if output.hidden_states is not None

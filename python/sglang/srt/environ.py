@@ -319,6 +319,9 @@ class Envs:
     # Pack independent 64-key QSA index groups into each decode CTA.
     # Zero selects the B200 row-count heuristic; a positive value forces it.
     SGLANG_QSA_MQA_GROUPS_PER_CTA = EnvInt(0)
+    # Keep greedy Qwen4 MTP logits vocab-parallel and all-gather only one
+    # (max, token-id) candidate per rank and row.
+    SGLANG_QWEN4_MTP_DISTRIBUTED_TOPK1 = EnvBool(False)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)

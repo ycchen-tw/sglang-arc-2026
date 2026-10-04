@@ -209,6 +209,11 @@ class LogitsProcessorOutput:
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
 
+    # Greedy MTP may keep logits vocab-parallel and perform an exact
+    # distributed argmax instead of gathering the full vocabulary.
+    next_token_logits_vocab_start: Optional[int] = None
+    next_token_logits_global_vocab_size: Optional[int] = None
+
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
     next_token_logprobs: Optional[torch.Tensor] = None

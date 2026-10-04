@@ -19,7 +19,7 @@ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP, _mtp_quant_config
 from sglang.srt.models.qwen4_exp import Qwen4ExpModel
-from sglang.srt.runtime_context import get_model, get_parallel
+from sglang.srt.runtime_context import get_model, get_parallel, get_spec
 from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
@@ -68,7 +68,36 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
             prefix=add_prefix("model.shared_head.head", prefix),
             use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
-        self.logits_processor = LogitsProcessor(config)
+        self._distributed_topk1 = envs.SGLANG_QWEN4_MTP_DISTRIBUTED_TOPK1.get()
+        if self._distributed_topk1:
+            spec = get_spec()
+            if (
+                spec.speculative_eagle_topk != 1
+                or spec.speculative_use_rejection_sampling
+            ):
+                raise ValueError(
+                    "Qwen4 distributed MTP top-1 requires eagle_topk=1 and "
+                    "rejection sampling disabled"
+                )
+            if self.lm_head.num_added_embeddings != 0:
+                raise ValueError("distributed MTP top-1 does not support added vocab")
+            if self.lm_head.num_embeddings_padded != config.vocab_size:
+                raise ValueError(
+                    "distributed MTP top-1 requires an unpadded vocabulary"
+                )
+            self._local_vocab_start = (
+                self.lm_head.shard_indices.padded_org_vocab_start_index
+            )
+            expected_start = (
+                get_parallel().tp_rank * self.lm_head.num_embeddings_per_partition
+            )
+            if self._local_vocab_start != expected_start:
+                raise ValueError("distributed MTP top-1 requires contiguous TP shards")
+        else:
+            self._local_vocab_start = None
+        self.logits_processor = LogitsProcessor(
+            config, skip_all_gather=self._distributed_topk1
+        )
 
     def _init_pre_fc_norms(self, config: PretrainedConfig) -> None:
         self.pre_fc_norm_embedding = GemmaRMSNorm(
@@ -221,6 +250,9 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         logits_output = self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
+        if self._distributed_topk1:
+            logits_output.next_token_logits_vocab_start = self._local_vocab_start
+            logits_output.next_token_logits_global_vocab_size = self.config.vocab_size
         self._set_hc_logits_hidden_states(
             logits_output, hc_hidden_states, forward_batch
         )

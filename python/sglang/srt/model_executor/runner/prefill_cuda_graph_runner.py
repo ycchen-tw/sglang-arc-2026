@@ -1885,6 +1885,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 if output.next_token_logits is not None
                 else None
             ),
+            next_token_logits_vocab_start=output.next_token_logits_vocab_start,
+            next_token_logits_global_vocab_size=(
+                output.next_token_logits_global_vocab_size
+            ),
             hidden_states=(
                 output.hidden_states[: self.raw_num_tokens]
                 if output.hidden_states is not None
