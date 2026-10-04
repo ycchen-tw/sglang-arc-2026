@@ -5121,6 +5121,32 @@ class Scheduler(
             success = False
         return success
 
+    def _qsa_hisparse_internal_state(self) -> dict:
+        """One attention-TP rank's CPU ledger; readers deduplicate by the DP leader."""
+        coord = self.hisparse_coordinator
+        snapshots = coord.snapshots
+        running = []
+        for req in self.running_batch.reqs:
+            if req.finished() or req.kv.req_pool_idx is None:
+                continue
+            running.append(dict(
+                rid=req.rid, req_pool_idx=req.kv.req_pool_idx,
+                input_tokens=len(req.origin_input_ids), committed_tokens=req.kv.kv_committed_len,
+            ))
+        host = coord.mem_pool_host
+        return dict(
+            dp_rank=self.ps.attn_dp_rank, attn_tp_rank=self.ps.attn_tp_rank,
+            logical_capacity_tokens=coord.layout.logical_tokens,
+            logical_available_tokens=self.token_to_kv_pool_allocator.logical_attn_allocator.available_size(),
+            host_used_tokens=(host.size - host.available_size()) * coord.layout.block_tokens,
+            mamba_available_slots=self.req_to_token_pool.mamba_allocator.available_size(),
+            snapshot_buffers_free=None if snapshots is None else len(snapshots.buffer_free),
+            snapshot_pending=0 if snapshots is None else len(snapshots.pending) + len(snapshots.unissued),
+            parked_records=(sum(rec.state == "PARKED" for rec in self.tree_cache.records)
+                            if coord.session_resume else 0),
+            running_requests=running,
+        )
+
     def get_internal_state(self, recv_req: GetInternalStateReq):
         # Resolved config (pristine server_args + post-publish overrides) so a
         # readback reflects values changed via /set_internal_state, not startup.
@@ -5146,6 +5172,15 @@ class Scheduler(
         )
         ret["startup_time"] = self.startup_time
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+
+        # h26: sparse capacity and committed residency, without a CUDA readback.
+        from sglang.srt.mem_cache.qsa_hisparse_distributed import distributed_hisparse_enabled
+        if (
+            self.enable_hisparse
+            and self.hisparse_coordinator is not None
+            and distributed_hisparse_enabled()
+        ):
+            ret["qsa_hisparse"] = self._qsa_hisparse_internal_state()
 
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
