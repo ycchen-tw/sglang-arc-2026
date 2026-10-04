@@ -1,4 +1,5 @@
 import contextlib
+import gc
 import logging
 import time
 from dataclasses import replace
@@ -143,6 +144,13 @@ _is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
 
+_NATIVE_QWEN_MTP_TYPES = frozenset(
+    {
+        ("Qwen3_5ForCausalLMMTP", "sglang.srt.models.qwen3_5_mtp"),
+        ("Qwen4ExpForCausalLMMTP", "sglang.srt.models.qwen4_exp_mtp"),
+    }
+)
+
 
 def _qsa_index_share_requested(hf_config) -> bool:
     """--json-model-override-args writes top-level hf_config attributes, while
@@ -225,6 +233,22 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         self.tree_mask_mode = default_tree_mask_mode()
 
+        # Bind the native-Qwen MTP embed/lm_head as early as safely possible.
+        #
+        # Both the target and the draft models are fully loaded at this point
+        # (TpModelWorker.__init__ -> ModelRunner.initialize -> load_model), and
+        # the target's embed/lm_head exist. Native Qwen MTP wrappers allocate
+        # BF16 skeleton embed_tokens/lm_head during construction; neither is
+        # checkpoint-backed (load_weights only processes mtp.* keys), so they
+        # are pure duplicates of the target's tensors. Releasing them here,
+        # before the scheduler allocates the target and draft memory pools,
+        # removes a multi-GiB transient residency peak during KV allocation.
+        #
+        # The result is consumed by alloc_memory_pool(), which skips the
+        # original post-pool init when the early bind ran. Token-mapped heads
+        # (hot_token_id) bail here and keep the original post-pool ordering.
+        self._early_mtp_alias_bound = self._bind_native_qwen_mtp_before_pool()
+
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
     def alloc_memory_pool(
@@ -236,13 +260,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         """Allocate draft KV cache pools (called by scheduler)."""
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        early_mtp_alias = getattr(self, "_early_mtp_alias_bound", False)
         self.draft_worker.alloc_memory_pool(
             memory_pool_config=memory_pool_config,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
-        self.init_token_map()
-        self.init_lm_head()
+        if not early_mtp_alias:
+            self.init_token_map()
+            self.init_lm_head()
 
         if get_spec().speculative_use_rejection_sampling:
             target_vocab_size = self.target_worker.model_config.vocab_size
@@ -304,6 +330,77 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.seed_dsa_topk_from_draft_extend = (
             self.index_share_for_mtp_iteration and self.dsa_seed_topk_width is not None
         )
+
+    def _bind_native_qwen_mtp_before_pool(self) -> bool:
+        """Bind native-Qwen MTP embed/lm_head to the target tensors.
+
+        Qwen3.5 and Qwen4-Exp MTP wrappers construct BF16 skeleton
+        ``model.embed_tokens.weight`` and ``lm_head.weight`` tensors during
+        draft-model construction. Neither is checkpoint-backed (``load_weights``
+        only processes ``mtp.*`` keys), so both are transient duplicates of the
+        target model's tensors. The existing ``init_lm_head()`` already deletes
+        them and rebinds the draft to the target via ``set_embed_and_head`` /
+        ``set_lm_head_from_target``; this method runs that existing logic at the
+        earliest safe point (right after both models finish loading, before the
+        scheduler allocates any memory pools).
+
+        The guard is intentionally narrow: only the known native Qwen MTP
+        class/module pairs take the early path. EAGLE3 / standalone / other
+        external-draft / token-mapped (hot-token) workers keep the original
+        post-pool ordering.
+
+        Returns True when the early bind ran; ``alloc_memory_pool()`` then skips
+        the later ``init_token_map()`` / ``init_lm_head()`` calls (idempotent).
+        """
+        draft_model = self.draft_runner.model
+        draft_type = (type(draft_model).__name__, type(draft_model).__module__)
+        if draft_type not in _NATIVE_QWEN_MTP_TYPES:
+            return False
+
+        self.init_token_map()
+        if self.hot_token_id is not None:
+            # Token-mapped heads clone/reorder the head; the early alias is not
+            # safe there. Fall back to the original post-pool ordering.
+            return False
+        self.init_lm_head()
+
+        target_model = self.target_worker.model_runner.model
+        target_embed = target_model.model.embed_tokens.weight
+        draft_embed = draft_model.model.embed_tokens.weight
+        target_head = target_model.lm_head
+        draft_head = draft_model.lm_head
+        same_embed_storage = (
+            target_embed.untyped_storage().data_ptr()
+            == draft_embed.untyped_storage().data_ptr()
+        )
+        same_head_storage = (
+            target_head.weight.untyped_storage().data_ptr()
+            == draft_head.weight.untyped_storage().data_ptr()
+        )
+        duplicate_bytes = 0
+        if not same_embed_storage:
+            duplicate_bytes += draft_embed.numel() * draft_embed.element_size()
+        if not same_head_storage:
+            duplicate_bytes += (
+                draft_head.weight.numel() * draft_head.weight.element_size()
+            )
+
+        logger.info(
+            "Native Qwen MTP: early-bound draft embed/lm_head to target "
+            "(embed_storage_shared=%s lm_head_storage_shared=%s "
+            "duplicate_bytes=%s)",
+            same_embed_storage,
+            same_head_storage,
+            duplicate_bytes,
+        )
+        assert same_embed_storage, "native Qwen MTP embedding alias failed"
+        assert draft_head is target_head, "native Qwen MTP lm_head alias failed"
+        assert duplicate_bytes == 0, "native Qwen MTP duplicate weights remain"
+
+        # Release the deleted Parameter objects now that the alias is confirmed.
+        gc.collect()
+        torch.cuda.empty_cache()
+        return True
 
     def init_token_map(self):
         # Load hot token ids
@@ -995,9 +1092,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 logits_output.next_token_logits,
                 None,
                 vocab_start_index=logits_output.next_token_logits_vocab_start,
-                global_vocab_size=(
-                    logits_output.next_token_logits_global_vocab_size
-                ),
+                global_vocab_size=(logits_output.next_token_logits_global_vocab_size),
             )
             probs = None
         else:
@@ -1167,9 +1262,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 ret_topk_index = torch.argmax(
                     draft_logits_output.next_token_logits, dim=-1, keepdim=True
                 )
-                ret_topk_p = torch.ones_like(
-                    ret_topk_index, dtype=torch.float32
-                )
+                ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
             ret_draft_probs = None
         else:
             probs = renorm_draft_probs(

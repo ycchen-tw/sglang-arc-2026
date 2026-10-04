@@ -104,6 +104,30 @@ def _resolve_eagle_aux_hidden_state(
             )
         )
     else:
+        # Native in-checkpoint MTP (e.g. Qwen3.5 / Qwen3.8 / Qwen4-Exp): the
+        # draft model is the same checkpoint and its KV layers are not covered
+        # by an explicit --speculative-draft-model-path, nor by
+        # ``num_nextn_predict_layers`` (which ModelConfig only synthesises for
+        # is_draft_model configs). The checkpoint declares the MTP layer count
+        # via ``mtp_num_hidden_layers`` on the text config; budget those draft
+        # layers in the target KV cell size so the draft KV pool allocation
+        # cannot overrun the static memory envelope. There is one native MTP
+        # hidden layer reused across every draft step, so do not multiply by
+        # speculative-num-steps.
+        mtp_num_hidden_layers = getattr(
+            model_config.hf_text_config, "mtp_num_hidden_layers", None
+        )
+        if mtp_num_hidden_layers is None or int(mtp_num_hidden_layers) <= 0:
+            return
+        config.eagle_draft_num_layers = int(mtp_num_hidden_layers)
+        logger.info(
+            "Native MTP draft KV accounting: mtp_num_hidden_layers=%s "
+            "from target text config (no external draft path).",
+            mtp_num_hidden_layers,
+        )
+        # The native MTP draft is a single dense block rebuilt from the target
+        # checkpoint; the target's SWA geometry and EAGLE3 aux-hidden config
+        # below describe the target, not this draft, so stop here.
         return
 
     if draft_model_config.is_hybrid_swa and not draft_model_config.is_deepseek_v4_arch:
