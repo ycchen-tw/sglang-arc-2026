@@ -250,6 +250,85 @@ class TestMambaStateScatterCorrectness(unittest.TestCase):
         torch.testing.assert_close(ssm_fused, ssm_ref)
         torch.testing.assert_close(conv_fused, conv_ref)
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for this test.")
+    def test_sparse_track_strided_matches_regular_and_graph(self):
+        if fused_mamba_state_scatter_with_mask is None:
+            self.skipTest(
+                f"fused_mamba_state_scatter_with_mask import failed: {_FUSED_IMPORT_ERROR}"
+            )
+
+        torch.manual_seed(9)
+        device = torch.device("cuda")
+        layers, batch, slots, steps, elems = 2, 8, 12, 4, 9 * 1024 + 17
+        src = torch.randn(
+            (layers, batch, steps, elems), device=device, dtype=torch.bfloat16
+        )
+        initial = torch.randn(
+            (layers, slots, elems), device=device, dtype=torch.bfloat16
+        )
+        dst_indices = torch.arange(batch, device=device, dtype=torch.int32)
+        step_indices = torch.full(
+            (batch,), -1, device=device, dtype=torch.int32
+        )
+        step_indices[0] = 2
+
+        expected = initial.clone()
+        fused_mamba_state_scatter_with_mask(
+            expected, src, dst_indices, step_indices
+        )
+        actual = initial.clone()
+        fused_mamba_state_scatter_with_mask(
+            actual, src, dst_indices, step_indices, max_ctas_per_entry=8
+        )
+        self.assertTrue(torch.equal(actual, expected))
+
+        # All rejected entries must be skipped without touching memory.
+        bounds_dst = dst_indices.clone()
+        bounds_steps = step_indices.clone()
+        bounds_dst[1:3] = torch.tensor([-1, slots], device=device)
+        bounds_steps[1:4] = torch.tensor([0, 0, steps], device=device)
+        expected = initial.clone()
+        fused_mamba_state_scatter_with_mask(
+            expected, src, bounds_dst, bounds_steps
+        )
+        actual = initial.clone()
+        fused_mamba_state_scatter_with_mask(
+            actual,
+            src,
+            bounds_dst,
+            bounds_steps,
+            max_ctas_per_entry=8,
+        )
+        self.assertTrue(torch.equal(actual, expected))
+
+        # The production caller runs under a captured decode graph.
+        graph_dst = initial.clone()
+        fused_mamba_state_scatter_with_mask(
+            graph_dst,
+            src,
+            dst_indices,
+            step_indices,
+            max_ctas_per_entry=8,
+        )
+        torch.cuda.synchronize()
+        graph_dst.copy_(initial)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            fused_mamba_state_scatter_with_mask(
+                graph_dst,
+                src,
+                dst_indices,
+                step_indices,
+                max_ctas_per_entry=8,
+            )
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = initial.clone()
+        fused_mamba_state_scatter_with_mask(
+            expected, src, dst_indices, step_indices
+        )
+        self.assertTrue(torch.equal(graph_dst, expected))
+
 
 def _make_envelope_views(device="cpu"):
     """Envelope-strided conv/temporal views, exactly as UnifiedMambaPool /
