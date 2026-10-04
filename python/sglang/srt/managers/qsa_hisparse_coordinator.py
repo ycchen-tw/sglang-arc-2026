@@ -1326,6 +1326,11 @@ def create_qsa_hisparse_coordinator(model_runner) -> QSAHiSparseCoordinator:
         _check_session_host_budget(
             pool, user, snapshot, model_runner.req_to_token_pool.mamba_pool
         )
+    elif snapshot is not None and snapshot.anchor:
+        raise ValueError(
+            "hisparse_config.qsa_session_anchor (h23) needs qsa_session_resume: "
+            "the anchors are session records' buffers"
+        )
     # M5 h16: a TARGET_VERIFY forward has K rows per request (the decode graph
     # runner captures TARGET_VERIFY with bs * K tokens), so the per-row buffers hold
     # K x the graph's max batch size.
@@ -1431,7 +1436,10 @@ def _snapshot_config(
     qsa_snapshot_interval (T) is set; K staging slots default to 8 and the host
     buffers to R + 16 (design §3.3, §5.3). Under speculative decoding a staging
     slot stays claimed until the CPU sees the step and its D2H ends, about two
-    steps: 16 by default (M5 design §7.2, §16 decision 2)."""
+    steps: 16 by default (M5 design §7.2, §16 decision 2). h23:
+    qsa_session_anchor (default off) keeps each record's resume point as a second
+    restore point; a record then holds up to two buffers, so the host buffer default
+    doubles to 2 (R + 16)."""
     keys = (
         "qsa_snapshot_interval",
         "qsa_snapshot_staging_slots",
@@ -1441,14 +1449,18 @@ def _snapshot_config(
         value = user.get(key)
         if key in user and (not isinstance(value, int) or isinstance(value, bool)):
             raise ValueError(f"hisparse_config.{key} must be an integer, got {value!r}")
+    anchor = user.get("qsa_session_anchor", False)
+    if not isinstance(anchor, bool):
+        raise ValueError(f"hisparse_config.qsa_session_anchor must be a bool, got {anchor!r}")
     if keys[0] not in user:
-        if any(key in user for key in keys[1:]):
-            raise ValueError(f"hisparse_config.{keys[1]} / {keys[2]} need {keys[0]}")
+        if any(key in user for key in keys[1:]) or anchor:
+            raise ValueError(f"hisparse_config.{keys[1]} / {keys[2]} / qsa_session_anchor need {keys[0]}")
         return None
     return QSAHiSparseSnapshotConfig(
         interval=user[keys[0]],
         staging_slots=user.get(keys[1], 16 if verify_tokens > 1 else 8),
-        host_buffers=user.get(keys[2], num_reqs + 16),
+        host_buffers=user.get(keys[2], (2 if anchor else 1) * (num_reqs + 16)),
+        anchor=anchor,
     )
 
 
@@ -1459,6 +1471,7 @@ class QSAHiSparseSnapshotConfig(NamedTuple):
     interval: int  # T: snapshot when a decode input position p is a positive multiple of T
     staging_slots: int  # K mamba slots reserved for the D2D, for good
     host_buffers: int  # pinned host buffers of one mamba slot each (S_max)
+    anchor: bool = False  # h23: records keep their resume point as a second buffer
 
 
 class SnapshotOwner(Protocol):
@@ -1534,6 +1547,7 @@ class QSAHiSparseSnapshots:
         if config.staging_slots < 1 or config.host_buffers < 1:
             raise ValueError(f"need >= 1 staging slot and host buffer, got {config}")
         self.interval = config.interval
+        self.anchor = config.anchor  # h23: read by the session cache
         self.pool = pool
         self.mamba = pool.mamba_pool
         self.device = pool.req_index_to_mamba_index_mapping.device
@@ -1614,12 +1628,13 @@ class QSAHiSparseSnapshots:
         self._destroyed = False
         logger.info(
             "QSA HiSparse GDN snapshots: T=%d, staging mamba slots %s, %d host buffers "
-            "x %d B = %.2f GB pinned",
+            "x %d B = %.2f GB pinned, resume anchors %s",
             self.interval,
             self.staging_slots,
             config.host_buffers,
             self.slot_nbytes,
             total / 1e9,
+            "on" if self.anchor else "off",
         )
 
     # ------------------------------------------------------------ owner side

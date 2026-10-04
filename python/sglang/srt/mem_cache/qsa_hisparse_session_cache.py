@@ -42,6 +42,20 @@ the request then resumes at P as usual. With images the record's ids are padded
 the comparison runs raw against raw; a replayed message may not touch an image, and
 the processor's ids, padded ids, later image offsets and M-RoPE positions move with
 it.
+
+Resume anchors (h23, hisparse_config.qsa_session_anchor; replaces the h10 prompt-tail
+track, design §3.8, §13): a record may hold a second GDN buffer, the anchor: the state
+after A tokens, where A is the P the request that parked it resumed from (0 < A < P).
+It is the buffer that request restored before its first extend, so it holds exactly
+the fp16 state that request's computation started from; no copy is made. While the
+request runs that buffer is protected: its decode snapshots go to the record's other
+buffer, and the first one to publish turns the old tip into the anchor. A next request
+whose tokens agree with the record on [0, A) but not on [0, P) (a `limit` mismatch:
+the client dropped the last generation and resent the prompt; or a `tokens` one past
+A) truncates the record to A (logical [A, P), host blocks [A/4, P/4) and the tip
+buffer go back) and resumes there instead of starting over. A shortage of buffers
+drops the LRU PARKED record's anchor before it evicts a record. Buffers stay per
+record, one owner each (no refcount, §2.6).
 """
 
 from __future__ import annotations
@@ -51,7 +65,7 @@ import logging
 import time
 from array import array
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import numpy as np
@@ -122,6 +136,8 @@ class SessionRecord:
     prompt_len: int = 0  # h14: the producer's prompt length (its generation starts here)
     raw: Optional[np.ndarray] = None  # h14: unpadded input + output ids when padding changed them
     raw_ok: bool = True  # h14: False when the unpadded ids cannot stand for the tokens (length differs)
+    abuf: Optional[int] = None  # h23: second GDN buffer, the state after `anchor` tokens
+    anchor: int = 0  # h23: A, 0 < A < P while PARKED
 
     @property
     def state(self) -> str:
@@ -140,8 +156,13 @@ class _ReqSession:
     second: bool = False  # another live request owns the session (R7)
     claim: Optional[SessionRecord] = None  # match result, until adopted
     record: Optional[SessionRecord] = None  # the record it pins (resumed or created)
-    first_buf: Optional[int] = None  # GDN buffer of a snapshot taken before the record exists (§11.4)
+    # GDN buffers of snapshots issued into buffers its record does not hold yet
+    # (before the record exists, §11.4, or a second buffer, h23); they join at publish
+    owned: List[int] = field(default_factory=list)
     logged: Optional[tuple] = None  # last match decision logged (admission retries match again)
+    # h23: the record buffer this admission resumed from (the state at its extend's
+    # start), kept for the next anchor: decode snapshots never write it
+    kept: Optional[int] = None
 
 
 class QSAHiSparseSessionCache(ChunkCache):
@@ -197,6 +218,7 @@ class QSAHiSparseSessionCache(ChunkCache):
         self.replay_end: Optional[int] = None
         self.replay_stop = np.empty(0, np.int64)  # <|im_end|> + the model's stop tokens
         self.replay_decode = None
+        self.anchor = coordinator.snapshots.anchor  # h23
         # R15: before 0030 the prefill context is packed whole per QSA layer, so a
         # prefill batch takes resumed prompts up to 2 C tokens (the first always).
         self.resume_context_cap = 2 * coordinator.req_to_token_pool.max_context_len
@@ -205,11 +227,12 @@ class QSAHiSparseSessionCache(ChunkCache):
         coordinator.set_snapshot_owner(self)
         logger.info(
             "QSA HiSparse session cache: snapshot T=%d, idle timeout %.0f s, "
-            "resumed context cap %d tokens per prefill batch, output-id replay %s",
+            "resumed context cap %d tokens per prefill batch, output-id replay %s, resume anchors %s",
             coordinator.snapshots.interval,
             self.idle_timeout,
             self.resume_context_cap,
             "on" if self.replay else "off",
+            "on" if self.anchor else "off",
         )
 
     def reset_state(self) -> None:
@@ -592,12 +615,14 @@ class QSAHiSparseSessionCache(ChunkCache):
         rec = self.index.get(st.sid)
         if rec is None:
             return self._miss()
-        why = self._mismatch(rec, params, req, st)
-        if why is not None:
-            self.stats[f"mismatch_{why}"] += 1
+        action = self._decide(rec, params, req, st)
+        if action == "release":
             self.stats["mismatch_release"] += 1
             self._release_record(rec)
             return self._miss()
+        if action == "truncate":
+            self.stats["truncate"] += 1
+            self._truncate(rec)
         st.claim = rec
         req.hisparse_resume = rec  # h07 adopt_host_prefix reads .host_blocks
         req.kv.mamba_host_restore = rec.gdn  # h08 deferred H2D before the first extend
@@ -609,10 +634,12 @@ class QSAHiSparseSessionCache(ChunkCache):
             cache_protected_len=rec.P,
         )
 
-    def _mismatch(
+    def _decide(
         self, rec: SessionRecord, params: MatchPrefixParams, req: "Req", st: _ReqSession
-    ) -> Optional[str]:
-        """Why the owner's record cannot be resumed (None: it can); logs (P, LCP, committed)."""
+    ) -> str:
+        """resume (the key agrees on [0, P)), truncate (h23: it agrees on [0, A) of
+        the record's anchor only) or release; logs (P, LCP, committed) and, for a
+        tokens / limit mismatch, one QSA_MISMATCH line with both sides around the LCP."""
         if rec.state != "PARKED" or rec.gen != req.session_generation:
             raise RuntimeError(
                 f"{req.rid}: the owner's record of {rec.sid} is {rec.state}, generation "
@@ -622,13 +649,23 @@ class QSAHiSparseSessionCache(ChunkCache):
         if key.is_bigram:
             raise NotImplementedError(f"{BACKEND_NAME} matches raw token keys only")
         full = _i64(key.token_ids)
+        limit = len(key)  # honours the limit: input_len - 1 or logprob_start_len
+        lcp = _lcp(full, rec.tokens)
         why = None
         if rec.extra_key != key.extra_key or rec.cache_salt != key.cache_salt:
             why = "extra_key"
-        elif rec.P > len(key):  # len honours the limit: input_len - 1 or logprob_start_len
+        elif rec.P > limit:
             why = "limit"
-        elif not np.array_equal(full[: rec.P], rec.tokens[: rec.P]):
+        elif lcp < rec.P:
             why = "tokens"
+        action = "resume"
+        if why is not None:
+            self.stats[f"mismatch_{why}"] += 1
+            usable = min(lcp, limit)
+            if why != "extra_key" and rec.abuf is not None and rec.anchor <= usable:
+                action = "truncate"
+            else:
+                action = "release"
         decision = (id(rec), rec.P, why)
         if st.logged != decision:  # a request waiting for admission matches every round
             st.logged = decision
@@ -636,11 +673,11 @@ class QSAHiSparseSessionCache(ChunkCache):
             logger.info(
                 "QSA session %s: %s at P=%d, LCP=%d, committed=%d, key %d/%d tokens",
                 rec.sid,
-                "resume" if why is None else f"mismatch ({why})",
+                "resume" if why is None else f"mismatch ({why}), {action}",
                 rec.P,
                 lcp,
                 rec.committed,
-                len(key),
+                limit,
                 len(full),
             )
             if why in ("limit", "tokens"):  # h14 diagnostic: both sides around the LCP
@@ -652,10 +689,12 @@ class QSAHiSparseSessionCache(ChunkCache):
                             "sid": rec.sid,
                             "rid": req.rid,
                             "why": why,
+                            "action": action,
                             "P": rec.P,
+                            "anchor": rec.anchor,
                             "prev_prompt": rec.prompt_len,
                             "lcp": lcp,
-                            "key_len": len(key),
+                            "key_len": limit,
                             "full_len": len(full),
                             "rec_len": len(rec.tokens),
                             "start": start,
@@ -665,7 +704,21 @@ class QSAHiSparseSessionCache(ChunkCache):
                         separators=(",", ":"),
                     ),
                 )
-        return why
+        return action
+
+    def _truncate(self, rec: SessionRecord) -> None:
+        """h23: cut a PARKED record back to its anchor A: logical [A, P), host blocks
+        [A/4, P/4) and the tip buffer go back; the anchor buffer becomes the tip."""
+        a, bt = rec.anchor, self.block_tokens
+        if rec.state != "PARKED" or rec.abuf is None or not 0 < a < rec.P or a % self.page_size:
+            raise RuntimeError(f"truncate of the {rec.state} record of {rec.sid}: P={rec.P}, anchor {a}")
+        self.token_to_kv_pool_allocator.free(rec.logical[a:])
+        self.coord.mem_pool_host.free(rec.host_blocks[a // bt :])
+        self.coord.snapshots.free_buffer(rec.gdn)
+        rec.logical = rec.logical[:a].clone()
+        rec.host_blocks = rec.host_blocks[: a // bt].clone()
+        rec.P, rec.gdn, rec.abuf, rec.anchor = a, rec.abuf, None, 0
+        self.ledger_version += 1
 
     def inc_lock_ref(self, node: Any) -> IncLockRefResult:
         """PrefillAdder: the temporary lock around the admission check, then the
@@ -719,41 +772,72 @@ class QSAHiSparseSessionCache(ChunkCache):
             st.record, st.claim = req.hisparse_resume, None
             req.hisparse_resume = None
             self.stats["resume"] += 1
+            if self.anchor:  # h23: the restored buffer is the next anchor
+                st.kept = st.record.gdn
 
     # ------------------------------------------------------------ snapshots (h08 SnapshotOwner)
 
-    def snapshot_buffer(self, req: "Req", p: int) -> Optional[int]:
-        """The GDN buffer req's snapshot at p goes to, or None to skip (design §3.2)."""
+    def _snapshot_owner(self, req: "Req") -> Optional[_ReqSession]:
+        """The request's session state if it may snapshot now, else None."""
         st = self._reqs.get(req.rid)
         if st is None:
             return None  # not a session request
         if st.req is not req:
             raise RuntimeError(f"{req.rid}: snapshot for a request the cache does not track")
         if st.second or self._stale(st):
-            self.stats["snap_ineligible"] += 1
             return None
         if self.owner.get(st.sid) is not req:
             raise RuntimeError(f"{req.rid}: snapshot by a request that does not own {st.sid}")
-        if st.record is not None:
-            return st.record.gdn
-        if st.first_buf is None:
-            st.first_buf = self._alloc_gdn()
-            if st.first_buf is None:
-                self.stats["skip_gdn"] += 1
-        return st.first_buf  # busy until published: h08 skips (§11.8)
+        return st
+
+    def snapshot_buffer(self, req: "Req", p: int) -> Optional[int]:
+        """The GDN buffer req's decode snapshot at p goes to, or None to skip (design
+        §3.2). h23: never the buffer the request resumed from (the next anchor)."""
+        st = self._snapshot_owner(req)
+        if st is None:
+            if req.rid in self._reqs:
+                self.stats["snap_ineligible"] += 1
+            return None
+        rec = st.record
+        if rec is not None and p <= rec.P:
+            raise RuntimeError(f"{req.rid}: snapshot at p={p}, at or below its record's P={rec.P}")
+        if rec is not None:
+            if rec.gdn != st.kept:
+                return rec.gdn  # in place (h09)
+            if rec.abuf is not None:
+                return rec.abuf  # the tip is kept: the other buffer (an older anchor) takes it
+        if st.owned:
+            return st.owned[-1]  # busy until published: h08 skips (§11.8)
+        buf = self._alloc_gdn()
+        if buf is None:
+            self.stats["skip_gdn"] += 1
+            return None
+        st.owned.append(buf)
+        return buf
 
     def _alloc_gdn(self) -> Optional[int]:
+        """A free GDN buffer; else the LRU PARKED record's anchor (h23); else the LRU
+        PARKED record goes (h09)."""
         snaps = self.coord.snapshots
         buf = snaps.alloc_buffer()
-        if buf is None:
-            victims = sorted(self._evict_candidates(), key=lambda r: r.last_used)
-            if not victims:
-                return None
+        if buf is not None:
+            return buf
+        parked = sorted(self._evict_candidates(), key=lambda r: r.last_used)
+        anchored = [r for r in parked if r.abuf is not None]
+        if anchored:
+            victim = anchored[0]
+            self.stats["drop_anchor"] += 1
+            snaps.free_buffer(victim.abuf)
+            victim.abuf, victim.anchor = None, 0
+            self.ledger_version += 1
+        elif parked:
             self.stats["evict_for_gdn"] += 1
-            self._release_record(victims[0])
-            buf = snaps.alloc_buffer()
-            if buf is None:
-                raise RuntimeError("released a record but no GDN buffer came back")
+            self._release_record(parked[0])
+        else:
+            return None
+        buf = snaps.alloc_buffer()
+        if buf is None:
+            raise RuntimeError("freed a GDN buffer but none came back")
         return buf
 
     def on_snapshot_published(self, req: "Req", p: int, buf: int) -> None:
@@ -762,10 +846,11 @@ class QSAHiSparseSessionCache(ChunkCache):
         st = self._reqs[req.rid]
         if st.req is not req or p % self.page_size:
             raise RuntimeError(f"{req.rid}: published p={p} is not a page multiple, or not tracked")
-        if st.record is None:
-            if buf != st.first_buf:
-                raise RuntimeError(f"{req.rid}: first snapshot into buffer {buf}, allocated {st.first_buf}")
-            st.first_buf = None
+        rec = st.record
+        if rec is None:
+            if buf not in st.owned:
+                raise RuntimeError(f"{req.rid}: first snapshot into buffer {buf}, owned {st.owned}")
+            st.owned.remove(buf)
             if self._stale(st):  # closed between issue and publish: no record (§11.4)
                 self.stats["first_snap_stale"] += 1
                 self.coord.snapshots.free_buffer(buf)
@@ -790,11 +875,27 @@ class QSAHiSparseSessionCache(ChunkCache):
             st.record = rec
             self.stats["record_created"] += 1
         else:
-            rec = st.record
-            if rec.pin_req is not req or rec.gdn != buf or p <= rec.P:
+            if rec.pin_req is not req or p <= rec.P:
                 raise RuntimeError(
                     f"{req.rid}: publish p={p} into buffer {buf}; record P={rec.P}, "
-                    f"buffer {rec.gdn}, pinned by {rec.pin_req.rid if rec.pin_req else None}"
+                    f"pinned by {rec.pin_req.rid if rec.pin_req else None}"
+                )
+            if buf == rec.gdn:
+                pass  # in place: the tip moves on
+            elif buf == rec.abuf or buf in st.owned:
+                # h23: the kept tip (at P, the resume point) becomes the anchor
+                if rec.gdn != st.kept:
+                    raise RuntimeError(f"{req.rid}: publish into {buf} beside a tip {rec.gdn} it does not keep")
+                if buf in st.owned:
+                    if rec.abuf is not None:
+                        raise RuntimeError(f"{req.rid}: a third GDN buffer for the record of {rec.sid}")
+                    st.owned.remove(buf)
+                rec.abuf, rec.anchor, rec.gdn = rec.gdn, rec.P, buf
+                self.stats["anchor_set"] += 1
+            else:
+                raise RuntimeError(
+                    f"{req.rid}: publish into buffer {buf}, the record of {rec.sid} holds "
+                    f"{rec.gdn} / {rec.abuf}"
                 )
             rec.P, rec.committed = p, req.kv.kv_committed_len
         req.kv.cache_protected_len = p  # incremental commit of [P_old, p) to the record
@@ -812,9 +913,9 @@ class QSAHiSparseSessionCache(ChunkCache):
         coord = self.coord
         coord.release_snapshots(req)
         st = self._reqs.get(req.rid)
-        if st is not None and (st.req is not req or st.claim is not None or st.first_buf is not None):
+        if st is not None and (st.req is not req or st.claim is not None or st.owned):
             raise RuntimeError(
-                f"{req.rid}: exit with a claim not adopted or an unpublished first snapshot"
+                f"{req.rid}: exit with a claim not adopted or an unpublished snapshot buffer"
             )
         rec = None if st is None else st.record
         keep = 0 if rec is None else rec.P
@@ -836,6 +937,10 @@ class QSAHiSparseSessionCache(ChunkCache):
                 rec.raw, rec.raw_ok = np.concatenate((_i64(unpadded), _i64(req.output_ids))), True
             else:  # e.g. --allow-auto-truncate cut the padded ids: no raw view, no replay
                 rec.raw, rec.raw_ok = None, False
+            if rec.abuf is not None and not 0 < rec.anchor < rec.P:
+                raise RuntimeError(f"{req.rid}: parks the record of {rec.sid} with anchor {rec.anchor}, P={rec.P}")
+        if st is not None:  # h23: a retracted request resumes (and keeps) again
+            st.kept = None
         super().cache_finished_req(req, is_insert, kv_len_to_handle=kv_len_to_handle)
         coord.release_host_row(r, keep // self.block_tokens)
         if rec is not None:
@@ -933,6 +1038,8 @@ class QSAHiSparseSessionCache(ChunkCache):
         self.token_to_kv_pool_allocator.free(rec.logical)
         self.coord.mem_pool_host.free(rec.host_blocks)
         self.coord.snapshots.free_buffer(rec.gdn)
+        if rec.abuf is not None:
+            self.coord.snapshots.free_buffer(rec.abuf)
         rec.released = True
         self.records.remove(rec)
         if self.index.get(rec.sid) is rec:
@@ -952,8 +1059,10 @@ class QSAHiSparseSessionCache(ChunkCache):
                 problems.append(f"record of {rec.sid} is {rec.state}, indexed {self.index.get(rec.sid) is rec}")
             elif rec.P % self.page_size or rec.P > rec.committed or rec.logical.numel() != rec.P or (
                 rec.host_blocks.numel() * self.block_tokens != rec.P
-            ):
-                problems.append(f"record of {rec.sid}: P={rec.P}, committed {rec.committed}")
+            ) or (rec.abuf is not None and (not 0 < rec.anchor < rec.P or rec.anchor % self.page_size)):
+                problems.append(
+                    f"record of {rec.sid}: P={rec.P}, committed {rec.committed}, anchor {rec.anchor}"
+                )
         if len(self.index) != len(self.records):
             problems.append(f"{len(self.index)} indexed of {len(self.records)} records")
         if problems:
@@ -962,11 +1071,13 @@ class QSAHiSparseSessionCache(ChunkCache):
         self.coord.check_idle_invariants(
             parked_logical=torch.cat([r.logical for r in parked]) if parked else None,
             parked_host=torch.cat([r.host_blocks for r in parked]) if parked else None,
-            parked_gdn=[r.gdn for r in parked],
+            parked_gdn=[r.gdn for r in parked] + [r.abuf for r in parked if r.abuf is not None],
         )
         logger.info(
-            "QSA HiSparse session cache idle: %d parked records, %d tokens; stats %s; snapshots %s",
+            "QSA HiSparse session cache idle: %d parked records (%d with an anchor), %d tokens; "
+            "stats %s; snapshots %s",
             len(parked),
+            sum(r.abuf is not None for r in parked),
             self.evictable_size(),
             dict(sorted(self.stats.items())),
             dict(sorted(self.coord.snapshots.stats.items())),
