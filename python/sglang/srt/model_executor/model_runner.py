@@ -1319,6 +1319,70 @@ class ModelRunner:
                 is_ep_joiner=get_exec().moe.is_ep_joiner,
             )
 
+        self._arc_drop_checkpoint_pages_after_load()
+
+    def _arc_drop_checkpoint_pages_after_load(self):
+        # arc-forge h30: startup only, after complete PLE/Marlin load and before KV admission.
+        import hashlib
+        import json
+        import os
+        from pathlib import Path
+
+        if os.environ.get("ARC_HISPARSE_STARTUP_CACHE_DROP") != "1":
+            return
+        group = self.tp_group.cpu_group
+        if dist.get_backend(group) != "gloo":
+            raise RuntimeError("h30 checkpoint cache drop requires the TP CPU/Gloo group")
+        rank = dist.get_rank()
+        ranks = dist.get_process_group_ranks(group)
+        model_root = str(Path(self.model_config.model_path).resolve())
+        ready = {"rank": rank, "model_root": model_root,
+                 "load_complete": self.startup_weight_load is None and not self.is_draft_worker}
+        loaded = [None] * dist.get_world_size(group)
+        dist.all_gather_object(loaded, ready, group=group)
+        valid = (ranks == [0, 1, 2, 3] and sorted(row["rank"] for row in loaded) == ranks
+                 and all(row["load_complete"] and row["model_root"] == model_root for row in loaded))
+        if not valid:
+            raise RuntimeError("h30 requires all global TP4 target ranks fully loaded from one local checkpoint")
+
+        outcome = None
+        if rank == 0:
+            try:
+                from arcforge.checkpoint_prefetch import drop_checkpoint_pages
+
+                raw = (Path(model_root) / "verified_identity.json").read_bytes()
+                identity = json.loads(raw)
+                result = drop_checkpoint_pages(Path(model_root), identity)
+                # Keep the broadcast and log contract plain JSON, including an advisory-only result.
+                outcome = json.loads(json.dumps({"status": "advised", "result": result,
+                    "identity_sha256": hashlib.sha256(raw).hexdigest()}))
+            except BaseException as error:
+                outcome = {"status": "failed", "error": f"{type(error).__name__}: {error}"}
+        shared = [outcome]
+        dist.broadcast_object_list(shared, src=0, group=group)
+        outcome = shared[0]
+        error = None
+        try:
+            if outcome["status"] != "advised":
+                raise RuntimeError(outcome["error"])
+            result = outcome["result"]
+            if not (result["operation"] == "POSIX_FADV_DONTNEED" and result["advisory_only"] is True
+                    and result["files_advised"] == 20 and result["reclaimed_bytes"] is None):
+                raise RuntimeError("h30 helper did not publish exact20-shard advisory-only completion")
+        except BaseException as failure:
+            error = f"{type(failure).__name__}: {failure}"
+        acknowledgements = [None] * len(ranks)
+        dist.all_gather_object(acknowledgements, {"rank": rank, "error": error}, group=group)
+        errors = [row["error"] for row in acknowledgements if row["error"] is not None]
+        receipt = {"stage": "after-all-weight-loads-before-kv-admission", "global_rank": rank,
+                   "cpu_group_ranks": ranks, "leader_global_rank": 0,
+                   "status": "failed" if errors else "advised", "outcome": outcome,
+                   "all_ranks_acknowledged": True}
+        print("ARC_HISPARSE_STARTUP_CACHE_DROP=" + json.dumps(receipt, sort_keys=True), flush=True)
+        if errors:
+            raise RuntimeError("h30 checkpoint cache advice failed on all ranks: " + errors[0])
+
+
     def start_startup_weight_load(self) -> None:
         assert self.startup_weight_load is not None
         self.startup_weight_load.start_prefetch()
