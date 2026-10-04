@@ -242,6 +242,10 @@ class _PoolSizes(msgspec.Struct, frozen=True, kw_only=True):
     c4_state_dtype: Optional[torch.dtype]
     c128_state_dtype: Optional[torch.dtype]
     unified_total_bytes: Optional[int] = None
+    # QSA HiSparse device geometry (arc-forge h05); None unless --enable-hisparse on QSA.
+    hisparse_hot_blocks: Optional[int] = None
+    hisparse_prefill_tokens: Optional[int] = None
+    hisparse_device_tokens: Optional[int] = None
 
 
 @dataclass(slots=True, kw_only=True)
@@ -431,6 +435,9 @@ class KVCacheConfigurator:
             c4_state_dtype=c4_state_dtype,
             c128_state_dtype=c128_state_dtype,
             unified_total_bytes=config.unified_total_bytes,
+            hisparse_hot_blocks=config.hisparse_hot_blocks,
+            hisparse_prefill_tokens=config.hisparse_prefill_tokens,
+            hisparse_device_tokens=config.hisparse_device_tokens,
         )
 
     def _init_pools(
@@ -1289,6 +1296,7 @@ class KVCacheConfigurator:
                     max_total_num_tokens=sizes.max_total_num_tokens,
                     req_to_token_pool=req_to_token_pool,
                     mha_pool_class=mha_pool_class,
+                    sizes=sizes,
                 )
             else:
                 quant_method = self._build_mha_quant_method(
@@ -1830,6 +1838,7 @@ class KVCacheConfigurator:
         max_total_num_tokens: int,
         req_to_token_pool: ReqToTokenPool,
         mha_pool_class: type,
+        sizes: _PoolSizes,
     ) -> KVCache:
         full_attention_layer_ids = (
             [0]
@@ -1905,9 +1914,28 @@ class KVCacheConfigurator:
                 qsa_token_topk=qsa_profile.budget,
                 num_request_slots=req_to_token_pool.req_to_token.shape[0],
             )
+        size_args = {"size": max_total_num_tokens}
+        qsa_hisparse = get_memory().enable_hisparse
+        if qsa_hisparse:
+            # arc-forge QSA HiSparse (h05): device rows = prefill area + hot slabs;
+            # the scheduler-facing capacity stays logical.
+            from sglang.srt.mem_cache.qsa_hisparse_pool import (
+                HiSparseQSATokenToKVPool,
+            )
+
+            if qsa_profile is None or self.is_draft_worker:
+                raise NotImplementedError(
+                    "--enable-hisparse on a hybrid linear-attention model needs QSA (no draft)"
+                )
+            pool_class = HiSparseQSATokenToKVPool
+            size_args = {
+                "logical_size": max_total_num_tokens,
+                "prefill_tokens": sizes.hisparse_prefill_tokens,
+                "hot_blocks": sizes.hisparse_hot_blocks,
+            }
         token_to_kv_pool = pool_class(
             page_size=self.pool_page_size,
-            size=max_total_num_tokens,
+            **size_args,
             dtype=self.kv_cache_dtype,
             head_num=self.model_config.get_num_kv_heads(
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size
@@ -1925,6 +1953,13 @@ class KVCacheConfigurator:
             post_capture_active=self.post_capture_kv_active and quant_method is None,
             **extra_args,
         )
+        if qsa_hisparse and (
+            token_to_kv_pool.layout.device_tokens != sizes.hisparse_device_tokens
+        ):
+            raise RuntimeError(
+                f"QSA HiSparse pool has {token_to_kv_pool.layout.device_tokens} device rows, "
+                f"sizing planned {sizes.hisparse_device_tokens}"
+            )
         return token_to_kv_pool
 
     def _build_mha_fp4_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
@@ -2065,7 +2100,27 @@ class KVCacheConfigurator:
                         req_to_token_pool=req_to_token_pool,
                     )
                 else:
+                    qsa_hisparse = False
                     if get_memory().enable_hisparse:
+                        from sglang.srt.mem_cache.qsa_hisparse_pool import (
+                            HiSparseQSATokenToKVPool,
+                            QSAHiSparseTokenToKVPoolAllocator,
+                        )
+
+                        qsa_hisparse = isinstance(
+                            token_to_kv_pool, HiSparseQSATokenToKVPool
+                        )
+                    if qsa_hisparse:
+                        # arc-forge QSA HiSparse (h05): logical + prefill-area allocator.
+                        token_to_kv_pool_allocator = QSAHiSparseTokenToKVPoolAllocator(
+                            sizes.max_total_num_tokens,
+                            page_size=get_schedule().page_size,
+                            dtype=self.kv_cache_dtype,
+                            device=self.device,
+                            kvcache=token_to_kv_pool,
+                            need_sort=need_sort,
+                        )
+                    elif get_memory().enable_hisparse:
                         from sglang.srt.mem_cache.sparsity import (
                             parse_hisparse_config,
                         )

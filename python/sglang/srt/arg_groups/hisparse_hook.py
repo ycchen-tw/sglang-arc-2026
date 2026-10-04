@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from sglang.srt.arg_groups.overrides import (
@@ -89,6 +92,11 @@ def validate_hisparse(server_args: ServerArgs) -> None:
     )
 
     hf_config = model_config_of(server_args).hf_config
+    from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+
+    if is_qwen_qsa(hf_config):
+        validate_qsa_hisparse(server_args)
+        return
     is_v4_hisparse = is_deepseek_v4(hf_config)
     is_hip = get_platform().is_hip
     assert is_deepseek_dsa(hf_config) or is_v4_hisparse, (
@@ -133,3 +141,78 @@ def validate_hisparse(server_args: ServerArgs) -> None:
         ("dsa_decode_backend", "decode"),
     ]:
         validate_hisparse_dsa_backend(server_args, attr, label)
+
+
+# ---------------------------------------------------------------------------
+# arc-forge QSA HiSparse (h05, M1a design §7): the one supported shape, then a
+# source manifest check. SOURCE_SHA256 lists `<sha256>  <path>` lines (paths
+# relative to the sglang package) for every installed file the QSA HiSparse
+# path uses; the JIT kernels compile from the installed .cuh files, so a stale
+# or partially patched tree must not start.
+# ---------------------------------------------------------------------------
+QSA_HISPARSE_MANIFEST_ENV = "ARC_HISPARSE_QSA_MANIFEST"
+
+
+def validate_qsa_hisparse(server_args: ServerArgs) -> None:
+    from sglang.srt.arg_groups.model_override_base import mamba_extra_buffer_of
+    from sglang.srt.environ import envs
+
+    view = resolved_view(server_args)
+    need = {
+        "--tp-size 1": view.tp_size == 1,
+        "--pp-size 1": view.pp_size == 1,
+        "--dp-size 1 and no DP attention": view.dp_size == 1
+        and not view.enable_dp_attention,
+        "no context parallelism (--dcp-size / --attn-cp-size 1)": view.dcp_size == 1
+        and view.attn_cp_size == 1,
+        "--disable-radix-cache": bool(view.disable_radix_cache),
+        "no --enable-session-radix-cache": not view.enable_session_radix_cache,
+        "no speculative decoding": view.speculative_algorithm is None,
+        "no ReplaySSM (--enable-linear-replayssm[-spec])": not view.enable_linear_replayssm
+        and not view.enable_linear_replayssm_spec,
+        "no mamba extra buffer": not mamba_extra_buffer_of(view),
+        "no --enable-mixed-chunk": not view.enable_mixed_chunk,
+        "--max-running-requests set": view.max_running_requests is not None,
+        "--kv-cache-dtype fp8_e4m3 (M1a)": view.kv_cache_dtype == "fp8_e4m3",
+        "no PD disaggregation": view.disaggregation_mode == "null",
+        "no hierarchical cache": not view.enable_hierarchical_cache,
+        "no unified memory pool": not view.enable_unified_memory,
+        "no page-major KV layout": not view.enable_page_major_kv_layout,
+        "no post-capture KV sizing": not envs.SGLANG_ENABLE_POST_CAPTURE_KV_SIZING.get(),
+    }
+    missing = [what for what, ok in need.items() if not ok]
+    if missing:
+        raise ValueError(
+            "--enable-hisparse on a QSA model (M1a) requires: " + "; ".join(missing)
+        )
+    tree = verify_qsa_hisparse_manifest()
+    # warning: resolution runs before the server configures log levels
+    logger.warning("ARC_HISPARSE_QSA_TREE=%s", tree)
+
+
+def verify_qsa_hisparse_manifest() -> str:
+    """Re-hash the files ARC_HISPARSE_QSA_MANIFEST lists; return sha256 of the manifest text."""
+    import sglang
+
+    path = os.environ.get(QSA_HISPARSE_MANIFEST_ENV)
+    if not path:
+        raise ValueError(
+            f"--enable-hisparse on a QSA model requires {QSA_HISPARSE_MANIFEST_ENV}=<SOURCE_SHA256>"
+        )
+    text = Path(path).read_text()
+    root = Path(sglang.__file__).resolve().parent
+    bad = []
+    for n, line in enumerate(text.splitlines(), 1):
+        digest, sep, rel = line.partition("  ")
+        if not sep or len(digest) != 64 or not rel:
+            raise ValueError(f"{path}:{n} is not '<sha256>  <path>': {line!r}")
+        target = root / rel
+        if not target.is_file():
+            bad.append(f"missing  {rel}")
+        elif hashlib.sha256(target.read_bytes()).hexdigest() != digest:
+            bad.append(f"changed  {rel}")
+    if bad:
+        raise RuntimeError(
+            f"installed sglang at {root} does not match {path}:\n" + "\n".join(bad)
+        )
+    return hashlib.sha256(text.encode()).hexdigest()

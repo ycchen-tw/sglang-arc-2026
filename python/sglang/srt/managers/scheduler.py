@@ -1268,6 +1268,31 @@ class Scheduler(
         # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture.
         self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
         self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+        from sglang.srt.managers.qsa_hisparse_coordinator import (
+            QSAHiSparseCoordinator,
+        )
+
+        self._qsa_hisparse = isinstance(
+            self.hisparse_coordinator, QSAHiSparseCoordinator
+        )
+        if self._qsa_hisparse:
+            from sglang.srt.mem_cache.qsa_hisparse_pool import (
+                QSAHiSparseTokenToKVPoolAllocator,
+            )
+
+            # h06 admission keys on isinstance(allocator, QSAHiSparse...Allocator):
+            # a wrapper here would silently bring back the min() budget.
+            allocator = self.token_to_kv_pool_allocator
+            if (
+                type(allocator) is not QSAHiSparseTokenToKVPoolAllocator
+                or allocator is not self.hisparse_coordinator.token_to_kv_pool_allocator
+            ):
+                raise RuntimeError(
+                    "QSA HiSparse needs the scheduler to hold the coordinator's "
+                    f"QSAHiSparseTokenToKVPoolAllocator itself, got {type(allocator).__name__}"
+                )
+        # forward_ct at the last idle check (R3 runs once per idle period).
+        self._hisparse_idle_checked_ct = -1
 
     def init_running_status(self):
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
@@ -3538,7 +3563,12 @@ class Scheduler(
 
         if batch.return_logprob:
             batch.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
-            batch.token_ids_logprobs = [list(r.origin_input_ids) for r in reqs]
+            # arc-forge h05 (R1): the requested ids, as prepare_for_extend sets
+            # them; the prompt ids made every step return logprobs for the whole prompt.
+            batch.token_ids_logprobs = [r.logprob.token_ids_logprob for r in reqs]
+        # arc-forge h05 (R1): MRoPE decode positions read the per-request
+        # multimodal inputs (None for text), and merge_batch concatenates them.
+        batch.multimodal_inputs = [r.multimodal_inputs for r in reqs]
 
         batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
             batch, self.model_config.vocab_size
@@ -4776,6 +4806,20 @@ class Scheduler(
                         "pool-bytes", "\n".join(byte_violations)
                     )
 
+            # QSA HiSparse (arc-forge h05, R3): the pool counters above are
+            # skipped for hisparse; check pools and tables once per idle period,
+            # i.e. once after any forward since the last check.
+            if (
+                self.enable_hisparse
+                and self._qsa_hisparse
+                and self._hisparse_idle_checked_ct != self.forward_ct
+            ):
+                self.hisparse_coordinator.check_idle_invariants()
+                self._hisparse_idle_checked_ct = self.forward_ct
+                logger.info(
+                    "QSA HiSparse idle invariants hold (forward %d)", self.forward_ct
+                )
+
             # tree cache sanity check
             self.invariant_checker._check_tree_cache()
 
@@ -5368,6 +5412,22 @@ class Scheduler(
                     )
                 else:
                     req.to_finish = FINISH_ABORT()
+
+        # HiSparse staging requests sit in no batch (arc-forge h05, R2): mark
+        # them like method 3; they finish on their first decode step.
+        if self.hisparse_coordinator is not None:
+            for act in self.hisparse_coordinator.ack_staging_queue:
+                req = act.req
+                if not req.finished() and (
+                    recv_req.abort_all or req.rid.startswith(recv_req.rid)
+                ):
+                    logger.debug(f"Abort staging request. {req.rid=}")
+                    if recv_req.abort_message:
+                        req.to_finish = FINISH_ABORT(
+                            recv_req.abort_message, HTTPStatus.SERVICE_UNAVAILABLE
+                        )
+                    else:
+                        req.to_finish = FINISH_ABORT()
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()

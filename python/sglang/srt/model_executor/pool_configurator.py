@@ -88,6 +88,14 @@ class MemoryPoolConfig:
     # caps. None on the token-capped path -- a user token cap IS the budget.
     unified_total_bytes: Optional[int] = None
 
+    # QSA HiSparse (arc-forge h05): the profiled KV budget, carried from
+    # calculate_pool_sizes to finalize_with_max_running_requests, and the device
+    # geometry solved there once R is final (design §5.2).
+    hisparse_budget_bytes: Optional[int] = None
+    hisparse_hot_blocks: Optional[int] = None
+    hisparse_prefill_tokens: Optional[int] = None
+    hisparse_device_tokens: Optional[int] = None
+
     def __post_init__(self):
         if self.max_total_num_tokens <= 0:
             msg = "Not enough memory. Please try to increase --mem-fraction-static."
@@ -1349,6 +1357,119 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         return self._to_config(sizes)
 
 
+class QSAHiSparsePoolConfigurator(DefaultPoolConfigurator):
+    """QSA HiSparse (arc-forge h05, design §5): logical capacity L = R * C for the
+    scheduler; the device holds a prefill area plus B hot blocks per request, B
+    solved from the profiled budget once R is final."""
+
+    @staticmethod
+    def is_applicable(kvc: KVCacheConfigurator) -> bool:
+        from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+
+        return is_qwen_qsa(kvc.model_config.hf_config)
+
+    def __init__(self, kvc: KVCacheConfigurator):
+        from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
+
+        if kvc.is_draft_worker:
+            raise NotImplementedError("QSA HiSparse has no draft worker (spec is off)")
+        super().__init__(kvc)
+        hf_config = kvc.model_config.hf_config
+        mambaish = mambaish_config(kvc.model_config)
+        if mambaish is None:
+            raise NotImplementedError("QSA HiSparse is wired for the hybrid QSA models only")
+        self._num_layers = sum(
+            kvc.layer_info.start_layer <= i < kvc.layer_info.end_layer
+            for i in mambaish.full_attention_layer_ids
+        )
+        self._index_cell = self._compute_qsa_cell_size(
+            hf_config=hf_config, num_layers=self._num_layers
+        )
+        self._kv_cell = self._cell_size - self._index_cell
+        profile = parse_qsa_profile(hf_config)
+        self._block_tokens = profile.compress_ratio
+        self._top_k = profile.block_topk
+        self._context_len = kvc.model_config.context_len
+        self._device = kvc.device
+        from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+        self._hot_override = parse_hisparse_config().sparse_extra_config.get(
+            "qsa_hot_blocks"
+        )
+        if self._hot_override is not None and not isinstance(self._hot_override, int):
+            raise ValueError(f"qsa_hot_blocks must be an integer, got {self._hot_override!r}")
+
+    def calculate_pool_sizes(
+        self, available_bytes: int, page_size: int
+    ) -> MemoryPoolConfig:
+        # R is not final yet (mamba may cap it): expose the logical capacity of
+        # the requested R and keep the budget for finalize_with_max_running_requests.
+        requested = get_schedule().max_running_requests
+        if requested is None:
+            raise ValueError("QSA HiSparse needs --max-running-requests")
+        return MemoryPoolConfig(
+            max_total_num_tokens=ceil_align(requested * self._context_len, page_size),
+            hisparse_budget_bytes=max(available_bytes, 0),
+        )
+
+    def calculate_pool_sizes_from_max_tokens(
+        self, max_total_num_tokens: int, page_size: int
+    ) -> MemoryPoolConfig:
+        raise ValueError(
+            "QSA HiSparse sizes the logical pool as max_running_requests x context_len; "
+            "--max-total-tokens (or a PP token sync) does not apply"
+        )
+
+    def finalize_with_max_running_requests(
+        self, config: MemoryPoolConfig
+    ) -> MemoryPoolConfig:
+        from sglang.srt.mem_cache.qsa_hisparse_capacity import plan_qsa_hisparse
+
+        if config.max_running_requests is None or config.hisparse_budget_bytes is None:
+            raise RuntimeError("QSA HiSparse sizing runs after calculate_pool_sizes and R")
+        chunk = get_schedule().chunked_prefill_size
+        if chunk is None or chunk <= 0:
+            raise ValueError("QSA HiSparse needs chunked prefill (--chunked-prefill-size > 0)")
+        page_size = get_schedule().page_size
+        plan = plan_qsa_hisparse(
+            budget_bytes=config.hisparse_budget_bytes,
+            context_len=self._context_len,
+            max_running_requests=config.max_running_requests,
+            chunked_prefill_size=chunk,
+            kv_bytes_per_token=self._kv_cell,
+            index_bytes_per_token=self._index_cell,
+            num_layers=self._num_layers,
+            block_tokens=self._block_tokens,
+            page_size=page_size,
+            top_k=self._top_k,
+            hot_override=self._hot_override,
+            smem_optin=torch.cuda.get_device_properties(
+                self._device
+            ).shared_memory_per_block_optin,
+        )
+        config.max_total_num_tokens = plan.logical_tokens
+        config.hisparse_hot_blocks = plan.hot_blocks
+        config.hisparse_prefill_tokens = plan.prefill_tokens
+        config.hisparse_device_tokens = plan.device_tokens
+        logger.info(
+            "QSA HiSparse sizing: budget %.2f GiB, R=%d, C=%d -> logical %d tokens, "
+            "prefill area %d tokens, B=%d blocks (%d fit, %.1fx top-k), device rows %d; "
+            "KV %d B/token, index %d B/token",
+            config.hisparse_budget_bytes / (1 << 30),
+            config.max_running_requests,
+            self._context_len,
+            plan.logical_tokens,
+            plan.prefill_tokens,
+            plan.hot_blocks,
+            plan.hot_blocks_vram,
+            plan.hot_blocks / self._top_k,
+            plan.device_tokens,
+            self._kv_cell,
+            self._index_cell,
+        )
+        return config
+
+
 def create_memory_pool_configurator(
     kvc: KVCacheConfigurator,
 ) -> MemoryPoolConfigurator:
@@ -1359,5 +1480,7 @@ def create_memory_pool_configurator(
         if SWAChunkCapPoolConfigurator.is_applicable(kvc):
             return SWAChunkCapPoolConfigurator(kvc)
         return HybridSWAPoolConfigurator(kvc)
+    if get_memory().enable_hisparse and QSAHiSparsePoolConfigurator.is_applicable(kvc):
+        return QSAHiSparsePoolConfigurator(kvc)
     # Future: MambaPoolConfigurator
     return DefaultPoolConfigurator(kvc)
