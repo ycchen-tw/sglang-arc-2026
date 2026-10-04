@@ -93,7 +93,20 @@ def _resolve_trtllm_sparse_decode():
     # This path is numerically validated on SM100 and SM120. Do not widen it
     # to every SM12x device: it silently corrupts long-context decode on
     # SM121/GB10.
-    if not (is_sm100_supported() or is_sm120()):
+    sm120 = is_sm120()
+    mode = os.environ.get("ARC_QSA_SM120_DECODE", "xqa")
+    if mode not in ("fa2", "xqa"):
+        raise ValueError(f"Invalid ARC_QSA_SM120_DECODE={mode!r}")
+    if sm120:
+        # Upstream turns trtllm-gen (XQA on SM120) decode on by default; the
+        # knob only keeps the FA2 arm reachable for the SM120 A/B, so "xqa"
+        # is the default and the shipped behaviour matches upstream.
+        logger.info("QSA_SM120_KERNEL=%s (selection and indexer unchanged)", mode)
+        if mode == "fa2":
+            return None
+    elif "ARC_QSA_SM120_DECODE" in os.environ:
+        raise RuntimeError("ARC_QSA_SM120_DECODE is only meaningful on SM120")
+    if not (is_sm100_supported() or sm120):
         return None
     try:
         from flashinfer.decode import trtllm_batch_decode_with_kv_cache
