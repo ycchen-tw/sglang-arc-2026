@@ -13,7 +13,7 @@ after staging.
 from __future__ import annotations
 
 import logging
-from typing import List
+from typing import List, Optional
 
 import torch
 
@@ -502,6 +502,29 @@ class QSAHiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     ):
         # Device rows of decode tokens are slab slots, set by the coordinator.
         return self.logical_attn_allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
+
+    def alloc_spec_decode(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+    ) -> Optional[torch.Tensor]:
+        """Logical slots for a speculative decode window (arc-forge M5 h17,
+        design §2.1): [prefix, seq) per request, whole pages. Only logical slots:
+        the window's blocks live in slab slots (the coordinator maps them), never
+        in the prefill area, which h06 keeps for prompts. None if the logical
+        pool is short (the scheduler's decode capacity check retracts first)."""
+        return self.logical_attn_allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+        )
 
     def free_prefill_blocks(self, device_blocks: torch.Tensor) -> None:
         """Return prefill-area blocks (whole pages) to the pool."""

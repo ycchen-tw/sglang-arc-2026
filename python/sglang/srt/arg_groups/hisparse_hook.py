@@ -177,9 +177,11 @@ def validate_qsa_hisparse(server_args: ServerArgs) -> None:
         (
             "--enable-session-radix-cache with the session cache, not without"
         ): bool(view.enable_session_radix_cache) == session,
-        "no speculative decoding": view.speculative_algorithm is None,
-        "no ReplaySSM (--enable-linear-replayssm[-spec])": not view.enable_linear_replayssm
-        and not view.enable_linear_replayssm_spec,
+        # arc-forge M5 h17: speculative decoding in the shape _qsa_spec_needs lists
+        "no non-speculative ReplaySSM (--enable-linear-replayssm)": not view.enable_linear_replayssm,
+        "--enable-linear-replayssm-spec only with speculative decoding": view.speculative_algorithm
+        is not None
+        or not view.enable_linear_replayssm_spec,
         "no mamba extra buffer": not mamba_extra_buffer_of(view),
         "no --enable-mixed-chunk": not view.enable_mixed_chunk,
         "--max-running-requests set": view.max_running_requests is not None,
@@ -194,6 +196,8 @@ def validate_qsa_hisparse(server_args: ServerArgs) -> None:
     }
     if session:
         need.update(_qsa_session_needs(view))
+    if view.speculative_algorithm is not None:
+        need.update(_qsa_spec_needs(view, session))
     missing = [what for what, ok in need.items() if not ok]
     if missing:
         raise ValueError(
@@ -236,6 +240,64 @@ def _qsa_session_needs(view) -> dict:
         # it frees output KV below kv_committed_len, where a record's P can sit
         "no --strip-thinking-cache": not view.strip_thinking_cache,
     }
+
+
+def _qsa_spec_needs(view, session: bool) -> dict:
+    """M5 h17 (design §9): the speculative shape QSA HiSparse serves. The target
+    verifies K rows per request (h16) and backs up after accept (h17) only on the
+    overlap EAGLEWorkerV2 path; the draft keeps a resident plain QSA pool priced
+    per logical token (fp8_e4m3 / bfloat16 only). GDN snapshots and session
+    resume under spec need the ReplaySSM track into staging slots (h18)."""
+    import json
+
+    from sglang.srt.environ import envs
+
+    user = json.loads(view.hisparse_config) if view.hisparse_config else {}
+    k = view.speculative_num_draft_tokens
+    return {
+        "--speculative-algorithm NEXTN / EAGLE": view.speculative_algorithm
+        in ("EAGLE", "NEXTN"),
+        "--speculative-eagle-topk 1": view.speculative_eagle_topk == 1,
+        "--speculative-num-draft-tokens = --speculative-num-steps + 1": k is not None
+        and view.speculative_num_steps is not None
+        and k == view.speculative_num_steps + 1,
+        # the QSA pending ring holds one group; K = 8 comes with h19 (experimental-qsa 0018)
+        "--speculative-num-draft-tokens <= 4": k is not None and 1 <= k <= 4,
+        "no --enable-multi-layer-eagle": not view.enable_multi_layer_eagle,
+        "no --speculative-adaptive (it changes K at runtime)": not view.speculative_adaptive,
+        "--speculative-draft-kv-cache-dtype fp8_e4m3 or bfloat16": view.speculative_draft_kv_cache_dtype
+        in ("fp8_e4m3", "bf16", "bfloat16"),
+        "--speculative-attention-mode prefill": view.speculative_attention_mode == "prefill",
+        "the overlap scheduler (no --disable-overlap-schedule)": not view.disable_overlap_schedule,
+        "SGLANG_RAGGED_VERIFY_MODE=static (K rows per request)": envs.SGLANG_RAGGED_VERIFY_MODE.get()
+        == "static",
+        "no SGLANG_SIMULATE_ACC_LEN": envs.SGLANG_SIMULATE_ACC_LEN.get() < 0,
+        "no session cache with speculative decoding (h18)": not session,
+        "no qsa_session_resume / qsa_snapshot_interval with speculative decoding (h18)": not user.get(
+            "qsa_session_resume", False
+        )
+        and "qsa_snapshot_interval" not in user,
+    }
+
+
+def qsa_hisparse_spec_capture_bs(server_args: ServerArgs, max_bs: int):
+    """M5 h17 (design §16 decision 5): the decode capture list for QSA HiSparse with
+    speculative decoding when --cuda-graph-bs-decode is not given, else None.
+
+    Three runners (target verify, draft decode, draft extend) capture every listed
+    batch size, and the graph memory comes out of the headroom mem_fraction_static
+    leaves; the stock spec list has 33 sizes up to 110 while a c110 batch sits
+    near R. Fewer sizes only cost padding at small batches. Powers of two to 32,
+    then every 16, plus max_bs."""
+    view = resolving_view(server_args)
+    if not view.enable_hisparse or view.speculative_algorithm is None:
+        return None
+    from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+
+    if not is_qwen_qsa(model_config_of(server_args).hf_config):
+        return None
+    capture_bs = [1, 2, 4, 8, 16, 32] + list(range(48, max_bs + 1, 16))
+    return [bs for bs in capture_bs if bs <= max_bs]
 
 
 def verify_qsa_hisparse_manifest() -> str:

@@ -282,6 +282,28 @@ class QSAHiSparseLayout:
         bt = self.block_tokens
         return range(committed // bt, (committed + accepted) // bt)
 
+    def spec_backup_width(self, verify_tokens: int) -> int:
+        """Most blocks one verify of verify_tokens rows can complete: ceil(K / bt)
+        (verify_backup of the full window from any committed; h17 sizes the device
+        backup's candidate list with it)."""
+        if verify_tokens < 1:
+            raise ValueError(f"verify_tokens must be >= 1, got {verify_tokens}")
+        return -(-verify_tokens // self.block_tokens)
+
+    def spec_map_blocks(self, allocated: int, new_allocated: int) -> range:
+        """Blocks whose logical -> device mapping a speculative allocation that grows
+        a request from `allocated` to `new_allocated` tokens writes (arc-forge M5 h17,
+        design §2.1): every block that starts in [allocated, new_allocated), plus the
+        block holding position `allocated` when it is a partial one. That block is
+        the prompt's last one after staging, whose mapping staging cleared; any other
+        time `allocated` is page aligned and the range starts on a fresh block."""
+        if not 0 <= allocated <= new_allocated:
+            raise ValueError(f"spec_map_blocks({allocated}, {new_allocated})")
+        bt = self.block_tokens
+        if new_allocated == allocated:
+            return range(0)
+        return range(allocated // bt, _ceil_div(new_allocated, bt))
+
     def staging_plan(self, prompt_len: int, host_blocks: int = 0) -> StagingPlan:
         """Staging copies of a prompt of prompt_len tokens whose blocks [0, host_blocks)
         are a resumed prefix on host (h07). The prefix is a whole number of pages

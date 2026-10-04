@@ -580,9 +580,15 @@ def generate_decode_cuda_graph_batch_sizes(server_args: Any, max_bs: int):
     This integrates the logic from cuda_graph_runner.py.
     """
     cfg = resolving_view(server_args)
+    from sglang.srt.arg_groups.hisparse_hook import qsa_hisparse_spec_capture_bs
+
+    # arc-forge M5 h17: QSA HiSparse + spec captures a short list (None otherwise)
+    hisparse_bs = qsa_hisparse_spec_capture_bs(server_args, max_bs)
     # Handle disable_cuda_graph_padding as the first condition for both spec and non-spec
     if cfg.disable_cuda_graph_padding:
         capture_bs = list(range(1, max_bs + 1))
+    elif hisparse_bs is not None:
+        capture_bs = hisparse_bs
     elif cfg.speculative_algorithm is None:
         # Normal case:
         capture_bs = (

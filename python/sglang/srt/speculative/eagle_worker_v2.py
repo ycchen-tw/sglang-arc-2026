@@ -1496,6 +1496,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
 
                 if isinstance(coord, QSAHiSparseCoordinator):
+                    # h17: the accepted, completed blocks go from their ring slots to
+                    # host on this (forward) stream, before the next verify
+                    if not batch.forward_mode.is_idle():
+                        coord.backup_after_accept(
+                            batch.req_pool_indices, batch.seq_lens, batch_output.accept_lens
+                        )
                     batch_output.hisparse_verify_overflow = coord.verify_overflow
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:

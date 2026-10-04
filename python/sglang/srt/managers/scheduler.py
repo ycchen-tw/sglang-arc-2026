@@ -3584,13 +3584,32 @@ class Scheduler(
         batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
         batch.orig_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
         batch.seq_lens_sum = sum(seq_lens)
-        # Stash last token into relay; resolve_forward_inputs will gather.
-        last_tokens = torch.tensor(
-            [r.output_ids[-1] for r in reqs], dtype=torch.int64, device=device
-        )
-        self.future_map.stash(
-            batch.req_pool_indices, RelayPayload(bonus_tokens=last_tokens)
-        )
+        if self.spec_algorithm.is_none():
+            # Stash last token into relay; resolve_forward_inputs will gather.
+            last_tokens = torch.tensor(
+                [r.output_ids[-1] for r in reqs], dtype=torch.int64, device=device
+            )
+            self.future_map.stash(
+                batch.req_pool_indices, RelayPayload(bonus_tokens=last_tokens)
+            )
+        else:
+            # arc-forge M5 h17: the prefill forward relayed each request's draft
+            # input (bonus token, draft top-k, hidden state) and published its
+            # length into the future map under its req_pool_idx; nothing touches
+            # those rows while it stages. This batch only points at them, as the
+            # prefill batch's spec_info would after filter / merge.
+            from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+            if not self.enable_overlap:
+                raise NotImplementedError(
+                    "QSA HiSparse speculative decoding runs the overlap scheduler (spec v2 relay)"
+                )
+            batch.spec_info = EagleDraftInput(
+                num_tokens_per_req=1,
+                num_tokens_for_logprob_per_req=1,
+                future_indices=batch.req_pool_indices.clone(),
+                future_dsa_topk_indices_available=False,
+            )
         batch.input_ids = None
 
         if batch.return_logprob:

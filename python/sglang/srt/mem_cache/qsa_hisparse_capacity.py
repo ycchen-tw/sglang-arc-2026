@@ -15,6 +15,10 @@ M1b h09 (session cache, design §5.1): L is a budget, not R * C: logical_tokens 
 it (parked sessions and running requests share it; retract is the last resort), and
 the host-prefix landing zone (one layer of K/V for ceil_page(C) tokens) joins fixed.
 The host pool follows L (L / bt + R * page_blocks blocks, the coordinator's check).
+
+M5 h17 (speculative decoding, design §10.3): the draft's resident QSA pool is priced
+per logical token (draft_bytes_per_token, one draft layer of K/V plus index keys)
+plus draft_fixed_bytes, both in fixed.
 """
 
 from __future__ import annotations
@@ -67,6 +71,8 @@ def plan_qsa_hisparse(
     smem_optin: Optional[int] = None,
     logical_tokens: Optional[int] = None,
     landing_zone_bytes: int = 0,
+    draft_bytes_per_token: int = 0,
+    draft_fixed_bytes: int = 0,
 ) -> QSAHiSparsePlan:
     r, c, kv, bt = max_running_requests, context_len, kv_bytes_per_token, block_tokens
     if min(r, c, chunked_prefill_size, kv, num_layers, top_k) <= 0:
@@ -88,6 +94,10 @@ def plan_qsa_hisparse(
         logical = logical_tokens
     if landing_zone_bytes < 0:
         raise ValueError(f"landing_zone_bytes must be >= 0, got {landing_zone_bytes}")
+    if draft_bytes_per_token < 0 or draft_fixed_bytes < 0:
+        raise ValueError(
+            f"draft pool price must be >= 0, got {draft_bytes_per_token} B/token + {draft_fixed_bytes} B"
+        )
     # h06 admits a prompt only when its whole rest fits the prefill area, and raises for a
     # prompt that could never fit: the area must hold the longest prompt, C rounded to pages.
     prefill = _round_up(c + chunked_prefill_size, page_size)
@@ -99,12 +109,15 @@ def plan_qsa_hisparse(
         + logical // bt * 8
         + r * (ctx_blocks + page_blocks) * 8
         + landing_zone_bytes
+        + logical * draft_bytes_per_token
+        + draft_fixed_bytes
     )
     per_slot = r * (bt * kv + num_layers * TABLE_BYTES_PER_SLOT_LAYER)
     if budget_bytes <= fixed:
         raise ValueError(
-            f"KV budget {budget_bytes} B does not cover the index, prefill area and maps "
-            f"({fixed} B) for R={r}, C={c}; lower --max-running-requests or --context-length"
+            f"KV budget {budget_bytes} B does not cover the index, prefill area, maps and "
+            f"draft pool ({fixed} B) for R={r}, C={c}, L={logical}; lower "
+            "--max-running-requests or --context-length"
         )
     hot_vram = ((budget_bytes - fixed) // per_slot - page_blocks) // HOT_BLOCKS_ALIGN * HOT_BLOCKS_ALIGN
     hot = min(hot_vram, MAX_HOT_BLOCKS, _round_up(ctx_blocks, HOT_BLOCKS_ALIGN))

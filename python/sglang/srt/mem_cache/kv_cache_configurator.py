@@ -1923,16 +1923,19 @@ class KVCacheConfigurator:
                 HiSparseQSATokenToKVPool,
             )
 
-            if qsa_profile is None or self.is_draft_worker:
+            if qsa_profile is None:
                 raise NotImplementedError(
-                    "--enable-hisparse on a hybrid linear-attention model needs QSA (no draft)"
+                    "--enable-hisparse on a hybrid linear-attention model needs QSA"
                 )
-            pool_class = HiSparseQSATokenToKVPool
-            size_args = {
-                "logical_size": max_total_num_tokens,
-                "prefill_tokens": sizes.hisparse_prefill_tokens,
-                "hot_blocks": sizes.hisparse_hot_blocks,
-            }
+            if not self.is_draft_worker:
+                pool_class = HiSparseQSATokenToKVPool
+                size_args = {
+                    "logical_size": max_total_num_tokens,
+                    "prefill_tokens": sizes.hisparse_prefill_tokens,
+                    "hot_blocks": sizes.hisparse_hot_blocks,
+                }
+            # arc-forge M5 h17: the draft keeps a resident plain QSA pool over the
+            # logical slots (design §10, option (a)); the target priced it per token.
         token_to_kv_pool = pool_class(
             page_size=self.pool_page_size,
             **size_args,
@@ -1953,12 +1956,29 @@ class KVCacheConfigurator:
             post_capture_active=self.post_capture_kv_active and quant_method is None,
             **extra_args,
         )
-        if qsa_hisparse and (
+        if qsa_hisparse and not self.is_draft_worker and (
             token_to_kv_pool.layout.device_tokens != sizes.hisparse_device_tokens
         ):
             raise RuntimeError(
                 f"QSA HiSparse pool has {token_to_kv_pool.layout.device_tokens} device rows, "
                 f"sizing planned {sizes.hisparse_device_tokens}"
+            )
+        if qsa_hisparse and self.is_draft_worker:
+            # the target's plan took the draft pool out of the budget it split
+            # into index, prefill area and hot slabs: a larger pool eats headroom
+            priced = self.memory_pool_config.hisparse_draft_pool_bytes
+            k_size, v_size = token_to_kv_pool.get_kv_size_bytes()
+            if priced is None or k_size + v_size > priced:
+                raise RuntimeError(
+                    f"QSA HiSparse draft pool holds {k_size + v_size} B, the target's "
+                    f"sizing priced {priced} B for {max_total_num_tokens} logical tokens"
+                )
+            logger.info(
+                "QSA HiSparse draft pool: %.2f GiB resident for %d logical tokens "
+                "(priced %.2f GiB)",
+                (k_size + v_size) / (1 << 30),
+                max_total_num_tokens,
+                priced / (1 << 30),
             )
         return token_to_kv_pool
 

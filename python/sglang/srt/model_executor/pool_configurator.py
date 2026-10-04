@@ -17,7 +17,7 @@ import logging
 import os
 from bisect import bisect_right
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
@@ -95,6 +95,9 @@ class MemoryPoolConfig:
     hisparse_hot_blocks: Optional[int] = None
     hisparse_prefill_tokens: Optional[int] = None
     hisparse_device_tokens: Optional[int] = None
+    # arc-forge M5 h17: bytes the target's plan set aside for the draft's resident
+    # QSA pool (design §10, option (a)); the draft worker checks its pool against it.
+    hisparse_draft_pool_bytes: Optional[int] = None
 
     def __post_init__(self):
         if self.max_total_num_tokens <= 0:
@@ -1372,7 +1375,9 @@ class QSAHiSparsePoolConfigurator(DefaultPoolConfigurator):
         from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
 
         if kvc.is_draft_worker:
-            raise NotImplementedError("QSA HiSparse has no draft worker (spec is off)")
+            raise NotImplementedError(
+                "QSA HiSparse sizes the target; the draft reuses its MemoryPoolConfig"
+            )
         super().__init__(kvc)
         hf_config = kvc.model_config.hf_config
         mambaish = mambaish_config(kvc.model_config)
@@ -1385,7 +1390,10 @@ class QSAHiSparsePoolConfigurator(DefaultPoolConfigurator):
         self._index_cell = self._compute_qsa_cell_size(
             hf_config=hf_config, num_layers=self._num_layers
         )
-        self._kv_cell = self._cell_size - self._index_cell
+        # arc-forge M5 h17: not self._cell_size, which DefaultPoolConfigurator scales
+        # by (1 + draft layers / layers) for EAGLE; the draft is priced below.
+        self._kv_cell = self._compute_cell_size(kvc, self._num_layers) - self._index_cell
+        self._draft_cell, self._draft_fixed = self._draft_pool_price(kvc, hf_config)
         profile = parse_qsa_profile(hf_config)
         self._block_tokens = profile.compress_ratio
         self._top_k = profile.block_topk
@@ -1411,6 +1419,44 @@ class QSAHiSparsePoolConfigurator(DefaultPoolConfigurator):
         self._session_resume = extra.get("qsa_session_resume", False) is True
         if self._logical_override is not None and not self._session_resume:
             raise ValueError("qsa_logical_tokens needs qsa_session_resume (M1b)")
+
+    @staticmethod
+    def _draft_pool_price(kvc: KVCacheConfigurator, hf_config) -> Tuple[int, int]:
+        """(bytes per logical token, fixed bytes) of the draft's resident QSA pool
+        (M5 h17, design §10.3): the draft worker's QSATokenToKVPool has one attention
+        layer (kv_cache_configurator: full_attention_layer_ids = [0]) of
+        --speculative-draft-kv-cache-dtype K/V plus its compressed index keys, over
+        logical size + page rows, and a pending ring per request slot. 0, 0 without
+        spec. Upper bounds; the draft worker checks the pool it builds against them."""
+        if kvc.spec_algorithm.is_none():
+            return 0, 0
+        from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
+        from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+
+        draft_dtype = get_spec().speculative_draft_kv_cache_dtype
+        elem = {"fp8_e4m3": 1, "bf16": 2, "bfloat16": 2}.get(draft_dtype)
+        if elem is None:
+            raise NotImplementedError(
+                "QSA HiSparse prices the draft pool for --speculative-draft-kv-cache-dtype "
+                f"fp8_e4m3 or bfloat16, got {draft_dtype!r}"
+            )
+        model_config = kvc.model_config
+        heads = model_config.get_num_kv_heads(
+            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+        )
+        profile = parse_qsa_profile(hf_config)
+        cell = heads * (model_config.head_dim + model_config.v_head_dim) * elem
+        cell += QSATokenToKVPool.qsa_bytes_per_token(
+            kv_heads=profile.kv_heads,
+            head_dim=profile.head_dim,
+            compress_ratio=profile.compress_ratio,
+            num_layers=1,
+        )
+        page = get_schedule().page_size
+        slots = get_schedule().max_running_requests + 1
+        ring = slots * profile.compress_ratio * (profile.kv_heads * profile.head_dim * 2 + 3 * 8)
+        # rows beyond L: the pool's page_size padding plus the index capacity's round-up
+        return cell, cell * 2 * page + ring
 
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
@@ -1474,15 +1520,21 @@ class QSAHiSparsePoolConfigurator(DefaultPoolConfigurator):
             ).shared_memory_per_block_optin,
             logical_tokens=self._logical_override,
             landing_zone_bytes=landing_zone_bytes,
+            draft_bytes_per_token=self._draft_cell,
+            draft_fixed_bytes=self._draft_fixed,
         )
         config.max_total_num_tokens = plan.logical_tokens
+        config.hisparse_draft_pool_bytes = (
+            plan.logical_tokens * self._draft_cell + self._draft_fixed
+        )
         config.hisparse_hot_blocks = plan.hot_blocks
         config.hisparse_prefill_tokens = plan.prefill_tokens
         config.hisparse_device_tokens = plan.device_tokens
         logger.info(
             "QSA HiSparse sizing: budget %.2f GiB, R=%d, C=%d -> logical %d tokens, "
             "prefill area %d tokens, B=%d blocks (%d fit, %.1fx top-k), device rows %d; "
-            "KV %d B/token, index %d B/token, landing zone %d B",
+            "KV %d B/token, index %d B/token, landing zone %d B, draft pool %d B/token "
+            "+ %d B",
             config.hisparse_budget_bytes / (1 << 30),
             config.max_running_requests,
             self._context_len,
@@ -1495,6 +1547,8 @@ class QSAHiSparsePoolConfigurator(DefaultPoolConfigurator):
             self._kv_cell,
             self._index_cell,
             landing_zone_bytes,
+            self._draft_cell,
+            self._draft_fixed,
         )
         return config
 

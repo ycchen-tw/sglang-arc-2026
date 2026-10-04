@@ -36,9 +36,16 @@ resolves a request's K rows one after another in one CTA, the window's blocks
 >= B live in ring slots B + b % W (W = layout.ring_width(K)), the per-row decode
 buffers hold max_bs * K rows, and verify_overflow is set when a row evicts a
 block an earlier row of its request selected (checked with the step result:
-check_verify_overflow). Mapping a window's logical blocks to their ring slots at
-allocation (ring_blocks) and the backup after accept are h17's; the decode-row
-path (map_last_loc_to_buffer and its backup) is K = 1 only.
+check_verify_overflow). The decode-row path (map_last_loc_to_buffer and its
+backup) is K = 1 only.
+
+Speculative serving (arc-forge M5 h17, design §2, §5): a speculative allocation
+maps the new window's logical blocks to their ring slots and gives the request
+host pages for every logical page it holds (map_spec_window, from
+alloc_for_spec_decode); after each verify, backup_after_accept copies the blocks
+the accepted tokens completed from their ring slots to host on the forward
+stream, before the next verify writes a ring slot or misses on those blocks.
+host_done[r] counts the blocks on host (design §5.1 I1).
 """
 
 from __future__ import annotations
@@ -199,7 +206,9 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
                 session_host_blocks(layout)
                 if session_resume
                 else layout.host_blocks(max_context_len)
-            ),
+            )
+            # h17: plus the page the verify backup's dummy entries write to
+            + (layout.page_blocks if verify_tokens > 1 else 0),
         )
 
         layer_num = pool.layer_num
@@ -247,6 +256,24 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         # the same request selected; never cleared (the server stops on it).
         self.verify_overflow = torch.zeros(1, dtype=torch.int32, device=device)
         self._skip_first_backup = [False] * num_slots
+        # M5 h17: blocks [0, host_done[r]) of row r are on host (staging sets it to
+        # the prompt's complete blocks, backup_after_accept advances it; design §5.1).
+        self.host_done = torch.zeros(num_slots, dtype=torch.int32, device=device)
+        self.spec_backup_width = layout.spec_backup_width(verify_tokens)
+        self._backup_offsets = torch.arange(
+            self.spec_backup_width, dtype=torch.int64, device=device
+        )
+        # A verify's backup is a fixed list of bs x spec_backup_width blocks (no
+        # host sync); an entry without a completed block copies device block 0 into
+        # this reserved host page (the transfer kernel has no skip for -1).
+        self._backup_dump_pages: Optional[torch.Tensor] = None
+        self._backup_dump_host = -1
+        if verify_tokens > 1:
+            dump = self.mem_pool_host.alloc(self.page_size)
+            if dump is None:
+                raise RuntimeError("QSA HiSparse host pool has no page left for the verify backup dump")
+            self._backup_dump_pages = dump
+            self._backup_dump_host = int(dump[0])
 
         self.write_staging_stream = device_module.Stream()
         self.decode_backup_stream = device_module.Stream()
@@ -418,6 +445,8 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
             h,
             plan.full_blocks - h,
         )
+        # h17: every complete prompt block is on host once this staging's D2H runs
+        self.host_done[r] = plan.full_blocks
         slab = self.req_to_device_buffer[r]
         src, dst = [], []
         from_prefill = plan.slab_from_prefill
@@ -480,6 +509,7 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         if not self.session_resume:
             self.release_host_row(r, 0)
         self._skip_first_backup[r] = False
+        self.host_done[r] = 0
         req.hisparse_staging = False
 
     # ------------------------------------------------------------ decode (scheduler side)
@@ -691,6 +721,127 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
             f"B={self.device_buffer_size}, K={self.verify_tokens}, top-k={self.top_k}",
         )
 
+    # ------------------------------------------------------------ speculative serving (M5 h17)
+
+    def map_spec_window(
+        self,
+        req_pool_indices: Sequence[int],
+        allocated: Sequence[int],
+        new_allocated: Sequence[int],
+    ) -> None:
+        """A speculative allocation grew request req_pool_indices[i] from allocated[i]
+        to new_allocated[i] tokens (logical slots already in req_to_token, design
+        §2.1). Map the new blocks (layout.spec_map_blocks) to their ring slots, the
+        rule ring_slot(b) that does not depend on the accept length, and give the
+        request host pages up to the new logical pages, so a backup after accept
+        needs no allocation (host pages never outnumber logical pages, M1b §5.1).
+        CPU lists in, device writes on the current stream, no host sync."""
+        if self.verify_tokens <= 1:
+            raise RuntimeError("map_spec_window needs a coordinator with verify_tokens > 1")
+        rows = [int(r) for r in req_pool_indices]
+        allocated = [int(a) for a in allocated]
+        new_allocated = [int(n) for n in new_allocated]
+        if not len(rows) == len(allocated) == len(new_allocated):
+            raise ValueError("map_spec_window: lists of different lengths")
+        self._map_spec_blocks(rows, allocated, new_allocated)
+        self._grow_spec_host_rows(rows, new_allocated)
+
+    def _map_spec_blocks(self, rows: List[int], allocated: List[int], new_allocated: List[int]) -> None:
+        bt = self.layout.block_tokens
+        idx_r: List[int] = []
+        idx_b: List[int] = []
+        for r, a, n in zip(rows, allocated, new_allocated):
+            span = self.layout.spec_map_blocks(a, n)
+            idx_r.extend([r] * len(span))
+            idx_b.extend(span)
+        if not idx_b:
+            return
+        idx = torch.tensor([idx_r, idx_b], dtype=torch.int64).pin_memory()
+        idx = idx.to(self.device, non_blocking=True)
+        r_dev, b_dev = idx[0], idx[1]
+        logical = self.req_to_token_pool.req_to_token[r_dev, b_dev * bt].to(torch.int64) // bt
+        self.mem_pool_device.mapping[logical] = self.req_to_device_buffer[
+            r_dev, self._ring_slots(b_dev)
+        ]
+
+    def _grow_spec_host_rows(self, rows: List[int], new_allocated: List[int]) -> None:
+        page = self.page_size
+        grow: List[Tuple[int, int, int]] = []
+        for r, n in zip(rows, new_allocated):
+            need = -(-self.layout.seq_blocks(n) // page) * page  # host blocks, whole pages
+            if need > self.req_to_host_pool.shape[1]:
+                raise RuntimeError(
+                    f"speculative allocation of {n} tokens for request slot {r} needs "
+                    f"{need} host blocks, the row holds {self.req_to_host_pool.shape[1]}"
+                )
+            have = int(self.req_to_host_pool_allocated_len[r])
+            if need > have:
+                grow.append((r, have, need))
+        if not grow:
+            return
+        total = sum(need - have for _, have, need in grow)
+        host_blocks = self.mem_pool_host.alloc(total)
+        if host_blocks is None:
+            raise RuntimeError(
+                f"QSA HiSparse host pool is out of blocks for a speculative window "
+                f"({total} blocks for {len(grow)} requests)"
+            )
+        h_rows = torch.cat([torch.full((need - have,), r, dtype=torch.int64) for r, have, need in grow])
+        h_cols = torch.cat([torch.arange(have, need, dtype=torch.int64) for _, have, need in grow])
+        triple = torch.stack([h_rows, h_cols, host_blocks.to(torch.int64)]).pin_memory()
+        triple = triple.to(self.device, non_blocking=True)
+        self.req_to_host_pool[triple[0], triple[1]] = triple[2]
+        for r, _, need in grow:
+            self.req_to_host_pool_allocated_len[r] = need
+
+    def backup_after_accept(
+        self,
+        req_pool_indices: torch.Tensor,
+        committed: torch.Tensor,
+        accept_lens: torch.Tensor,
+    ) -> None:
+        """After a verify at committed[i] tokens accepted accept_lens[i] (bonus
+        included): copy blocks [s // bt, (s + a) // bt) (layout.verify_backup) from
+        their ring slots to the host records map_spec_window gave them, and advance
+        host_done (design §5.2). Runs on the current (forward) stream after the
+        verify and before the next verify, which may overwrite those ring slots or
+        miss on those blocks. A fixed-shape list, no host sync; an entry without a
+        completed block goes to the dump page. A completed block without a host
+        record sets bit 2 of verify_overflow (raised with the step result)."""
+        bs = req_pool_indices.shape[0]
+        if bs == 0:
+            return
+        if committed.shape[0] != bs or accept_lens.shape[0] != bs:
+            raise ValueError(
+                f"backup_after_accept: {bs} requests, {committed.shape[0]} lengths, "
+                f"{accept_lens.shape[0]} accept lengths"
+            )
+        bt = self.layout.block_tokens
+        rpi = req_pool_indices.to(torch.int64)
+        s = committed.to(torch.int64)
+        lo = s // bt
+        hi = (s + accept_lens.to(torch.int64)) // bt
+        if self._debug_host_records and not torch.cuda.is_current_stream_capturing():
+            done = self.host_done[rpi].to(torch.int64)
+            if not torch.equal(done, lo):
+                i = int((done != lo).nonzero()[0])
+                raise RuntimeError(
+                    f"QSA HiSparse verify backup: request slot {int(rpi[i])} committed "
+                    f"{int(s[i])} but {int(done[i])} blocks on host (want {int(lo[i])})"
+                )
+        blocks = lo[:, None] + self._backup_offsets[None, :]
+        valid = blocks < hi[:, None]
+        blocks = blocks.clamp(max=self.req_to_host_pool.shape[1] - 1)
+        dev = self.req_to_device_buffer[rpi[:, None], self._ring_slots(blocks)]
+        host = self.req_to_host_pool[rpi[:, None], blocks]
+        lost = valid & (host < 0)
+        self.verify_overflow.bitwise_or_(lost.any().to(torch.int32) * 2)
+        use = valid & ~lost
+        dev = torch.where(use, dev, torch.zeros_like(dev))
+        host = torch.where(use, host, torch.full_like(host, self._backup_dump_host))
+        self.mem_pool_host.backup_blocks(dev.reshape(-1), host.reshape(-1))
+        self.host_done[rpi] = hi.to(torch.int32)
+
     def _run_swap_in_kernel(
         self,
         req_pool_indices: torch.Tensor,
@@ -756,6 +907,10 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         may_miss = slow[:, None] & (top_k >= 0) & (top_k < ring_lo[:, None])
         host = self.req_to_host_pool[rpi[:, None], top_k.clamp(min=0)]
         lost = may_miss & (host < 0)
+        if self.verify_tokens > 1:
+            # h17: speculative host pages are allocated ahead with the logical pages,
+            # so an entry >= 0 is not enough; the block must be backed up
+            lost |= may_miss & (top_k >= self.host_done[rpi].to(torch.int64)[:, None])
         if bool(lost.any()):
             i, j = lost.nonzero()[0].tolist()
             raise RuntimeError(
@@ -798,6 +953,7 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         self.req_device_buffer_tokens[:, r, :] = -1
         self.lru_slots[:, r, :].copy_(self._lru_init)
         self._skip_first_backup[r] = False
+        self.host_done[r] = 0
 
     # ------------------------------------------------------------ session resume (M1b h07)
 
@@ -921,10 +1077,11 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
                 problems.append("parked logical slots are not whole pages held off the free list")
         host = self.mem_pool_host
         used = host.slot_used.nonzero().flatten()
+        held = [] if parked_host is None else [parked_host.to("cpu", torch.int64)]
+        if self._backup_dump_pages is not None:  # h17: the verify backup's dump page
+            held.append(self._backup_dump_pages.to("cpu", torch.int64))
         parked = (
-            torch.empty(0, dtype=torch.int64)
-            if parked_host is None
-            else torch.sort(parked_host.to("cpu", torch.int64)).values
+            torch.sort(torch.cat(held)).values if held else torch.empty(0, dtype=torch.int64)
         )
         if host.available_size() != host.size - parked.numel() or not torch.equal(used, parked):
             problems.append(
@@ -947,6 +1104,8 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
             problems.append("req_to_host_pool not cleared")
         if bool((self.req_device_buffer_tokens != -1).any()):
             problems.append("req_device_buffer_tokens not cleared")
+        if bool(self.host_done.any()):
+            problems.append("host_done not cleared")
         if not torch.equal(
             self.lru_slots, self._lru_init.view(1, 1, -1).expand_as(self.lru_slots)
         ):
@@ -1166,10 +1325,28 @@ def create_qsa_hisparse_coordinator(model_runner) -> QSAHiSparseCoordinator:
         )
     # M5 h16: a TARGET_VERIFY forward has K rows per request (the decode graph
     # runner captures TARGET_VERIFY with bs * K tokens), so the per-row buffers hold
-    # K x the graph's max batch size. h05 still refuses spec (h17 serves it).
+    # K x the graph's max batch size.
     verify_tokens = 1
     if get_spec().speculative_algorithm is not None:
         verify_tokens = int(max_speculative_num_draft_tokens() or 1)
+        # h17 (design §3.3): B >= K x top-k makes the swap-in overflow impossible;
+        # below it only the flag stands between a large selection and a raise.
+        small_ok = user.get("qsa_spec_small_hot_ok", False)
+        if not isinstance(small_ok, bool):
+            raise ValueError(f"hisparse_config.qsa_spec_small_hot_ok must be a bool, got {small_ok!r}")
+        hot = pool.layout.hot_blocks
+        if hot < verify_tokens * top_k and not small_ok:
+            raise ValueError(
+                f"QSA HiSparse speculative verify with B={hot} hot blocks < K x top-k = "
+                f"{verify_tokens} x {top_k}: a verify step may need more hot blocks than B "
+                "and would stop the server (overflow flag). Raise B (memory, R, L) or set "
+                "hisparse_config.qsa_spec_small_hot_ok=true to accept that risk"
+            )
+        if hot < verify_tokens * top_k:
+            logger.warning(
+                "QSA HiSparse speculative verify with B=%d < K x top-k = %d: relying on "
+                "the overflow flag (qsa_spec_small_hot_ok)", hot, verify_tokens * top_k
+            )
     return QSAHiSparseCoordinator(
         req_to_token_pool=model_runner.req_to_token_pool,
         token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
@@ -1190,12 +1367,21 @@ def raise_on_verify_overflow(flag: torch.Tensor, detail: str = "") -> None:
     attention read the wrong KV (B < K x top-k was not enough for the selection;
     the coordinator's startup log line gives B and K). Called with the step
     result's host copy of the flag, before the step's tokens are sent."""
-    if int(flag.reshape(-1)[0]):
+    bits = int(flag.reshape(-1)[0])
+    if bits & 1:
         raise RuntimeError(
             "QSA HiSparse verify swap-in overflow: a verify row evicted a block an "
             "earlier row of its request selected, so this step's tokens were computed "
             f"from wrong KV and are not sent ({detail or 'see the coordinator log for B and K'})"
         )
+    if bits & 2:
+        raise RuntimeError(
+            "QSA HiSparse verify backup: an accepted, completed block had no host "
+            "record (a speculative allocation skipped map_spec_window), so it could "
+            f"not be backed up; this step's tokens are not sent ({detail})"
+        )
+    if bits:
+        raise RuntimeError(f"QSA HiSparse verify flag has unknown bits {bits:#x}")
 
 
 def session_host_blocks(layout) -> int:

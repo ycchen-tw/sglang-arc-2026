@@ -728,6 +728,22 @@ ALLOC_EXTEND_FUNCS = defaultdict(
 )
 
 
+def _qsa_hisparse_spec_coordinator(tree_cache: BasePrefixCache, batch):
+    """The batch's QSA HiSparse coordinator when the pool is QSA HiSparse, else None."""
+    from sglang.srt.mem_cache.qsa_hisparse_pool import (
+        QSAHiSparseTokenToKVPoolAllocator,
+    )
+
+    if not isinstance(tree_cache.token_to_kv_pool_allocator, QSAHiSparseTokenToKVPoolAllocator):
+        return None
+    coord = None if batch is None else batch.hisparse_coordinator
+    if coord is None:
+        raise RuntimeError(
+            "QSA HiSparse speculative decode: the decode batch has no hisparse_coordinator"
+        )
+    return coord
+
+
 def alloc_for_spec_decode(
     tree_cache: BasePrefixCache,
     req_to_token_pool: ReqToTokenPool,
@@ -741,8 +757,29 @@ def alloc_for_spec_decode(
     num_needed_tokens: int,
     batch: Optional[ScheduleBatch] = None,
 ) -> None:
+    # arc-forge M5 h17: QSA HiSparse allocates logical slots only and maps the new
+    # blocks to their slab ring slots (design §2.1); None for every other pool.
+    hisparse = _qsa_hisparse_spec_coordinator(tree_cache, batch)
     if num_needed_tokens > 0:
-        if tree_cache.token_to_kv_pool_allocator.page_size == 1:
+        if hisparse is not None:
+            last_loc = get_last_loc(
+                req_to_token_pool.req_to_token, req_pool_indices, cur_kv_lens
+            )
+            out_cache_loc = tree_cache.token_to_kv_pool_allocator.alloc_spec_decode(
+                cur_kv_lens,
+                cur_kv_lens_cpu,
+                nxt_kv_lens,
+                nxt_kv_lens_cpu,
+                last_loc,
+                num_needed_tokens,
+            )
+            if out_cache_loc is None:
+                raise RuntimeError(
+                    f"QSA HiSparse speculative decode: the logical pool has no room for "
+                    f"{num_needed_tokens} tokens after the decode capacity check "
+                    f"({tree_cache.token_to_kv_pool_allocator.debug_print()})"
+                )
+        elif tree_cache.token_to_kv_pool_allocator.page_size == 1:
             out_cache_loc = alloc_token_slots(tree_cache, num_needed_tokens)
         else:
             last_loc = get_last_loc(
@@ -772,6 +809,12 @@ def alloc_for_spec_decode(
             out_cache_loc,
             len(reqs),
         )
+        if hisparse is not None:
+            hisparse.map_spec_window(
+                [r.kv.req_pool_idx for r in reqs],
+                cur_kv_lens_cpu.tolist(),
+                nxt_kv_lens_cpu.tolist(),
+            )
 
     nxt_kv_lens_list = nxt_kv_lens_cpu.tolist()
     for req, nxt_kv_len in zip(reqs, nxt_kv_lens_list, strict=True):

@@ -939,6 +939,10 @@ class ModelRunner:
     def maybe_init_hisparse_coordinator(self):
         if not self.enable_hisparse:
             return
+        if self.is_draft_worker:
+            # arc-forge M5 h17: the draft keeps its KV resident in a plain QSA pool
+            # (design §10, option (a)); only the target runs HiSparse.
+            return
         from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 
         if isinstance(self.token_to_kv_pool, QSATokenToKVPool):
