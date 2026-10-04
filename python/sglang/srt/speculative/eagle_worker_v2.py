@@ -1324,7 +1324,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self._hosts_draft = get_pp_group().is_last_rank
         # arc-forge DFlash (experimental-dflash d01): ARC_DFLASH_DRAFTER swaps the native MTP draft worker for the
         # MTP5-DFlash drafter (work/qwen38fn_dflash/g4/dflash_eagle.py); target, verify and HiSparse are unchanged.
-        self._dflash = bool(os.environ.get("ARC_DFLASH_DRAFTER"))
+        from sglang.srt.speculative import arc_dflash
+
+        self._dflash = arc_dflash.enabled()
         if self._dflash:
             if not self._hosts_draft:
                 raise ValueError("DFlash drafter runs without pipeline parallelism")

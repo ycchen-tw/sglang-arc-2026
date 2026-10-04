@@ -760,7 +760,7 @@ def alloc_for_spec_decode(
     # arc-forge M5 h17: QSA HiSparse allocates logical slots only and maps the new
     # blocks to their slab ring slots (design §2.1); None for every other pool.
     hisparse = _qsa_hisparse_spec_coordinator(tree_cache, batch)
-    if hisparse is not None:
+    if hisparse is not None and hisparse.distributed_spec:  # h29: single-rank serving has nothing to agree on
         hisparse.agree_spec_allocation(reqs, cur_kv_lens_cpu.tolist(), nxt_kv_lens_cpu.tolist(), num_needed_tokens)
     if num_needed_tokens > 0:
         if hisparse is not None:

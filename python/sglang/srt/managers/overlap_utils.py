@@ -27,7 +27,9 @@ if TYPE_CHECKING:
 def dflash_drafter_enabled() -> bool:
     """arc-forge d01 (l4): the DFlash drafter computes every proposal's q inside its own draft step, so the
     relay carries no first-step q (draft extend publishes none) and h39's owned-q checks do not apply."""
-    return bool(os.environ.get("ARC_DFLASH_DRAFTER"))
+    from sglang.srt.speculative import arc_dflash
+
+    return arc_dflash.enabled()
 
 
 def require_real_draft_probs(probs, rows: int, *, allow_padding: bool = False, expected_ndim: int = 2):

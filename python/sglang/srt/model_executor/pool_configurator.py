@@ -1432,7 +1432,9 @@ class QSAHiSparsePoolConfigurator(DefaultPoolConfigurator):
         slot (h19). 0, 0 without spec. Upper bounds; the draft worker checks the pool it builds against them."""
         if kvc.spec_algorithm.is_none():
             return 0, 0
-        if os.environ.get("ARC_DFLASH_DRAFTER"):
+        from sglang.srt.speculative import arc_dflash
+
+        if arc_dflash.enabled():
             # arc-forge d01: the DFlash drafter holds no draft KV pool (its SWA window is per request,
             # outside the token pool); its weights were on the GPU before this budget was measured
             return 0, 0

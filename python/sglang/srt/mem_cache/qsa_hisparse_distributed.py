@@ -141,7 +141,9 @@ def distributed_mtp_steps() -> int:
     value = os.environ.get("ARC_HISPARSE_MTP_STEPS", "3")
     # arc-forge l01: the DFlash drafter (experimental-dflash/l4) proposes K-1 = 1..7 tokens; the verify-width
     # machinery (h16-h19: ring width, spec backup, union hot blocks) is generic in K. The native MTP keeps 1 / 3.
-    allowed = ("1", "2", "3", "4", "5", "6", "7") if os.environ.get("ARC_DFLASH_DRAFTER") else ("1", "3")
+    from sglang.srt.speculative import arc_dflash
+
+    allowed = ("1", "2", "3", "4", "5", "6", "7") if arc_dflash.enabled() else ("1", "3")
     if value not in allowed:
         raise ValueError(f"ARC_HISPARSE_MTP_STEPS must be one of {allowed}")
     if value == "1" and not distributed_spec_enabled():
