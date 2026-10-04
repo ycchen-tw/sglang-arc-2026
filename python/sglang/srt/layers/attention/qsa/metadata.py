@@ -106,6 +106,12 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     graph_ring_group_locs: Optional[torch.Tensor] = None
     # DECODE forwards with HiSparse offload on; None otherwise.
     hisparse: Optional[QSAHiSparseDecode] = None
+    # Extend forwards (arc-forge h15), from the scheduler's host lengths so no
+    # layer reads the GPU back: the compressed-K slots of every sequence's
+    # complete blocks (concatenated), and the largest RoPE position (text-only
+    # batches; None otherwise).
+    prefill_compressed_locs: Optional[torch.Tensor] = None
+    max_position_cpu: Optional[int] = None
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.sequence_lengths.to(torch.int32)
@@ -147,29 +153,36 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
         pool = self.token_to_kv_pool
         ratio = self.compress_ratio
         compressed_buffer = pool.get_qsa_compressed_k_buffer(layer_id)
-        parts = []
         sequence_lengths = self.sequence_lengths.to(torch.int32)
-        sequence_lengths_list = sequence_lengths.tolist()
-        for sequence_id in range(len(sequence_lengths_list)):
-            complete_blocks = int(sequence_lengths_list[sequence_id]) // ratio
-            if complete_blocks == 0:
-                continue
-            # compressed slot = first raw slot // ratio; the allocator is page-aligned,
-            # so each group is contiguous in one page (see QSATokenToKVPool).
-            compressed_locs = (
-                self.token_slot_table[
-                    sequence_id, : complete_blocks * ratio : ratio
-                ].long()
-                // ratio
+        empty = (0, pool.qsa_index_kv_heads, pool.qsa_index_head_dim)
+        if self.prefill_compressed_locs is not None:
+            # h15: one gather of the slots the metadata builder concatenated from
+            # host lengths; the same bytes as the per-sequence loop below
+            locs = self.prefill_compressed_locs
+            compressed_keys = (
+                compressed_buffer.index_select(0, locs)
+                if locs.numel()
+                else compressed_buffer.new_empty(empty)
             )
-            parts.append(compressed_buffer.index_select(0, compressed_locs))
-        compressed_keys = (
-            torch.cat(parts, dim=0)
-            if parts
-            else compressed_buffer.new_empty(
-                (0, pool.qsa_index_kv_heads, pool.qsa_index_head_dim)
+        else:
+            parts = []
+            sequence_lengths_list = sequence_lengths.tolist()
+            for sequence_id in range(len(sequence_lengths_list)):
+                complete_blocks = int(sequence_lengths_list[sequence_id]) // ratio
+                if complete_blocks == 0:
+                    continue
+                # compressed slot = first raw slot // ratio; the allocator is page-aligned,
+                # so each group is contiguous in one page (see QSATokenToKVPool).
+                compressed_locs = (
+                    self.token_slot_table[
+                        sequence_id, : complete_blocks * ratio : ratio
+                    ].long()
+                    // ratio
+                )
+                parts.append(compressed_buffer.index_select(0, compressed_locs))
+            compressed_keys = (
+                torch.cat(parts, dim=0) if parts else compressed_buffer.new_empty(empty)
             )
-        )
         num_valid_tokens = self.token_to_batch_idx.numel()
         if positions.numel() < num_valid_tokens:
             raise ValueError(

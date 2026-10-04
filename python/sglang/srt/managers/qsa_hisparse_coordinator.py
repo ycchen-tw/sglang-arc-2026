@@ -19,7 +19,7 @@ Session resume (arc-forge M1b h07, design §2.3, §4.3-4.4, §11.5), on with
 session_resume: a request may start from a parked prefix, logical slots [0, P)
 plus host blocks [0, P/4) owned by a session record. adopt_host_prefix puts the
 record's host blocks in the request's row; the prefill context reads them
-through the landing zone (fill_host_prefix_context); staging copies only
+through the landing zone (QSAHostPrefixFill, h15); staging copies only
 [P/4, nb) from the prefill area and loads the prefix's identity slots from
 host. Host blocks are then released by release_host_row(r, keep) from the
 cache's finish path, never by request_finished / abort_staging_request, which
@@ -263,11 +263,16 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         self.session_resume = session_resume
         self._host_prefix_blocks = [0] * num_slots
         self.landing_zone: Optional[QSAContextLandingZone] = None
+        # h15: host -> landing-zone fills run here, one layer ahead of the
+        # forward stream (QSAHostPrefixFill); the fill of the current forward.
+        self.context_fill_stream = None
+        self._host_fill: Optional["QSAHostPrefixFill"] = None
         if session_resume:
             ps = layout.page_size
             self.landing_zone = QSAContextLandingZone(
                 pool, -(-max_context_len // ps) * ps
             )
+            self.context_fill_stream = device_module.Stream()
 
         # M1b h08: decode GDN snapshots, off unless configured.
         self.snapshots = (
@@ -744,61 +749,27 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
     def has_host_prefix(self) -> bool:
         return any(self._host_prefix_blocks)
 
-    def fill_host_prefix_context(
-        self,
-        layer_index: int,
-        segments: Sequence[Tuple[int, int, int]],
-        k_context: torch.Tensor,
-        v_context: torch.Tensor,
-        expand: Optional[Callable[[QSAContextLandingZone, List[Tuple[int, int, int]]], None]] = None,
-    ) -> None:
-        """Write the host part of resumed prefixes into a packed prefill context,
-        on the current stream (design §4.3). segments: (req_pool_idx, P, first
-        context row) per request with a host prefix of P tokens; rows
-        [start, start + P) of k_context / v_context receive positions [0, P).
+    def begin_host_prefix_fill(
+        self, segments: Sequence[Tuple[int, int, int]]
+    ) -> "QSAHostPrefixFill":
+        """Start one extend forward's host-prefix fills (h15; design §4.3).
 
-        Records go through the landing zone, as many requests per fill as it
-        holds, then are copied out into the context (the extra D2D disappears
-        once the zone doubles as the 0030 workspace). A zone of packed records
-        (NVFP4, arc-forge h12) is not the context yet: ``expand(zone, [(blocks,
-        first context row, first zone block), ...])`` writes each request's
-        part instead of the copy.
-        """
-        zone = self.landing_zone
-        if zone is None:
-            raise RuntimeError("fill_host_prefix_context needs session_resume")
-        if expand is None and len(zone.planes) != 2:
-            raise RuntimeError("packed (NVFP4) host records need an expansion into the context")
-        bt = self.layout.block_tokens
-        group: List[Tuple[int, int, int, int]] = []
-
-        def flush() -> None:
-            host = torch.cat([self.req_to_host_pool[r, :n] for r, n, _, _ in group])
-            self.mem_pool_host.fill_context_host(layer_index, host, zone)
-            if expand is not None:
-                expand(zone, [(n, start, off) for _, n, start, off in group])
-                return
-            zone_k, zone_v = (p.view(k_context.dtype) for p in zone.planes)
-            for _, n, start, off in group:
-                k_context[start : start + n * bt].copy_(zone_k[off * bt : (off + n) * bt])
-                v_context[start : start + n * bt].copy_(zone_v[off * bt : (off + n) * bt])
-
-        used = 0
-        for r, prefix, start in segments:
-            n = self._host_prefix_blocks[r]
-            if prefix <= 0 or prefix != n * bt:
-                raise RuntimeError(
-                    f"row {r}: host segment of {prefix} tokens, adopted prefix {n * bt}"
-                )
-            if n > zone.capacity_blocks:
-                raise RuntimeError(f"row {r}: {n} host blocks exceed the landing zone")
-            if used + n > zone.capacity_blocks:
-                flush()
-                group, used = [], 0
-            group.append((r, n, start, used))
-            used += n
-        if group:
-            flush()
+        segments: (req_pool_idx, P, first context row) per request with a host
+        prefix of P tokens. Call once per forward, on the forward stream, before
+        its first QSA layer; each layer then takes its part with
+        QSAHostPrefixFill.consume, in layer order. The fills of the previous
+        forward must all have been consumed (the forward stream has waited on
+        every one of them, which is what orders the host frees after it)."""
+        if self.landing_zone is None:
+            raise RuntimeError("begin_host_prefix_fill needs session_resume")
+        prev = self._host_fill
+        if prev is not None and not prev.complete:
+            raise RuntimeError(
+                f"the previous extend forward consumed {prev.consumed_jobs} of its "
+                f"{len(prev.jobs)} landing-zone fills"
+            )
+        self._host_fill = QSAHostPrefixFill(self, segments)
+        return self._host_fill
 
     # ------------------------------------------------------------ diagnostics
 
@@ -862,6 +833,11 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
             )
         if any(self._host_prefix_blocks):
             problems.append("adopted host prefixes left on idle rows")
+        if self._host_fill is not None and not self._host_fill.complete:
+            problems.append(
+                f"landing-zone fills left unconsumed ({self._host_fill.consumed_jobs} "
+                f"of {len(self._host_fill.jobs)})"
+            )
         mapping = self.mem_pool_device.mapping
         if bool(mapping[:-1].any()) or int(mapping[-1]) != -1:
             problems.append(f"mapping has {int((mapping[:-1] != 0).sum())} live entries")
@@ -896,6 +872,9 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
     def destroy(self) -> None:
         if self.snapshots is not None:
             self.snapshots.destroy()
+        if self.context_fill_stream is not None:
+            # fills read the host pool that super().destroy() unregisters
+            self.context_fill_stream.synchronize()
         super().destroy()
 
     # ------------------------------------------------------------ unsupported
@@ -911,6 +890,110 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
 
     def _grow_device_buffers(self, *args, **kwargs):
         raise NotImplementedError("QSA HiSparse slabs are static")
+
+
+class QSAHostPrefixFill:
+    """One extend forward's host-prefix -> landing-zone fills (arc-forge h15).
+
+    h07 filled the zone on the forward stream right before each QSA layer read
+    it, so the H2D (about 0.15 ms per 1k prefix tokens per forward) never
+    overlapped compute. Here the fills run on the coordinator's
+    context_fill_stream, one job ahead: a job is (layer index, group), a group
+    is the requests packed into one zone fill (h07's rule, in segment order),
+    and the jobs run in (layer, group) order. With one zone:
+
+      fill j      side stream: waits consumed[j-1] (the fork event for j = 0),
+                  host records -> zone, then records filled[j]
+      consume j   forward stream: waits filled[j], reads the zone into the
+                  context (the backend's callback), records consumed[j], and
+                  only then enqueues fill j+1
+
+    So fill j+1 never overwrites the zone before the forward stream has read job
+    j, and a layer never reads a zone its fill has not finished; fill j+1 runs
+    while the forward stream computes the rest of layer i and the layers up to
+    the next QSA layer. Every fill is waited on by the forward stream within
+    the forward (the last consume waits the last fill), so all side-stream work
+    is ordered before the forward stream's later work: release_host_row, which
+    frees host blocks after waiting on the forward stream, and the next
+    forward, whose fork event orders its first fill after this forward's last
+    zone read. The host block lists are built once, on the forward stream
+    before the fork, and marked used by the side stream.
+    """
+
+    def __init__(self, coord: QSAHiSparseCoordinator, segments: Sequence[Tuple[int, int, int]]):
+        zone = coord.landing_zone
+        bt = coord.layout.block_tokens
+        self._coord, self._zone, self._stream = coord, zone, coord.context_fill_stream
+        # groups[g] = [(req_pool_idx, blocks, first context row, first zone block)]
+        self.groups: List[List[Tuple[int, int, int, int]]] = []
+        group: List[Tuple[int, int, int, int]] = []
+        used = 0
+        for r, prefix, start in segments:
+            n = coord._host_prefix_blocks[r]
+            if prefix <= 0 or prefix != n * bt:
+                raise RuntimeError(
+                    f"row {r}: host segment of {prefix} tokens, adopted prefix {n * bt}"
+                )
+            if n > zone.capacity_blocks:
+                raise RuntimeError(f"row {r}: {n} host blocks exceed the landing zone")
+            if used + n > zone.capacity_blocks:
+                self.groups.append(group)
+                group, used = [], 0
+            group.append((r, n, start, used))
+            used += n
+        if not group:
+            raise RuntimeError("a host-prefix fill needs at least one segment")
+        self.groups.append(group)
+        self._host = []
+        for g in self.groups:
+            host = torch.cat([coord.req_to_host_pool[r, :n] for r, n, _, _ in g])
+            host.record_stream(self._stream)
+            self._host.append(host)
+        layers = coord.mem_pool_device.layer_num
+        self.jobs = [(li, g) for li in range(layers) for g in range(len(self.groups))]
+        self._filled = [device_module.Event() for _ in self.jobs]
+        self._consumed = [device_module.Event() for _ in self.jobs]
+        self.consumed_jobs = 0
+        self._issued = 0
+        self._fork = device_module.Event()
+        self._fork.record()
+        self._issue()
+
+    @property
+    def complete(self) -> bool:
+        return self.consumed_jobs == len(self.jobs)
+
+    def _issue(self) -> None:
+        j = self._issued
+        layer_index, g = self.jobs[j]
+        stream = self._stream
+        with device_module.stream(stream):
+            stream.wait_event(self._fork if j == 0 else self._consumed[j - 1])
+            self._coord.mem_pool_host.fill_context_host(layer_index, self._host[g], self._zone)
+            self._filled[j].record(stream)
+        self._issued += 1
+
+    def consume(
+        self, layer_index: int, read_group: Callable[[QSAContextLandingZone, int], None]
+    ) -> None:
+        """This layer's groups, in order: wait for the fill, read_group(zone, g)
+        on the current (forward) stream, then start the next fill."""
+        stream = device_module.current_stream()
+        for g in range(len(self.groups)):
+            j = self.consumed_jobs
+            if j >= len(self.jobs) or self.jobs[j] != (layer_index, g):
+                raise RuntimeError(
+                    f"landing-zone fill order: layer {layer_index} group {g} asked for, "
+                    f"next job is {self.jobs[j] if j < len(self.jobs) else 'none'}"
+                )
+            if self._issued != j + 1:
+                raise RuntimeError(f"fill job {j} consumed with {self._issued} issued")
+            stream.wait_event(self._filled[j])
+            read_group(self._zone, g)
+            self._consumed[j].record(stream)
+            self.consumed_jobs += 1
+            if self.consumed_jobs < len(self.jobs):
+                self._issue()
 
 
 def create_qsa_hisparse_coordinator(model_runner) -> QSAHiSparseCoordinator:

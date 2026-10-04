@@ -480,6 +480,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # === Borrowed from ScheduleBatch: host metadata (CPU lists / mirrors) ===
     # Optional seq_lens on cpu (CPU mirror of seq_lens)
     seq_lens_cpu: Optional[torch.Tensor] = None
+    # CPU mirror of req_pool_indices on non-speculative extend forwards
+    # (arc-forge h15: the QSA extend path reads request slots without a readback)
+    req_pool_indices_cpu: Optional[torch.Tensor] = None
 
     # For logprob
     top_logprobs_nums: Optional[List[int]] = None
@@ -826,6 +829,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             seq_lens_sum=batch.seq_lens_sum,
             # Inputs aliased by reference from ScheduleBatch
             seq_lens_cpu=seq_lens_cpu,
+            # ScheduleBatch documents its mirror as stale in the speculative
+            # draft window: only non-speculative extend forwards carry it (h15)
+            req_pool_indices_cpu=(
+                batch.req_pool_indices_cpu
+                if batch.spec_algorithm.is_none()
+                and not batch.forward_mode.is_decode_or_idle()
+                else None
+            ),
             orig_seq_lens=batch.orig_seq_lens,
             out_cache_loc_dsv4=batch.out_cache_loc_dsv4,
             mamba_track_indices=batch.mamba_track_indices,

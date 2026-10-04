@@ -271,12 +271,17 @@ def _sparse_gqa_chunk_prefill(
     )
 
 
-def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, scale):
+def sparse_gqa_fwd_interface_triton_ck(
+    q, k, v, indices, cu_q, cu_k, kv_lens, scale, max_q=None
+):
+    """max_q: the longest query segment when the caller knows it on the host
+    (arc-forge h15); otherwise it is read back from cu_q."""
     k, v = k.contiguous(), v.contiguous()
     total_q, num_q_heads, head_dim = q.shape
     num_kv_heads = k.shape[1]
     group_size = num_q_heads // num_kv_heads
-    max_q = int((cu_q[1:] - cu_q[:-1]).max().item())
+    if max_q is None:
+        max_q = int((cu_q[1:] - cu_q[:-1]).max().item())
     block_m = max(16, triton.next_power_of_2(group_size))
     block_n, warps, stages = _get_best_config(total_q)
     out = torch.empty_like(q)
@@ -869,6 +874,145 @@ def qwen_sparse_nvfp4_expand_triton(
     )
 
 
+@triton.jit
+def _nvfp4_expand_kv_segments(
+    k_fp4,
+    v_fp4,
+    k_sf,
+    v_sf,
+    table,
+    table_stride,
+    segments,
+    out_k,
+    out_v,
+    k_global,
+    v_global,
+    heads: tl.constexpr,
+    dim: tl.constexpr,
+    IDENTITY: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    OUT_FP8: tl.constexpr,
+):
+    """_nvfp4_expand_kv with the output placement and source rows given per
+    segment (arc-forge h15): segment s = (table row, first table column, first
+    output row, length). Source rows are table[row, col + t], or col + t with
+    IDENTITY. The per-element arithmetic is _nvfp4_expand_kv's, line for line."""
+    PACK: tl.constexpr = dim // 2
+    SF: tl.constexpr = dim // 16
+    pid_s, pid_h, pid_t = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    seg = segments + pid_s * 4
+    row = tl.load(seg).to(tl.int64)
+    col = tl.load(seg + 1).to(tl.int64)
+    start = tl.load(seg + 2).to(tl.int64)
+    length = tl.load(seg + 3).to(tl.int64)
+    tokens = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
+    live = tokens < length
+    if IDENTITY:
+        slots = col + tokens.to(tl.int64)
+    else:
+        slots = tl.load(
+            table + row * table_stride + col + tokens, mask=live, other=0
+        ).to(tl.int64)
+
+    pack = tl.arange(0, PACK)
+    packed_src = slots[:, None] * (heads * PACK) + pid_h * PACK + pack[None, :]
+    scale_src = slots[:, None] * (heads * SF) + pid_h * SF + (pack // 8)[None, :]
+    mask = live[:, None]
+    kb = tl.load(k_fp4 + packed_src, mask=mask, other=0)
+    vb = tl.load(v_fp4 + packed_src, mask=mask, other=0)
+    k_step = tl.load(k_sf + scale_src, mask=mask, other=0.0).to(tl.float32) * tl.load(k_global)
+    v_step = tl.load(v_sf + scale_src, mask=mask, other=0.0).to(tl.float32) * tl.load(v_global)
+    dst = (start + tokens)[:, None] * (heads * dim) + pid_h * dim + 2 * pack[None, :]
+
+    k_low = _nvfp4_decode_nibble(kb, 0) * k_step
+    k_high = _nvfp4_decode_nibble(kb, 1) * k_step
+    v_low = _nvfp4_decode_nibble(vb, 0) * v_step
+    v_high = _nvfp4_decode_nibble(vb, 1) * v_step
+    if OUT_FP8:
+        k_low, k_high = k_low.to(tl.float8e4nv), k_high.to(tl.float8e4nv)
+        v_low, v_high = v_low.to(tl.float8e4nv), v_high.to(tl.float8e4nv)
+    else:
+        k_low, k_high = k_low.to(tl.bfloat16), k_high.to(tl.bfloat16)
+        v_low, v_high = v_low.to(tl.bfloat16), v_high.to(tl.bfloat16)
+    tl.store(out_k + dst, k_low, mask=mask)
+    tl.store(out_k + dst + 1, k_high, mask=mask)
+    tl.store(out_v + dst, v_low, mask=mask)
+    tl.store(out_v + dst + 1, v_high, mask=mask)
+
+
+def qwen_sparse_nvfp4_expand_segments_triton(
+    k_fp4,
+    v_fp4,
+    k_sf,
+    v_sf,
+    table,
+    segments,
+    out_k,
+    out_v,
+    k_global,
+    v_global,
+    max_length,
+):
+    """Expand packed NVFP4 rows segment by segment into ``out_k``/``out_v``
+    (arc-forge h15). ``segments`` is int64 ``[n, 4]``: (table row, first table
+    column, first output row, length); ``table`` None reads plane rows
+    ``col .. col + length - 1`` directly. One launch covers pieces whose outputs
+    are not one contiguous run (every request's device part of a resumed
+    batch), with the bytes qwen_sparse_nvfp4_expand_triton would write for each.
+    ``max_length`` (host int) is the longest segment; the table's row stride is
+    a runtime argument, so tables of any width share one compiled kernel."""
+    if k_fp4.dtype != torch.uint8 or v_fp4.dtype != torch.uint8:
+        raise ValueError(f"Packed NVFP4 K/V must be uint8, got {k_fp4.dtype}/{v_fp4.dtype}")
+    if out_k.dtype != out_v.dtype:
+        raise ValueError("NVFP4 expansion outputs must share a dtype")
+    out_fp8 = out_k.dtype == torch.float8_e4m3fn
+    if not out_fp8 and out_k.dtype != torch.bfloat16:
+        raise ValueError(f"NVFP4 expansion writes FP8 or BF16, got {out_k.dtype}")
+    if k_global.dtype != torch.float32 or v_global.dtype != torch.float32:
+        raise ValueError("NVFP4 global scales must be float32 device tensors")
+    heads, dim = out_k.shape[1], out_k.shape[2]
+    if k_fp4.shape[1] != heads or k_fp4.shape[2] * 2 != dim:
+        raise ValueError("Packed NVFP4 geometry does not match the expansion output")
+    if k_sf.shape[2] * 16 != dim:
+        raise ValueError("NVFP4 block-scale geometry does not match the expansion output")
+    if not (out_k.is_contiguous() and out_v.is_contiguous()):
+        raise ValueError("NVFP4 expansion outputs must be contiguous")
+    if (
+        segments.dtype != torch.int64
+        or segments.ndim != 2
+        or segments.shape[1] != 4
+        or not segments.is_contiguous()
+    ):
+        raise ValueError(
+            f"segments must be contiguous int64 [n, 4], got {segments.dtype} {tuple(segments.shape)}"
+        )
+    identity = table is None
+    if not identity and (table.ndim != 2 or table.stride(1) != 1):
+        raise ValueError("the NVFP4 segment table must be 2-D with unit column stride")
+    if segments.shape[0] == 0 or max_length <= 0:
+        raise ValueError(f"empty NVFP4 segment expansion ({segments.shape[0]} segments, longest {max_length})")
+    block_t = 8
+    _nvfp4_expand_kv_segments[(segments.shape[0], heads, triton.cdiv(max_length, block_t))](
+        k_fp4,
+        v_fp4,
+        k_sf.view(torch.float8_e4m3fn),
+        v_sf.view(torch.float8_e4m3fn),
+        segments if identity else table,
+        0 if identity else table.stride(0),
+        segments,
+        out_k,
+        out_v,
+        k_global,
+        v_global,
+        heads,
+        dim,
+        IDENTITY=identity,
+        BLOCK_T=block_t,
+        OUT_FP8=out_fp8,
+        num_warps=4,
+    )
+
+
 
 @triton.jit
 def _sparse_gqa_decode_selected(
@@ -1194,6 +1338,7 @@ __all__ = [
     "qwen_sparse_valid_counts_triton",
     "qwen_sparse_kv_extraction_compact_triton",
     "qwen_sparse_nvfp4_expand_triton",
+    "qwen_sparse_nvfp4_expand_segments_triton",
     "sparse_gqa_fwd_interface_triton",
     "sparse_gqa_fwd_interface_triton_ck",
     "qwen_sparse_gqa_decode_selected_triton",

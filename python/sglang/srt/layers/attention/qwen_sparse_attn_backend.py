@@ -11,6 +11,7 @@ import math
 import os
 from copy import copy
 from functools import lru_cache
+from itertools import accumulate
 from typing import Dict, List, Optional, Tuple
 
 import msgspec
@@ -34,6 +35,7 @@ from sglang.srt.layers.attention.qsa.metadata import (
 from sglang.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
+    qwen_sparse_nvfp4_expand_segments_triton,
     qwen_sparse_nvfp4_expand_triton,
     qwen_sparse_nvfp4_gather4_triton,
     qwen_sparse_gqa_decode_selected_triton,
@@ -76,6 +78,77 @@ if _ARC_QSA_NVFP4_GATHER not in ("fused", "split"):
 # kernel re-reads per query row (the dominant cost of chunk prefill); BF16
 # exists so the downcast's quantization cost can be measured against it.
 _ARC_QSA_NVFP4_PREFILL = os.environ.get("ARC_QSA_NVFP4_PREFILL", "fp8")
+# arc-forge QSA HiSparse debug flag (shared with the indexer and coordinator):
+# the extend path's contract checks raise on the host instead of asserting on
+# the device (h15).
+_ARC_HISPARSE_QSA_DEBUG = os.environ.get("ARC_HISPARSE_QSA_DEBUG", "0")
+if _ARC_HISPARSE_QSA_DEBUG not in ("0", "1"):
+    raise ValueError(
+        f"ARC_HISPARSE_QSA_DEBUG must be 0 or 1, got {_ARC_HISPARSE_QSA_DEBUG!r}"
+    )
+_ARC_HISPARSE_QSA_DEBUG = _ARC_HISPARSE_QSA_DEBUG == "1"
+
+
+def _host_ints_to_device(values, dtype: torch.dtype, device) -> torch.Tensor:
+    """A host list -> device tensor without a host sync (h15): pinned staging
+    and a non-blocking copy; the caching host allocator keeps the staging block
+    until the copy has run."""
+    return torch.tensor(values, dtype=dtype, pin_memory=True).to(device, non_blocking=True)
+
+
+def _check_on_device(bad: torch.Tensor, what: str) -> None:
+    """A contract check that must not read the GPU back (h15): a device-side
+    assert, which kills the CUDA context. ARC_HISPARSE_QSA_DEBUG=1 checks on the
+    host instead and raises RuntimeError(what)."""
+    if _ARC_HISPARSE_QSA_DEBUG:
+        if bool(bad.any()):
+            raise RuntimeError(what)
+        return
+    torch._assert_async(~bad.any(), what)
+
+
+class _QSAExtendPlan:
+    """What every QSA layer of one extend forward shares (arc-forge h15).
+
+    Built once per forward from the scheduler's CPU lengths: sizes, cu_seqlens,
+    the context table, the landing-zone fill and the NVFP4 segment descriptors.
+    Before h15 each of the 12 QSA layers rebuilt these and read the GPU back to
+    do it (a HiSparse resume forward made 151 host syncs), so the CPU could not
+    run ahead of the GPU. Everything a layer sizes a kernel or an allocation by
+    is a host int here; the device tensors are copied without a sync.
+    """
+
+    def __init__(self, forward_batch, extend_lens: List[int], seq_lens: List[int]):
+        self.forward_batch = forward_batch
+        self.extend_lens = extend_lens
+        self.seq_lens = seq_lens
+        self.prefix_lens = [s - e for s, e in zip(seq_lens, extend_lens)]
+        self.any_prefix = any(self.prefix_lens)
+        self.total = sum(seq_lens)
+        self.max_seq = max(seq_lens, default=0)
+        self.max_q = max(extend_lens, default=0)
+        self.starts = list(accumulate(seq_lens, initial=0))[:-1]
+        self.cu_seqlens_q: Optional[torch.Tensor] = None
+        # prefix forwards only
+        self.seq_lens_t: Optional[torch.Tensor] = None  # int32 [bs]
+        self.cu_seqlens_k: Optional[torch.Tensor] = None
+        self.slot_table: Optional[torch.Tensor] = None  # the context's slot / row table
+        self.slot_rows: Optional[torch.Tensor] = None  # its row per request
+        self.slot_rows_cpu: Optional[List[int]] = None
+        # HiSparse host prefixes (h07): tokens per request, the zone fills
+        self.host_lens: Optional[List[int]] = None
+        self.host_fill = None
+        self.device_rows: Optional[List[torch.Tensor]] = None  # FP8: rows [host, seq) per request
+        self.device_segments: Optional[torch.Tensor] = None  # NVFP4: int64 [bs, 4]
+        self.device_max = 0
+        self.zone_segments: Optional[List[Tuple[torch.Tensor, int]]] = None
+
+    def check_same(self, forward_batch) -> None:
+        if (
+            [int(x) for x in forward_batch.extend_seq_lens_cpu] != self.extend_lens
+            or [int(x) for x in forward_batch.seq_lens_cpu] != self.seq_lens
+        ):
+            raise RuntimeError("a forward_batch changed its lengths between QSA layers")
 
 
 def _pool_kv_quant_name(pool) -> Optional[str]:
@@ -315,6 +388,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._trtllm_workspace = None
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
+        self._extend_plan_state: Optional[_QSAExtendPlan] = None  # h15
         # QSA HiSparse offload (arc-forge h04). ModelRunner builds the
         # coordinator in alloc_memory_pool, before the attention backends.
         self.hisparse_coordinator = (
@@ -835,6 +909,14 @@ class QwenSparseAttnBackend(AttentionBackend):
                 extend_seq_lens = forward_batch.extend_seq_lens
                 if extend_seq_lens is None:
                     raise ValueError("QSA extend metadata requires extend_seq_lens")
+                # h15: the output size from the scheduler's host lengths; without
+                # it repeat_interleave reads the total (and a non-negative check)
+                # back from the GPU.
+                extend_host = forward_batch.extend_seq_lens_cpu
+                if extend_host is not None and len(extend_host) != batch_size:
+                    raise ValueError(
+                        f"QSA extend: {len(extend_host)} host extend lengths, batch {batch_size}"
+                    )
                 token_to_batch_idx = torch.repeat_interleave(
                     torch.arange(
                         batch_size,
@@ -842,6 +924,9 @@ class QwenSparseAttnBackend(AttentionBackend):
                         dtype=torch.int32,
                     ),
                     extend_seq_lens.to(torch.long),
+                    output_size=(
+                        None if extend_host is None else sum(int(x) for x in extend_host)
+                    ),
                 )
                 # More mapped rows than physical would index past them;
                 # fewer is fine (DP MAX_LEN padding is trimmed downstream).
@@ -914,6 +999,18 @@ class QwenSparseAttnBackend(AttentionBackend):
                         sequence_ids=group_sequence_ids.long(),
                         compress_ratio=self.compress_ratio,
                     )
+        # h15: what the indexer's extend path read back per layer, from host lengths
+        prefill_compressed_locs = None
+        max_position_cpu = None
+        if not decode_like and forward_batch.seq_lens_cpu is not None:
+            host_lengths = [int(x) for x in forward_batch.seq_lens_cpu[:batch_size]]
+            prefill_compressed_locs = self._prefill_compressed_locs(
+                token_slot_table, host_lengths
+            )
+            mm_inputs = forward_batch.mm_inputs
+            if mm_inputs is None or all(m is None for m in mm_inputs):
+                # text only: extend positions are [prefix, seq) per request
+                max_position_cpu = max(host_lengths) - 1
         hisparse = None
         if (
             self.hisparse_coordinator is not None
@@ -942,6 +1039,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             compress_group_ring_locs=compress_group_ring_locs,
             extend_rope_matrix=extend_rope_matrix,
             hisparse=hisparse,
+            prefill_compressed_locs=prefill_compressed_locs,
+            max_position_cpu=max_position_cpu,
         )
         return QwenSparseAttnMetadata(
             sequence_lengths=sequence_lengths,
@@ -951,11 +1050,31 @@ class QwenSparseAttnBackend(AttentionBackend):
             row_req_pool_indices=row_req_pool_indices,
         )
 
+    def _prefill_compressed_locs(
+        self, token_slot_table: torch.Tensor, sequence_lengths: List[int]
+    ) -> torch.Tensor:
+        """Compressed-K slots of every sequence's complete blocks, concatenated
+        in sequence order (h15): what get_prefill_mqa_inputs gathered per layer
+        and per sequence, once per forward."""
+        ratio = self.token_to_kv_pool.qsa_compress_ratio
+        parts = [
+            token_slot_table[i, : (length // ratio) * ratio : ratio]
+            for i, length in enumerate(sequence_lengths)
+            if length // ratio
+        ]
+        if not parts:
+            return torch.empty(0, dtype=torch.long, device=token_slot_table.device)
+        return torch.cat(parts).long() // ratio
+
     def init_forward_metadata(self, forward_batch):
         if forward_batch.forward_mode.is_idle():
             self.forward_metadata = None
             return
         self.forward_metadata = self._metadata_from_forward_batch(forward_batch)
+        if self._plans_extend_early(forward_batch):
+            # h15: the landing-zone fill of the first QSA layer starts now,
+            # overlapping the layers before it
+            self._extend_plan(forward_batch)
 
     def init_forward_metadata_out_graph(
         self,
@@ -1550,45 +1669,208 @@ class QwenSparseAttnBackend(AttentionBackend):
             return self._pad_extend_output(output, num_output_rows)
 
         topk_indices = topk_indices.to(torch.int32).contiguous()
-        extend_lens = [int(x) for x in forward_batch.extend_seq_lens_cpu]
-        sequence_lens = [int(x) for x in forward_batch.seq_lens_cpu]
-        prefix_lens = [
-            sequence_lens[i] - extend_lens[i] for i in range(len(extend_lens))
-        ]
-        cu_seqlens_q = F.pad(
-            forward_batch.extend_seq_lens.to(q.device, dtype=torch.int32).cumsum(0),
-            (1, 0),
-        ).contiguous()
-        if not any(prefix_lens):
+        plan = self._extend_plan(forward_batch)
+        if not plan.any_prefix:
             output = sparse_gqa_fwd_interface_triton(
                 q.contiguous(),
                 k[:num_valid_rows].contiguous(),
                 v[:num_valid_rows].contiguous(),
-                max(sequence_lens, default=1),
+                max(plan.seq_lens, default=1),
                 topk_indices,
-                cu_seqlens_q,
+                plan.cu_seqlens_q,
                 layer.scaling,
             )
             return self._pad_extend_output(output, num_output_rows)
 
         # The validated chunk-prefill kernel consumes tightly packed full-context
         # K/V. Current-chunk K/V has already been committed to the cache above.
-        pool = self.token_to_kv_pool
-        sequence_lens_tensor = torch.tensor(
-            sequence_lens, dtype=torch.int32, device=q.device
+        k_context, v_context = self._extend_context(layer, plan, q)
+        output = sparse_gqa_fwd_interface_triton_ck(
+            q.contiguous(),
+            k_context,
+            v_context,
+            topk_indices,
+            plan.cu_seqlens_q,
+            plan.cu_seqlens_k,
+            plan.seq_lens_t,
+            layer.scaling,
+            max_q=plan.max_q,
         )
-        cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
-        # Resumed session prefixes on host (arc-forge M1b h07); None without any.
-        host_lens = self._hisparse_host_prefix_lens(forward_batch)
-        if host_lens is not None and self.arc_nvfp4:
-            k_context, v_context = self._hisparse_host_prefix_context_nvfp4(
-                layer, forward_batch, sequence_lens, host_lens, q
+        return self._pad_extend_output(output, num_output_rows)
+
+    # ------------------------------------------------------------ extend plan (arc-forge h15)
+
+    def _plans_extend_early(self, forward_batch) -> bool:
+        """init_forward_metadata builds the extend plan up front when it starts
+        landing-zone fills: a HiSparse extend forward whose rows may hold
+        adopted host prefixes. Every other extend forward builds it in its first
+        QSA layer, which is the same work at the same point in the stream."""
+        coord = self.hisparse_coordinator
+        mode = forward_batch.forward_mode
+        return (
+            coord is not None
+            and coord.has_host_prefix()
+            and mode.is_extend()
+            and not self._is_speculative_paged_mode(mode)
+        )
+
+    def _extend_plan(self, forward_batch) -> "_QSAExtendPlan":
+        """This forward's _QSAExtendPlan; every QSA layer of one forward_batch
+        gets the same one."""
+        plan = self._extend_plan_state
+        if plan is not None and plan.forward_batch is forward_batch:
+            plan.check_same(forward_batch)
+            return plan
+        plan = self._build_extend_plan(forward_batch)
+        self._extend_plan_state = plan
+        return plan
+
+    def _req_pool_indices_cpu(self, forward_batch, *, required: bool) -> List[int]:
+        """The batch's request slots from the scheduler's CPU mirror
+        (ForwardBatch.req_pool_indices_cpu, h15). Without the mirror a path that
+        can do with one readback per forward takes it; HiSparse host prefixes
+        cannot (required)."""
+        bs = forward_batch.req_pool_indices.shape[0]
+        mirror = forward_batch.req_pool_indices_cpu
+        if mirror is None:
+            if required:
+                raise RuntimeError(
+                    "QSA HiSparse host prefixes need forward_batch.req_pool_indices_cpu "
+                    "(the scheduler's CPU mirror of req_pool_indices)"
+                )
+            return [int(x) for x in forward_batch.req_pool_indices.tolist()]
+        rpi = [int(x) for x in mirror]
+        if len(rpi) != bs:
+            raise RuntimeError(
+                f"req_pool_indices_cpu has {len(rpi)} rows, req_pool_indices {bs}"
             )
-        elif host_lens is not None:
-            k_context, v_context = self._hisparse_host_prefix_context(
-                layer, forward_batch, sequence_lens, host_lens
+        if _ARC_HISPARSE_QSA_DEBUG and rpi != forward_batch.req_pool_indices.tolist():
+            raise RuntimeError("req_pool_indices_cpu disagrees with req_pool_indices")
+        return rpi
+
+    def _build_extend_plan(self, forward_batch) -> "_QSAExtendPlan":
+        if forward_batch.extend_seq_lens_cpu is None or forward_batch.seq_lens_cpu is None:
+            raise RuntimeError(
+                "QSA extend needs the scheduler's CPU lengths (extend_seq_lens_cpu, seq_lens_cpu)"
             )
-        elif self.arc_nvfp4:
+        extend_lens = [int(x) for x in forward_batch.extend_seq_lens_cpu]
+        seq_lens = [int(x) for x in forward_batch.seq_lens_cpu]
+        if len(seq_lens) != len(extend_lens):
+            raise RuntimeError(
+                f"QSA extend: {len(seq_lens)} sequence lengths, {len(extend_lens)} extend lengths"
+            )
+        plan = _QSAExtendPlan(forward_batch, extend_lens, seq_lens)
+        device = forward_batch.extend_seq_lens.device
+        plan.cu_seqlens_q = F.pad(
+            forward_batch.extend_seq_lens.to(device, dtype=torch.int32).cumsum(0),
+            (1, 0),
+        ).contiguous()
+        if not plan.any_prefix:
+            return plan
+        plan.seq_lens_t = _host_ints_to_device(seq_lens, torch.int32, device)
+        plan.cu_seqlens_k = F.pad(plan.seq_lens_t.cumsum(0), (1, 0)).contiguous()
+        coord = self.hisparse_coordinator
+        if coord is None:
+            plan.slot_table = self.req_to_token_pool.req_to_token
+            plan.slot_rows = forward_batch.req_pool_indices
+            if not self.arc_nvfp4:
+                plan.slot_rows_cpu = self._req_pool_indices_cpu(forward_batch, required=False)
+            return plan
+        if coord.has_host_prefix():
+            rpi = self._req_pool_indices_cpu(forward_batch, required=True)
+            host_lens = coord.host_prefix_lens(rpi)
+            plan.host_lens = host_lens if any(host_lens) else None
+        rows = self._hisparse_rows(forward_batch, plan)
+        if plan.host_lens is None:
+            # M1a: every context row is a device row, read through the h04 table
+            plan.slot_table = self._nvfp4_fixed_width(rows) if self.arc_nvfp4 else rows
+            plan.slot_rows = torch.arange(
+                rows.shape[0], dtype=forward_batch.req_pool_indices.dtype, device=rows.device
+            )
+            plan.slot_rows_cpu = list(range(rows.shape[0]))
+            return plan
+        plan.slot_table = rows
+        segments = []
+        for i, (seq, host, start) in enumerate(zip(seq_lens, plan.host_lens, plan.starts)):
+            if not 0 <= host < seq:
+                raise RuntimeError(
+                    f"QSA HiSparse context: host prefix {host} of a {seq}-token request"
+                )
+            if host:
+                segments.append((rpi[i], host, start))
+        plan.host_fill = coord.begin_host_prefix_fill(segments)
+        if not self.arc_nvfp4:
+            plan.device_rows = [
+                rows[i, host:seq].long() for i, (seq, host) in enumerate(zip(seq_lens, plan.host_lens))
+            ]
+            return plan
+        # One descriptor table for the forward (segments_triton rows: table row,
+        # first table column, first context row, length), copied once.
+        bt = self.compress_ratio
+        device_segments = [
+            (i, host, start + host, seq - host)
+            for i, (seq, host, start) in enumerate(zip(seq_lens, plan.host_lens, plan.starts))
+        ]
+        zone_segments = [
+            [(0, off * bt, start, n * bt) for _, n, start, off in group]
+            for group in plan.host_fill.groups
+        ]
+        flat = device_segments + [s for group in zone_segments for s in group]
+        table = _host_ints_to_device(
+            [x for s in flat for x in s], torch.int64, device
+        ).view(len(flat), 4)
+        plan.device_segments = table[: len(device_segments)]
+        plan.device_max = max(s[3] for s in device_segments)
+        plan.zone_segments, at = [], len(device_segments)
+        for group in zone_segments:
+            plan.zone_segments.append((table[at : at + len(group)], max(s[3] for s in group)))
+            at += len(group)
+        return plan
+
+    def _hisparse_rows(self, forward_batch, plan: "_QSAExtendPlan") -> torch.Tensor:
+        """Device KV rows of every request's positions [0, seq): ``rows[i, j]``
+        (int32). With HiSparse the pool holds device rows only, so the logical
+        slots are translated through ``pool.rows_of``; the table is the same for
+        every layer of the forward. ``plan.host_lens[i]`` > 0 declares positions
+        [0, host_lens[i]) a host-resident prefix (h07): they must have no device
+        row and are not read from here. The two contract checks are device-side
+        (no readback); ARC_HISPARSE_QSA_DEBUG=1 makes them raise on the host."""
+        req_to_token = self.req_to_token_pool.req_to_token
+        device = req_to_token.device
+        width = plan.max_seq
+        lengths = plan.seq_lens_t.to(torch.int64)
+        positions = torch.arange(width, device=device)[None, :]
+        live = positions < lengths[:, None]
+        # Past a request's length the table holds stale slots; read slot 0 there.
+        logical = torch.where(
+            live, req_to_token[forward_batch.req_pool_indices.long(), :width], 0
+        )
+        rows = self.token_to_kv_pool.rows_of(logical)
+        # An unmapped slot translates into device block 0, the reserved dump.
+        no_row = rows < self.compress_ratio
+        if plan.host_lens is not None:
+            hosts = _host_ints_to_device(plan.host_lens, torch.int64, device)
+            on_host = positions < hosts[:, None]
+            _check_on_device(
+                on_host & ~no_row,
+                "QSA HiSparse prefill context: a declared host prefix has device rows",
+            )
+            live = live & ~on_host
+        _check_on_device(
+            no_row & live, "QSA HiSparse prefill context has a slot with no device row"
+        )
+        return rows.to(torch.int32)
+
+    def _extend_context(
+        self, layer, plan: "_QSAExtendPlan", q: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Tightly packed K/V of every request's context [0, seq), as the chunk
+        kernel reads it; request i at rows [starts[i], starts[i] + seq[i])."""
+        if plan.host_fill is not None and self.arc_nvfp4:
+            return self._hisparse_host_prefix_context_nvfp4(layer, plan, q)
+        if plan.host_fill is not None:
+            return self._hisparse_host_prefix_context(layer, plan)
+        if self.arc_nvfp4:
             # One fused pass per layer: gather + dequantize + downcast write
             # straight into the buffer the chunk kernel consumes. The previous
             # index_select -> BF16 -> FP8 -> torch.cat chain held four copies of
@@ -1596,98 +1878,27 @@ class QwenSparseAttnBackend(AttentionBackend):
             # The expansion folds the global scale in, and
             # _sparse_gqa_chunk_prefill casts FP8 K/V to the query dtype with no
             # scale of its own, so no k_scale/v_scale reaches the kernel.
-            k_context, v_context = self._nvfp4_expand_context(
-                layer, forward_batch, cu_seqlens_k, sequence_lens, q
-            )
-        else:
-            slot_table, slot_rows = self._context_slot_table(
-                forward_batch, sequence_lens
-            )
-            req_indices = slot_rows.tolist()
-            k_buffer = pool.get_key_buffer(layer.layer_id)
-            v_buffer = pool.get_value_buffer(layer.layer_id)
-            k_context = torch.cat(
-                [
-                    k_buffer.index_select(
-                        0, slot_table[req_indices[i], : sequence_lens[i]].long()
-                    )
-                    for i in range(len(sequence_lens))
-                ]
-            )
-            v_context = torch.cat(
-                [
-                    v_buffer.index_select(
-                        0, slot_table[req_indices[i], : sequence_lens[i]].long()
-                    )
-                    for i in range(len(sequence_lens))
-                ]
-            )
-        output = sparse_gqa_fwd_interface_triton_ck(
-            q.contiguous(),
-            k_context,
-            v_context,
-            topk_indices,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            sequence_lens_tensor,
-            layer.scaling,
+            return self._nvfp4_expand_context(layer, plan, q)
+        pool = self.token_to_kv_pool
+        table, req_indices = plan.slot_table, plan.slot_rows_cpu
+        k_buffer = pool.get_key_buffer(layer.layer_id)
+        v_buffer = pool.get_value_buffer(layer.layer_id)
+        k_context = torch.cat(
+            [
+                k_buffer.index_select(0, table[req_indices[i], :seq].long())
+                for i, seq in enumerate(plan.seq_lens)
+            ]
         )
-        return self._pad_extend_output(output, num_output_rows)
-
-    def _context_slot_table(
-        self, forward_batch, sequence_lens, host_lens=None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """``(table, row per request)`` a prefix chunk gathers its context
-        through: ``table[row[i], :sequence_lens[i]]`` are request i's pool slots.
-
-        Without HiSparse this is req_to_token and the requests' pool rows. With
-        it the pool holds device rows only, so the logical slots are translated
-        (``pool.rows_of``) into a per-request table read with rows ``arange(bs)``.
-        ``host_lens[i]`` > 0 declares positions [0, host_lens[i]) a host-resident
-        prefix (h07): they must have no device row, and are not read from here.
-        """
-        req_to_token = self.req_to_token_pool.req_to_token
-        req_pool_indices = forward_batch.req_pool_indices
-        if self.hisparse_coordinator is None:
-            return req_to_token, req_pool_indices
-        device = req_to_token.device
-        width = max(sequence_lens)
-        lengths = torch.tensor(sequence_lens, dtype=torch.int64, device=device)
-        positions = torch.arange(width, device=device)[None, :]
-        live = positions < lengths[:, None]
-        # Past a request's length the table holds stale slots; read slot 0 there.
-        logical = torch.where(live, req_to_token[req_pool_indices.long(), :width], 0)
-        rows = self.token_to_kv_pool.rows_of(logical)
-        # An unmapped slot translates into device block 0, the reserved dump.
-        no_row = rows < self.compress_ratio
-        if host_lens is not None:
-            hosts = torch.tensor(host_lens, dtype=torch.int64, device=device)
-            on_host = positions < hosts[:, None]
-            if bool((on_host & ~no_row).any()):
-                raise RuntimeError(
-                    "QSA HiSparse prefill context: a declared host prefix has device rows"
-                )
-            live = live & ~on_host
-        if bool((no_row & live).any()):
-            raise RuntimeError(
-                "QSA HiSparse prefill context has a slot with no device row"
-            )
-        rows = rows.to(torch.int32)
-        return rows, torch.arange(
-            rows.shape[0], dtype=req_pool_indices.dtype, device=device
+        v_context = torch.cat(
+            [
+                v_buffer.index_select(0, table[req_indices[i], :seq].long())
+                for i, seq in enumerate(plan.seq_lens)
+            ]
         )
-
-    def _hisparse_host_prefix_lens(self, forward_batch) -> Optional[List[int]]:
-        """Per request, the tokens of its adopted host prefix (M1b h07), or None
-        when no request of this batch has one (the M1a path, no extra sync)."""
-        coord = self.hisparse_coordinator
-        if coord is None or not coord.has_host_prefix():
-            return None
-        lens = coord.host_prefix_lens(forward_batch.req_pool_indices.tolist())
-        return lens if any(lens) else None
+        return k_context, v_context
 
     def _hisparse_host_prefix_context(
-        self, layer, forward_batch, sequence_lens, host_lens
+        self, layer, plan: "_QSAExtendPlan"
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Tightly packed FP8 context of a batch with resumed prefixes (M1b h07,
         design §4.3): request i's rows [host_lens[i], seq) are gathered from its
@@ -1697,115 +1908,68 @@ class QwenSparseAttnBackend(AttentionBackend):
         coord = self.hisparse_coordinator
         k_buffer = pool.get_key_buffer(layer.layer_id)
         v_buffer = pool.get_value_buffer(layer.layer_id)
-        slot_table, _ = self._context_slot_table(forward_batch, sequence_lens, host_lens)
-        total = sum(sequence_lens)
-        k_context = k_buffer.new_empty((total,) + tuple(k_buffer.shape[1:]))
-        v_context = v_buffer.new_empty((total,) + tuple(v_buffer.shape[1:]))
-        req_indices = forward_batch.req_pool_indices.tolist()
-        segments = []
-        start = 0
-        for i, (seq, host) in enumerate(zip(sequence_lens, host_lens)):
-            if not 0 <= host < seq:
-                raise RuntimeError(
-                    f"QSA HiSparse context: host prefix {host} of a {seq}-token request"
-                )
-            rows = slot_table[i, host:seq].long()
+        k_context = k_buffer.new_empty((plan.total,) + tuple(k_buffer.shape[1:]))
+        v_context = v_buffer.new_empty((plan.total,) + tuple(v_buffer.shape[1:]))
+        for rows, seq, host, start in zip(
+            plan.device_rows, plan.seq_lens, plan.host_lens, plan.starts
+        ):
             torch.index_select(k_buffer, 0, rows, out=k_context[start + host : start + seq])
             torch.index_select(v_buffer, 0, rows, out=v_context[start + host : start + seq])
-            if host:
-                segments.append((req_indices[i], host, start))
-            start += seq
-        coord.fill_host_prefix_context(
-            coord.layer_index(layer.layer_id), segments, k_context, v_context
-        )
+        bt = self.compress_ratio
+        fill = plan.host_fill
+
+        def read_group(zone, g):
+            if len(zone.planes) != 2:
+                raise RuntimeError("packed (NVFP4) host records need the NVFP4 context path")
+            zone_k, zone_v = (p.view(k_context.dtype) for p in zone.planes)
+            for _, n, start, off in fill.groups[g]:
+                k_context[start : start + n * bt].copy_(zone_k[off * bt : (off + n) * bt])
+                v_context[start : start + n * bt].copy_(zone_v[off * bt : (off + n) * bt])
+
+        fill.consume(coord.layer_index(layer.layer_id), read_group)
         return k_context, v_context
 
     def _hisparse_host_prefix_context_nvfp4(
-        self, layer, forward_batch, sequence_lens, host_lens, q: torch.Tensor
+        self, layer, plan: "_QSAExtendPlan", q: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """NVFP4 twin of _hisparse_host_prefix_context (arc-forge h12): request
         i's rows [host_lens[i], seq) are expanded from its device rows and rows
         [0, host_lens[i]) from its host records, which the landing zone holds as
-        the four packed planes. Both go through the fused 0030 expansion with the
-        layer's global scales, so the context is _nvfp4_expand_context's over a
-        full-resident pool. One expansion per segment: its output slice must be
-        contiguous, and a request's two segments come from different buffers."""
+        the four packed planes. Both go through the 0030 expansion arithmetic
+        with the layer's global scales, so the context is _nvfp4_expand_context's
+        over a full-resident pool. h15: one segment launch for every request's
+        device part and one per zone group, from the plan's descriptors."""
         pool = self.token_to_kv_pool
         coord = self.hisparse_coordinator
         planes = pool.get_raw_kv_buffer(layer.layer_id)
         method = pool.get_kv_cache_quant_method()
         layer_id = layer.layer_id
-        scales = (
-            method.k_scales_gpu[layer_id : layer_id + 1],
-            method.v_scales_gpu[layer_id : layer_id + 1],
-        )
+        k_scale = method.k_scales_gpu[layer_id : layer_id + 1]
+        v_scale = method.v_scales_gpu[layer_id : layer_id + 1]
         heads, dim = planes[0].shape[1], planes[0].shape[2] * 2
         dtype = torch.float8_e4m3fn if _ARC_QSA_NVFP4_PREFILL == "fp8" else q.dtype
-        shape = (sum(sequence_lens), heads, dim)
+        shape = (plan.total, heads, dim)
         k_context = torch.empty(shape, dtype=dtype, device=q.device)
         v_context = torch.empty(shape, dtype=dtype, device=q.device)
-        slot_table, _ = self._context_slot_table(forward_batch, sequence_lens, host_lens)
-        req_indices = forward_batch.req_pool_indices.tolist()
-        segments = []
-        start = 0
-        for i, (seq, host) in enumerate(zip(sequence_lens, host_lens)):
-            if not 0 <= host < seq:
-                raise RuntimeError(
-                    f"QSA HiSparse context: host prefix {host} of a {seq}-token request"
-                )
-            self._nvfp4_expand_rows(
-                planes,
-                slot_table[i, host:seq],
-                k_context[start + host : start + seq],
-                v_context[start + host : start + seq],
-                scales,
+        qwen_sparse_nvfp4_expand_segments_triton(
+            *planes,
+            plan.slot_table,
+            plan.device_segments,
+            k_context,
+            v_context,
+            k_scale,
+            v_scale,
+            plan.device_max,
+        )
+
+        def read_group(zone, g):
+            segments, longest = plan.zone_segments[g]
+            qwen_sparse_nvfp4_expand_segments_triton(
+                *zone.planes, None, segments, k_context, v_context, k_scale, v_scale, longest
             )
-            if host:
-                segments.append((req_indices[i], host, start))
-            start += seq
-        bt = self.compress_ratio
 
-        def expand(zone, group):
-            for blocks, first, off in group:
-                rows = torch.arange(
-                    off * bt, (off + blocks) * bt, dtype=torch.int32, device=q.device
-                )
-                self._nvfp4_expand_rows(
-                    zone.planes,
-                    rows,
-                    k_context[first : first + blocks * bt],
-                    v_context[first : first + blocks * bt],
-                    scales,
-                )
-
-        coord.fill_host_prefix_context(
-            coord.layer_index(layer_id), segments, k_context, v_context, expand=expand
-        )
+        plan.host_fill.consume(coord.layer_index(layer_id), read_group)
         return k_context, v_context
-
-    def _nvfp4_expand_rows(self, planes, rows, out_k, out_v, scales) -> None:
-        """Expand packed NVFP4 rows ``rows`` (int32, 1-D) of ``planes`` into
-        ``out_k``/``out_v``: one request's segment of the fused expansion, with
-        its table padded to the fixed width (the kernel specializes on it)."""
-        n = rows.numel()
-        if n == 0:
-            return
-        k_fp4, v_fp4, k_sf, v_sf = planes
-        table = self._nvfp4_fixed_width(rows.view(1, -1))
-        qwen_sparse_nvfp4_expand_triton(
-            k_fp4,
-            v_fp4,
-            k_sf,
-            v_sf,
-            table,
-            torch.zeros(1, dtype=torch.int64, device=rows.device),
-            torch.tensor([0, n], dtype=torch.int64, device=rows.device),
-            out_k,
-            out_v,
-            scales[0],
-            scales[1],
-            n,
-        )
 
     def _nvfp4_fixed_width(self, table: torch.Tensor) -> torch.Tensor:
         """A HiSparse context table padded to req_to_token's width: the expansion
@@ -1819,7 +1983,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         return F.pad(table, (0, width - table.shape[1])).contiguous()
 
     def _nvfp4_expand_context(
-        self, layer, forward_batch, cu_seqlens_k, sequence_lens, q: torch.Tensor
+        self, layer, plan: "_QSAExtendPlan", q: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Dequantize every request's packed NVFP4 context into one K/V pair.
 
@@ -1833,26 +1997,23 @@ class QwenSparseAttnBackend(AttentionBackend):
         method = pool.get_kv_cache_quant_method()
         heads, dim = k_fp4.shape[1], k_fp4.shape[2] * 2
         dtype = torch.float8_e4m3fn if _ARC_QSA_NVFP4_PREFILL == "fp8" else q.dtype
-        shape = (sum(sequence_lens), heads, dim)
+        shape = (plan.total, heads, dim)
         k_context = torch.empty(shape, dtype=dtype, device=q.device)
         v_context = torch.empty(shape, dtype=dtype, device=q.device)
         layer_id = layer.layer_id
-        slot_table, slot_rows = self._context_slot_table(forward_batch, sequence_lens)
-        if self.hisparse_coordinator is not None:
-            slot_table = self._nvfp4_fixed_width(slot_table)
         qwen_sparse_nvfp4_expand_triton(
             k_fp4,
             v_fp4,
             k_sf,
             v_sf,
-            slot_table,
-            slot_rows,
-            cu_seqlens_k,
+            plan.slot_table,
+            plan.slot_rows,
+            plan.cu_seqlens_k,
             k_context,
             v_context,
             method.k_scales_gpu[layer_id : layer_id + 1],
             method.v_scales_gpu[layer_id : layer_id + 1],
-            max(sequence_lens),
+            plan.max_seq,
         )
         return k_context, v_context
 
