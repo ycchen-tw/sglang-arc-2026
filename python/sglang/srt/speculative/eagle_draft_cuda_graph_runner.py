@@ -599,7 +599,15 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
         # hidden_states is large + contiguous: copy_() uses the cudaMemcpyAsync
         # DMA engine; foreach would force the ~3x slower compute-kernel copy.
-        if (
+        if get_spec().speculative_use_rejection_sampling:
+            from sglang.srt.managers.overlap_utils import require_real_draft_probs
+            if raw_bs > 0 and buffers.draft_probs is None:
+                raise RuntimeError("rejection sampling graph has no draft probability buffer")
+            real_q = require_real_draft_probs(forward_batch.spec_info.draft_probs, raw_bs, allow_padding=True,
+                expected_ndim=buffers.draft_probs.ndim if buffers.draft_probs is not None else 2)
+            if real_q is not None and buffers.draft_probs is not None:
+                buffers.draft_probs[:raw_bs].copy_(real_q[:raw_bs])
+        elif (
             buffers.draft_probs is not None
             and forward_batch.spec_info.draft_probs is not None
         ):

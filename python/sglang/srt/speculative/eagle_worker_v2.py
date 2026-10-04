@@ -786,7 +786,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         token_list: List[torch.Tensor] = []
         parents_list: List[torch.Tensor] = []
         if get_spec().speculative_use_rejection_sampling:
-            draft_probs_list: List[torch.Tensor] = [spec_info.draft_probs]
+            from sglang.srt.managers.overlap_utils import require_real_draft_probs
+            real_q = require_real_draft_probs(spec_info.draft_probs, topk_index.shape[0])
+            draft_probs_list: List[torch.Tensor] = [real_q]
 
         topk1_chain_fits = (
             self.topk == 1

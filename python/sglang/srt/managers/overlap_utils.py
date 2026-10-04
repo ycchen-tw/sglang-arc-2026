@@ -23,6 +23,18 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
+def require_real_draft_probs(probs, rows: int, *, allow_padding: bool = False, expected_ndim: int = 2):
+    """Validate owned real-row q without inventing probabilities or synchronizing GPU."""
+    if rows == 0:
+        return probs
+    if probs is None:
+        raise RuntimeError("rejection sampling requires published real draft probabilities")
+    if (probs.ndim != expected_ndim or probs.shape[-1] <= 0 or probs.shape[0] < rows
+            or (not allow_padding and probs.shape[0] != rows)):
+        raise RuntimeError("rejection sampling draft probability rows/shape mismatch")
+    return probs
+
+
 def decide_needs_cpu_seq_lens(
     attn_backends: Sequence[AttentionBackend],
 ) -> bool:
@@ -443,7 +455,11 @@ class FutureMap:
             draft_input.bonus_tokens = bonus_tokens
             if hidden_states is not None:
                 draft_input.hidden_states = hidden_states
-            if self.draft_probs_buf is not None and draft_input.draft_probs is not None:
+            if get_spec().speculative_use_rejection_sampling:
+                owned_q = None if self.draft_probs_buf is None else self.draft_probs_buf[indices]
+                draft_input.draft_probs = require_real_draft_probs(owned_q, indices.shape[0],
+                    expected_ndim=3 if get_spec().enable_multi_layer_eagle else 2)
+            elif self.draft_probs_buf is not None and draft_input.draft_probs is not None:
                 draft_input.draft_probs = self.draft_probs_buf[indices]
         else:
             draft_input.bonus_tokens = self.output_tokens_buf[indices]
@@ -603,6 +619,9 @@ class FutureMap:
             self.accept_tokens_buf[indices] = payload.accept_tokens
             self.accept_lens_buf[indices] = payload.accept_lens
             return
+        if get_spec().speculative_use_rejection_sampling and self.spec_algo.need_topk():
+            require_real_draft_probs(payload.draft_probs, indices.shape[0],
+                expected_ndim=3 if get_spec().enable_multi_layer_eagle else 2)
         self._maybe_init_forward_bufs(payload)
         self._maybe_init_dsa_topk_indices_buf(payload)
         self.output_tokens_buf[indices] = payload.bonus_tokens.to(
