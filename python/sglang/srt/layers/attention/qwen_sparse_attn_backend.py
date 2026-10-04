@@ -34,6 +34,7 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
     qwen_sparse_nvfp4_expand_triton,
+    qwen_sparse_nvfp4_gather4_triton,
     qwen_sparse_gqa_decode_selected_triton,
     qwen_sparse_gqa_decode_selected_fp4_triton,
     qwen_sparse_valid_counts_triton,
@@ -60,6 +61,16 @@ _ARC_QSA_NVFP4 = os.environ.get("ARC_QSA_NVFP4") == "1"
 # group; the key plane it reads linearly. Derived and gated in
 # work/qwen38fn_eval/probe_trtllm_fp4_kv_sm100.py.
 _SF_TOKEN_GROUP = 4
+
+# One fused four-plane gather instead of two same-shaped passes over the same
+# address chain. Byte-for-byte identical output, so "split" exists only as a
+# kill switch and for A/B, not because the two differ numerically.
+_ARC_QSA_NVFP4_GATHER = os.environ.get("ARC_QSA_NVFP4_GATHER", "fused")
+if _ARC_QSA_NVFP4_GATHER not in ("fused", "split"):
+    raise ValueError(
+        f"ARC_QSA_NVFP4_GATHER must be 'fused' or 'split', got "
+        f"{_ARC_QSA_NVFP4_GATHER!r}"
+    )
 # Dtype the prefix-chunk expansion feeds the _ck kernel. FP8 halves what that
 # kernel re-reads per query row (the dominant cost of chunk prefill); BF16
 # exists so the downcast's quantization cost can be measured against it.
@@ -1757,25 +1768,47 @@ class QwenSparseAttnBackend(AttentionBackend):
             if self.arc_nvfp4_sm100
             else {}
         )
-        for src_k, src_v, dst_k, dst_v, dst_layout in (
-            (k_fp4, v_fp4, packed_k, packed_v, {}),
-            (k_sf.view(torch.uint8), v_sf.view(torch.uint8), packed_ks, packed_vs, sf_dst_layout),
-        ):
-            qwen_sparse_kv_extraction_compact_triton(
-                src_k,
-                src_v,
+        if _ARC_QSA_NVFP4_GATHER == "fused":
+            qwen_sparse_nvfp4_gather4_triton(
+                k_fp4,
+                v_fp4,
+                k_sf.view(torch.uint8),
+                v_sf.view(torch.uint8),
                 self.req_to_token_pool.req_to_token,
                 req_indices,
                 topk_indices,
                 sequence_lens,
                 cu_strided,
-                dst_k,
-                dst_v,
+                packed_k,
+                packed_v,
+                packed_ks,
+                packed_vs,
                 batch,
                 topk,
-                zero_fill_cols=stride,
-                **dst_layout,
+                stride,
+                dst_page_size=sf_dst_layout.get("dst_page_size", 0),
+                dst_value_group=sf_dst_layout.get("dst_value_group", 0),
             )
+        else:
+            for src_k, src_v, dst_k, dst_v, dst_layout in (
+                (k_fp4, v_fp4, packed_k, packed_v, {}),
+                (k_sf.view(torch.uint8), v_sf.view(torch.uint8), packed_ks, packed_vs, sf_dst_layout),
+            ):
+                qwen_sparse_kv_extraction_compact_triton(
+                    src_k,
+                    src_v,
+                    self.req_to_token_pool.req_to_token,
+                    req_indices,
+                    topk_indices,
+                    sequence_lens,
+                    cu_strided,
+                    dst_k,
+                    dst_v,
+                    batch,
+                    topk,
+                    zero_fill_cols=stride,
+                    **dst_layout,
+                )
         n = batch * stride
         if self._trtllm_workspace is None:
             self._trtllm_workspace = torch.zeros(

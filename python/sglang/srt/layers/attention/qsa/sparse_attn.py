@@ -1,5 +1,6 @@
 """Validated sparse GQA operators migrated from the QSA reference branch."""
 
+import os
 from typing import Optional
 
 import torch
@@ -553,6 +554,179 @@ def qwen_sparse_kv_extraction_compact_triton(
         DST_PAGE_SIZE=dst_page_size,
         DST_V_GROUP=dst_value_group,
         num_warps=8,
+    )
+
+
+@triton.jit
+def _compact_kv_nvfp4_four_plane(
+    k,
+    v,
+    ks,
+    vs,
+    req_to_token,
+    req_indices,
+    indices,
+    seq_lens,
+    cu_k,
+    out_k,
+    out_v,
+    out_ks,
+    out_vs,
+    topk: tl.constexpr,
+    heads: tl.constexpr,
+    dim: tl.constexpr,
+    sf_dim: tl.constexpr,
+    req_stride: tl.constexpr,
+    idx_stride: tl.constexpr,
+    pad_cols,
+    BLOCK_TOPK: tl.constexpr,
+    DST_PAGE_SIZE: tl.constexpr,
+    DST_V_GROUP: tl.constexpr,
+):
+    """Move an NVFP4 selection's four planes in one pass over the address chain.
+
+    ``_compact_kv`` has to be called twice for an NVFP4 pool -- once for the
+    packed payload, once for the block scales -- and each call re-runs the
+    logical-position -> request-table -> slot lookup over a ``(rows, heads,
+    tiles)`` grid. The scale pass moves an eighth of the bytes but pays the same
+    addressing cost at a 16-byte feature width. Here the lookup happens once and
+    the head axis is folded into the feature axis, so a slot's heads are one
+    contiguous run in each plane. Destination layouts are unchanged.
+    """
+    row, block = tl.program_id(0), tl.program_id(1)
+    cols = block * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
+    length = tl.load(seq_lens + row)
+    req = tl.load(req_indices + row)
+    pack_start = tl.load(cu_k + row)
+    valid_count = tl.load(cu_k + row + 1) - pack_start
+    positions = tl.load(indices + row * idx_stride + cols, mask=cols < topk, other=-1)
+    valid = (cols < valid_count) & (positions >= 0) & (positions < length)
+    # 64-bit element offsets, as in _compact_kv: slot * heads * dim overflows
+    # int32 once the pool holds more than 2^31 / (heads * dim) tokens.
+    slots = tl.load(
+        req_to_token + req * req_stride + tl.where(valid, positions, 0),
+        mask=valid,
+        other=0,
+    ).to(tl.int64)
+    token = (pack_start + cols).to(tl.int64)
+    # Same page-aligned zero fill as the two-pass path: the paged decode kernel
+    # reads whole pages, so every slot up to the row stride must be written.
+    store_rows = cols < pad_cols
+
+    hd = tl.arange(0, heads * dim)
+    src_p = slots[:, None] * (heads * dim) + hd[None, :]
+    dst_p = token[:, None] * (heads * dim) + hd[None, :]
+    load_p = valid[:, None] & (hd[None, :] < heads * dim)
+    store_p = store_rows[:, None] & (hd[None, :] < heads * dim)
+    tl.store(out_k + dst_p, tl.load(k + src_p, mask=load_p, other=0), mask=store_p)
+    tl.store(out_v + dst_p, tl.load(v + src_p, mask=load_p, other=0), mask=store_p)
+
+    sd = tl.arange(0, heads * sf_dim)
+    head_i = sd // sf_dim
+    feat_i = sd % sf_dim
+    src_s = slots[:, None] * (heads * sf_dim) + sd[None, :]
+    load_s = valid[:, None] & (sd[None, :] < heads * sf_dim)
+    store_s = store_rows[:, None] & (sd[None, :] < heads * sf_dim)
+    ks_val = tl.load(ks + src_s, mask=load_s, other=0)
+    vs_val = tl.load(vs + src_s, mask=load_s, other=0)
+    if DST_PAGE_SIZE > 0:
+        # sm_100 trtllm-gen order: scale planes paged HND, the value plane
+        # additionally grouped by DST_V_GROUP tokens with the channel blocks
+        # interleaved inside a group. page/slot vary along the token axis, so
+        # both must be broadcast as [:, None] -- a 1-D page aligns to the
+        # feature axis and only happens to be right while a tile sits inside
+        # one page.
+        page = (token // DST_PAGE_SIZE)[:, None]
+        slot = (token % DST_PAGE_SIZE)[:, None]
+        base = page * (heads * DST_PAGE_SIZE * sf_dim) + head_i[None, :] * (
+            DST_PAGE_SIZE * sf_dim
+        )
+        dst_ks = base + slot * sf_dim + feat_i[None, :]
+        dst_vs = (
+            base
+            + (slot // DST_V_GROUP) * (DST_V_GROUP * sf_dim)
+            + feat_i[None, :] * DST_V_GROUP
+            + (slot % DST_V_GROUP)
+        )
+    else:
+        # sm_120 XQA reads NHD with a linear scale plane: token-major, like the
+        # payload.
+        dst_ks = token[:, None] * (heads * sf_dim) + sd[None, :]
+        dst_vs = dst_ks
+    tl.store(out_ks + dst_ks, ks_val, mask=store_s)
+    tl.store(out_vs + dst_vs, vs_val, mask=store_s)
+
+
+_ARC_QSA_GATHER4_BLOCK_TOPK = int(os.environ.get("ARC_QSA_GATHER4_BLOCK_TOPK", "64"))
+_ARC_QSA_GATHER4_WARPS = int(os.environ.get("ARC_QSA_GATHER4_WARPS", "8"))
+for _name, _value in (("ARC_QSA_GATHER4_BLOCK_TOPK", _ARC_QSA_GATHER4_BLOCK_TOPK),
+                      ("ARC_QSA_GATHER4_WARPS", _ARC_QSA_GATHER4_WARPS)):
+    # tl.arange needs a power of two, and cdiv needs a positive tile; both
+    # otherwise fail at first decode inside graph capture instead of here.
+    if _value <= 0 or _value & (_value - 1):
+        raise ValueError(f"{_name} must be a positive power of two, got {_value}")
+
+
+def qwen_sparse_nvfp4_gather4_triton(
+    k,
+    v,
+    ks,
+    vs,
+    req_to_token,
+    req_indices,
+    indices,
+    seq_lens,
+    cu_k,
+    out_k,
+    out_v,
+    out_ks,
+    out_vs,
+    rows,
+    topk,
+    stride,
+    dst_page_size: int = 0,
+    dst_value_group: int = 0,
+):
+    """Fused four-plane version of two ``qwen_sparse_kv_extraction_compact_triton``
+    calls for an NVFP4 pool. Byte-for-byte identical output; see
+    ``work/qwen38fn_eval/test_qsa_nvfp4_gather4.py``.
+
+    ``dst_page_size``/``dst_value_group`` select the sm_100 consumer's paged
+    scale layout exactly as they do for the split path; ``0`` keeps the
+    token-major sm_120 layout.
+    """
+    if stride <= 0:
+        raise ValueError("fused NVFP4 gather is only defined for the strided layout")
+    if dst_value_group and not dst_page_size:
+        raise ValueError("dst_value_group needs dst_page_size")
+    if dst_page_size and (
+        stride % dst_page_size or dst_page_size % max(dst_value_group, 1)
+    ):
+        raise ValueError(
+            "dst_page_size must divide the row stride and be a multiple of "
+            "dst_value_group"
+        )
+    for name, tensor in (
+        ("k", k), ("v", v), ("ks", ks), ("vs", vs),
+        ("out_k", out_k), ("out_v", out_v), ("out_ks", out_ks), ("out_vs", out_vs),
+    ):
+        if tensor.dtype != torch.uint8:
+            raise ValueError(
+                f"fused NVFP4 gather moves raw bytes; {name} is {tensor.dtype}"
+            )
+    _, heads, dim = k.shape
+    sf_dim = ks.shape[2]
+    _compact_kv_nvfp4_four_plane[(rows, triton.cdiv(stride, _ARC_QSA_GATHER4_BLOCK_TOPK))](
+        k, v, ks, vs,
+        req_to_token, req_indices, indices, seq_lens, cu_k,
+        out_k, out_v, out_ks, out_vs,
+        topk, heads, dim, sf_dim,
+        req_to_token.stride(0), indices.stride(0), stride,
+        BLOCK_TOPK=_ARC_QSA_GATHER4_BLOCK_TOPK,
+        DST_PAGE_SIZE=dst_page_size,
+        DST_V_GROUP=dst_value_group,
+        num_warps=_ARC_QSA_GATHER4_WARPS,
+        num_stages=1,
     )
 
 
