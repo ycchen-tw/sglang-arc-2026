@@ -2,6 +2,7 @@
 the torch implementations are the fallback and the reference."""
 
 import math
+import os
 from typing import Optional
 
 import torch
@@ -9,6 +10,20 @@ import torch
 from sglang.srt.environ import envs
 
 _GROUPED_QSA_MIN_ROWS_SCALE = {2: 2.0, 4: 1.0}
+# Opt-in, default off. `__launch_bounds__(threads, n)`: caps register usage so
+# n blocks fit per SM. ncu on the grouped verify kernel at B=110/ctx 96,000:
+# 71.6% of warp stall cycles wait on an L1TEX scoreboard while theoretical
+# occupancy is pinned at 50% *by registers* (block limit 8 vs SM limit 32).
+# n=10 moves that to 62.5% with zero spilling and 1.09-1.12x -- but only once
+# there are enough request groups to saturate; below about B=80 the sign is
+# non-monotonic (B=48 1.09x, B=64 0.97x, B=80 1.20x at ctx 32,100), so there is
+# no honest default to ship. Measurements in
+# docs/research/qwen38fn_qsa_verify_kernels_20260922.md.
+_ARC_QSA_INDEXER_MIN_BLOCKS_PER_SM = int(
+    os.environ.get("ARC_QSA_INDEXER_MIN_BLOCKS_PER_SM", "0")
+)
+if _ARC_QSA_INDEXER_MIN_BLOCKS_PER_SM < 0:
+    raise ValueError("ARC_QSA_INDEXER_MIN_BLOCKS_PER_SM must be >= 0 (0 = off)")
 
 
 def _qsa_verify_group_size(queries_per_request: Optional[int]) -> Optional[int]:
@@ -340,6 +355,7 @@ if HAS_TILELANG:
         groups_per_cta: int = 4,
         num_stages: int = 3,
         threads: int = 128,
+        min_blocks_per_sm: int = 0,
     ):
         """Speculative paged MQA that loads each request's K tile only once.
 
@@ -372,6 +388,8 @@ if HAS_TILELANG:
                 T.ceildiv(T.ceildiv(max_pages, sub_pages), groups_per_cta),
                 threads=threads,
             ) as (request, group_block):
+                if min_blocks_per_sm:
+                    T.annotate_min_blocks_per_sm(min_blocks_per_sm)
                 row_base = request * queries_per_request
                 q_shared = T.alloc_shared(
                     [queries_per_request * heads, head_dim], T.bfloat16
@@ -581,6 +599,7 @@ def tilelang_qsa_mqa_decode(
             page_size=page_size,
             queries_per_request=grouped_size,
             groups_per_cta=groups_per_cta,
+            min_blocks_per_sm=_ARC_QSA_INDEXER_MIN_BLOCKS_PER_SM,
         )(q_kernel.contiguous().view(-1, head_dim), *kernel_args)
     else:
         _tilelang_qsa_mqa_decode_kernel(
