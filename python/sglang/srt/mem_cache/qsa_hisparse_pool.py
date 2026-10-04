@@ -252,6 +252,51 @@ class HiSparseQSATokenToKVPool(QSATokenToKVPool):
         raise NotImplementedError("QSA HiSparse does not support PD transfer")
 
 
+class QSAContextLandingZone:
+    """Persistent device buffer the host part of a resumed prefix lands in, one
+    layer at a time, before the prefill context is assembled (arc-forge M1b h07,
+    design §4.3). Same planes as the device pool (FP8 / BF16: token-major K and
+    V); its one-entry pointer tables are built once, so a fill is one
+    transfer_hicache_all_layer launch per K/V pair. NVFP4 (M3) records need a
+    raw scratch plus expansion instead and are not wired here.
+    """
+
+    def __init__(self, pool: HiSparseQSATokenToKVPool, capacity_tokens: int):
+        layout = pool.layout
+        if capacity_tokens <= 0 or capacity_tokens % layout.page_size:
+            raise ValueError(
+                f"landing zone of {capacity_tokens} tokens is not a positive multiple "
+                f"of page_size {layout.page_size}"
+            )
+        if len(pool.plane_spec.planes) != 2:
+            raise NotImplementedError(
+                "QSA HiSparse host-prefix fill is FP8/BF16 only; NVFP4 records are M3"
+            )
+        self.plane_spec = pool.plane_spec
+        self.block_tokens = layout.block_tokens
+        self.capacity_blocks = capacity_tokens // layout.block_tokens
+        # Rows shaped like the pool's (tokens, heads, dim) in its store dtype.
+        self.planes = tuple(
+            torch.empty(
+                (capacity_tokens,) + tuple(p.shape[1:]), dtype=p.dtype, device=p.device
+            )
+            for p in pool.device_planes(0)
+        )
+        self.pair_ptrs = [
+            tuple(
+                make_kernel_ptr_table(
+                    [self.planes[p]], pool.device, host_memory_registered=False
+                )
+                for p in (q, q + 1)
+            )
+            for q, _ in self.plane_spec.pairs()
+        ]
+        self.block_ids = torch.arange(
+            self.capacity_blocks, dtype=torch.int64, device=pool.device
+        )
+        self.nbytes = sum(p.numel() * p.element_size() for p in self.planes)
+
+
 class QSAHiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """Logical token allocator plus the device prefill-area block allocator (design §5.3).
 
@@ -361,6 +406,11 @@ class QSAHiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         ):
             return None
 
+        mapping = self._kvcache.mapping
+        # before any allocation: a rejected host prefix leaves both pools untouched
+        device_last = self._device_last_block(
+            mapping[last_loc // bt], prefix_lens, prefix_lens_cpu
+        )
         logical = self.logical_attn_allocator.alloc_extend(
             prefix_lens,
             prefix_lens_cpu,
@@ -371,14 +421,13 @@ class QSAHiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         if logical is None:
             raise RuntimeError("logical allocation failed after the capacity check")
-        mapping = self._kvcache.mapping
         num_blocks = int((blk_seq_cpu - blk_prefix_cpu).sum())
         device_blocks = self.prefill_block_allocator.alloc_extend(
             prefix_lens // bt,
             blk_prefix_cpu,
             (seq_lens + bt - 1) // bt,
             blk_seq_cpu,
-            mapping[last_loc // bt],
+            device_last,
             num_blocks,
             num_new_pages=num_new_pages,
         )
@@ -393,6 +442,33 @@ class QSAHiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
         mapping[starts // bt] = device_blocks
         return logical
+
+    def _device_last_block(
+        self,
+        mapped_last: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+    ) -> torch.Tensor:
+        """Device block of each request's last prefix block, as the paged block
+        allocator takes last_loc (arc-forge M1b h07, design §4.4).
+
+        A prefix held on host (a resumed session) has no device rows: its last
+        block maps to 0, the dump block no request is ever given. Its device
+        side starts a fresh page, so pass -1 ("no partial page to continue",
+        and the allocator's debug check (last + 1) % page == prefix % page
+        holds). That is only right for a page-aligned prefix. Resume points are
+        page-aligned by construction; a CPU-side unaligned prefix must be a
+        device-resident chunk continuation, checked with a sync in that case.
+        """
+        on_host = mapped_last == 0
+        if bool((prefix_lens_cpu % self.page_size != 0).any()) and bool(
+            (on_host & (prefix_lens % self.page_size != 0)).any()
+        ):
+            raise RuntimeError(
+                "QSA HiSparse: a prefix with no device rows (on host) is not page "
+                f"aligned; prefix lengths {prefix_lens_cpu.tolist()}, page {self.page_size}"
+            )
+        return torch.where(on_host, torch.full_like(mapped_last, -1), mapped_last)
 
     def alloc_decode(
         self,

@@ -3,7 +3,9 @@
 Layer-first: layer l is one registered uint8 [blocks, record] array, a record
 holding every plane of one block back to back ([K | V] for FP8). The swap-in
 kernel reads records straight from mapped host memory (h01); this pool only
-allocates host blocks and writes records (device -> host backups).
+allocates host blocks and writes records (device -> host backups). A resumed
+session prefix (M1b h07) is read back two ways: load_blocks into the hot slab
+at staging, fill_context_host into the landing zone for a prefill context.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 from sglang.srt.mem_cache.qsa_hisparse_pool import (
     TRANSFER_BLOCK_QUOTA,
     HiSparseQSATokenToKVPool,
+    QSAContextLandingZone,
     _check_transfer_indices,
     plane_ptr_tables,
 )
@@ -120,6 +123,65 @@ class QSAPlanarHostPool(HiSparseHostPoolMixin, HostKVCache):
                 device_blocks,
                 kv_cache_src_stride_bytes=nbytes,
                 kv_cache_dst_stride_bytes=self.record_bytes,
+                element_size=nbytes,
+                block_quota=TRANSFER_BLOCK_QUOTA,
+            )
+
+    def load_blocks(self, host_blocks: torch.Tensor, device_blocks: torch.Tensor) -> None:
+        """Host records -> device blocks, every layer and plane, on the current
+        stream: backup_blocks reversed (M1b h07, the slab identity slots of a
+        resumed prefix)."""
+        _check_transfer_indices(host_blocks, device_blocks)
+        if host_blocks.numel() == 0:
+            return  # a zero-length launch is an invalid grid
+        for (_, nbytes), (hk, hv), (dk, dv) in zip(
+            self.plane_spec.pairs(), self.pair_ptrs, self.device_pool.pair_ptrs
+        ):
+            transfer_hicache_all_layer(
+                dk,
+                dv,
+                device_blocks,
+                hk,
+                hv,
+                host_blocks,
+                kv_cache_src_stride_bytes=self.record_bytes,
+                kv_cache_dst_stride_bytes=nbytes,
+                element_size=nbytes,
+                block_quota=TRANSFER_BLOCK_QUOTA,
+            )
+
+    def fill_context_host(
+        self, layer_index: int, host_blocks: torch.Tensor, dst: QSAContextLandingZone
+    ) -> None:
+        """One layer's host records -> landing-zone blocks [0, n), on the current
+        stream (M1b h07, design §4.3). The source table is the one-entry slice of
+        this layer in the all-layer pointer table, so no table is built per call."""
+        if not 0 <= layer_index < self.layer_num:
+            raise ValueError(f"layer index {layer_index} outside [0, {self.layer_num})")
+        if dst.plane_spec != self.plane_spec:
+            raise ValueError("landing zone planes differ from the host records'")
+        n = host_blocks.numel()
+        if n > dst.capacity_blocks:
+            raise ValueError(
+                f"{n} host blocks exceed the landing zone's {dst.capacity_blocks}"
+            )
+        dst_blocks = dst.block_ids[:n]
+        _check_transfer_indices(host_blocks, dst_blocks)
+        if n == 0:
+            return
+        one = slice(layer_index, layer_index + 1)
+        for (_, nbytes), (hk, hv), (zk, zv) in zip(
+            self.plane_spec.pairs(), self.pair_ptrs, dst.pair_ptrs
+        ):
+            transfer_hicache_all_layer(
+                zk,
+                zv,
+                dst_blocks,
+                hk[one],
+                hv[one],
+                host_blocks,
+                kv_cache_src_stride_bytes=self.record_bytes,
+                kv_cache_dst_stride_bytes=nbytes,
                 element_size=nbytes,
                 block_quota=TRANSFER_BLOCK_QUOTA,
             )

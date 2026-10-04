@@ -107,14 +107,32 @@ NVFP4_PLANES = PlaneSpec(
 class StagingPlan:
     """Copies made when a prompt of S tokens leaves prefill (design §2 staging row).
 
-    D2H: prompt blocks [0, full_blocks) -> host (complete blocks only).
-    D2D: prompt blocks [0, identity_blocks) -> slab slots [0, identity_blocks),
+    D2H: prompt blocks [host_blocks, full_blocks) -> host (complete blocks only).
+    Slab: prompt blocks [0, identity_blocks) -> slab slots [0, identity_blocks),
     plus newest_block -> slot B when a long prompt ends in a partial block.
+
+    host_blocks = h > 0 when blocks [0, h) are a resumed prefix already on host
+    with no device rows (arc-forge M1b h07, design §4.4): they are not copied to
+    host again, and their identity slots are loaded from host (``slab_from_host``);
+    every other copy reads the prefill area. With h = 0 this is the M1a plan.
     """
 
+    host_blocks: int
     full_blocks: int
     identity_blocks: int
     newest_block: Optional[int]
+
+    @property
+    def d2h(self) -> range:
+        return range(self.host_blocks, self.full_blocks)
+
+    @property
+    def slab_from_host(self) -> range:
+        return range(0, min(self.identity_blocks, self.host_blocks))
+
+    @property
+    def slab_from_prefill(self) -> range:
+        return range(self.host_blocks, self.identity_blocks)
 
 
 @dataclass(frozen=True)
@@ -212,14 +230,23 @@ class QSAHiSparseLayout:
         """s* = min(nb - 1, B): identity slot while short, slot B once long (design §1.7)."""
         return min(self.seq_blocks(seq_len) - 1, self.hot_blocks)
 
-    def staging_plan(self, prompt_len: int) -> StagingPlan:
+    def staging_plan(self, prompt_len: int, host_blocks: int = 0) -> StagingPlan:
+        """Staging copies of a prompt of prompt_len tokens whose blocks [0, host_blocks)
+        are a resumed prefix on host (h07). The prefix is a whole number of pages
+        below the prompt: resume points are published page-aligned (design §4.2)."""
+        h = host_blocks
+        if h < 0 or h % self.page_blocks or h * self.block_tokens >= prompt_len:
+            raise ValueError(
+                f"host prefix of {h} blocks must be a multiple of {self.page_blocks} "
+                f"with {self.block_tokens} * h < prompt_len {prompt_len}"
+            )
         nf, nb = prompt_len // self.block_tokens, self.seq_blocks(prompt_len)
         if self.seq_blocks(prompt_len + 1) <= self.hot_blocks:
             # The first decode step still takes the fast path: every block,
             # a partial tail included, sits in its identity slot.
-            return StagingPlan(nf, nb, None)
+            return StagingPlan(h, nf, nb, None)
         partial = prompt_len % self.block_tokens != 0
-        return StagingPlan(nf, self.hot_blocks, nb - 1 if partial else None)
+        return StagingPlan(h, nf, self.hot_blocks, nb - 1 if partial else None)
 
     def decode_backup(self, seq_len: int, skip_first: bool) -> Optional[tuple[int, int]]:
         """(block, slab slot) to copy to host before this decode step's forward, or None.

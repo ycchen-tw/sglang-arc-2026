@@ -11,7 +11,7 @@ import math
 import os
 from copy import copy
 from functools import lru_cache
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import msgspec
 import torch
@@ -1576,7 +1576,18 @@ class QwenSparseAttnBackend(AttentionBackend):
             sequence_lens, dtype=torch.int32, device=q.device
         )
         cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
-        if self.arc_nvfp4:
+        # Resumed session prefixes on host (arc-forge M1b h07); None without any.
+        host_lens = self._hisparse_host_prefix_lens(forward_batch)
+        if host_lens is not None:
+            if self.arc_nvfp4:
+                raise NotImplementedError(
+                    "QSA HiSparse host-prefix context for NVFP4 KV is M3 (whole-record "
+                    "H2D into a raw scratch, then expansion)"
+                )
+            k_context, v_context = self._hisparse_host_prefix_context(
+                layer, forward_batch, sequence_lens, host_lens
+            )
+        elif self.arc_nvfp4:
             # One fused pass per layer: gather + dequantize + downcast write
             # straight into the buffer the chunk kernel consumes. The previous
             # index_select -> BF16 -> FP8 -> torch.cat chain held four copies of
@@ -1623,7 +1634,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         return self._pad_extend_output(output, num_output_rows)
 
     def _context_slot_table(
-        self, forward_batch, sequence_lens
+        self, forward_batch, sequence_lens, host_lens=None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """``(table, row per request)`` a prefix chunk gathers its context
         through: ``table[row[i], :sequence_lens[i]]`` are request i's pool slots.
@@ -1631,6 +1642,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         Without HiSparse this is req_to_token and the requests' pool rows. With
         it the pool holds device rows only, so the logical slots are translated
         (``pool.rows_of``) into a per-request table read with rows ``arange(bs)``.
+        ``host_lens[i]`` > 0 declares positions [0, host_lens[i]) a host-resident
+        prefix (h07): they must have no device row, and are not read from here.
         """
         req_to_token = self.req_to_token_pool.req_to_token
         req_pool_indices = forward_batch.req_pool_indices
@@ -1639,12 +1652,22 @@ class QwenSparseAttnBackend(AttentionBackend):
         device = req_to_token.device
         width = max(sequence_lens)
         lengths = torch.tensor(sequence_lens, dtype=torch.int64, device=device)
-        live = torch.arange(width, device=device)[None, :] < lengths[:, None]
+        positions = torch.arange(width, device=device)[None, :]
+        live = positions < lengths[:, None]
         # Past a request's length the table holds stale slots; read slot 0 there.
         logical = torch.where(live, req_to_token[req_pool_indices.long(), :width], 0)
         rows = self.token_to_kv_pool.rows_of(logical)
         # An unmapped slot translates into device block 0, the reserved dump.
-        if bool(((rows < self.compress_ratio) & live).any()):
+        no_row = rows < self.compress_ratio
+        if host_lens is not None:
+            hosts = torch.tensor(host_lens, dtype=torch.int64, device=device)
+            on_host = positions < hosts[:, None]
+            if bool((on_host & ~no_row).any()):
+                raise RuntimeError(
+                    "QSA HiSparse prefill context: a declared host prefix has device rows"
+                )
+            live = live & ~on_host
+        if bool((no_row & live).any()):
             raise RuntimeError(
                 "QSA HiSparse prefill context has a slot with no device row"
             )
@@ -1652,6 +1675,49 @@ class QwenSparseAttnBackend(AttentionBackend):
         return rows, torch.arange(
             rows.shape[0], dtype=req_pool_indices.dtype, device=device
         )
+
+    def _hisparse_host_prefix_lens(self, forward_batch) -> Optional[List[int]]:
+        """Per request, the tokens of its adopted host prefix (M1b h07), or None
+        when no request of this batch has one (the M1a path, no extra sync)."""
+        coord = self.hisparse_coordinator
+        if coord is None or not coord.has_host_prefix():
+            return None
+        lens = coord.host_prefix_lens(forward_batch.req_pool_indices.tolist())
+        return lens if any(lens) else None
+
+    def _hisparse_host_prefix_context(
+        self, layer, forward_batch, sequence_lens, host_lens
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Tightly packed FP8 context of a batch with resumed prefixes (M1b h07,
+        design §4.3): request i's rows [host_lens[i], seq) are gathered from its
+        device rows, rows [0, host_lens[i]) come from its host records through
+        the coordinator's landing zone. Same bytes as a full-resident gather."""
+        pool = self.token_to_kv_pool
+        coord = self.hisparse_coordinator
+        k_buffer = pool.get_key_buffer(layer.layer_id)
+        v_buffer = pool.get_value_buffer(layer.layer_id)
+        slot_table, _ = self._context_slot_table(forward_batch, sequence_lens, host_lens)
+        total = sum(sequence_lens)
+        k_context = k_buffer.new_empty((total,) + tuple(k_buffer.shape[1:]))
+        v_context = v_buffer.new_empty((total,) + tuple(v_buffer.shape[1:]))
+        req_indices = forward_batch.req_pool_indices.tolist()
+        segments = []
+        start = 0
+        for i, (seq, host) in enumerate(zip(sequence_lens, host_lens)):
+            if not 0 <= host < seq:
+                raise RuntimeError(
+                    f"QSA HiSparse context: host prefix {host} of a {seq}-token request"
+                )
+            rows = slot_table[i, host:seq].long()
+            torch.index_select(k_buffer, 0, rows, out=k_context[start + host : start + seq])
+            torch.index_select(v_buffer, 0, rows, out=v_context[start + host : start + seq])
+            if host:
+                segments.append((req_indices[i], host, start))
+            start += seq
+        coord.fill_host_prefix_context(
+            coord.layer_index(layer.layer_id), segments, k_context, v_context
+        )
+        return k_context, v_context
 
     def _nvfp4_expand_context(
         self, layer, forward_batch, cu_seqlens_k, sequence_lens, q: torch.Tensor

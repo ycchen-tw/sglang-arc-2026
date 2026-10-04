@@ -14,6 +14,16 @@ Per request slot r the device keeps a static slab of H = B + page_blocks blocks
     decode       current block -> slab slot min(nb-1, B); the block completed by
                  the previous step goes to host before this step's forward
     finish       host blocks and tables released; the slab stays with the slot
+
+Session resume (arc-forge M1b h07, design §2.3, §4.3-4.4, §11.5), on with
+session_resume: a request may start from a parked prefix, logical slots [0, P)
+plus host blocks [0, P/4) owned by a session record. adopt_host_prefix puts the
+record's host blocks in the request's row; the prefill context reads them
+through the landing zone (fill_host_prefix_context); staging copies only
+[P/4, nb) from the prefill area and loads the prefix's identity slots from
+host. Host blocks are then released by release_host_row(r, keep) from the
+cache's finish path, never by request_finished / abort_staging_request, which
+run before it; without session_resume those two release the whole row as M1a.
 """
 
 from __future__ import annotations
@@ -21,7 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Dict, List, NamedTuple, Tuple
+from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 
@@ -37,6 +47,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.pool_host.qsa_planar import QSAPlanarHostPool
 from sglang.srt.mem_cache.qsa_hisparse_pool import (
     HiSparseQSATokenToKVPool,
+    QSAContextLandingZone,
     QSAHiSparseTokenToKVPoolAllocator,
 )
 from sglang.srt.utils import get_device_module
@@ -101,6 +112,7 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         tp_group,
         swap_in_block_size: int = 960,
         max_decode_rows: int = 0,
+        session_resume: bool = False,
     ):
         # No super().__init__(): upstream's asserts an MLA pool and builds an MLA host pool.
         if not isinstance(token_to_kv_pool_allocator, QSAHiSparseTokenToKVPoolAllocator):
@@ -219,15 +231,28 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
             (max_rows,), device_rows, dtype=torch.int32, device=device
         )
 
+        # Session resume (M1b h07). _host_prefix_blocks[r] = h: blocks [0, h) of
+        # row r are an adopted record prefix (host only, no device rows).
+        self.session_resume = session_resume
+        self._host_prefix_blocks = [0] * num_slots
+        self.landing_zone: Optional[QSAContextLandingZone] = None
+        if session_resume:
+            ps = layout.page_size
+            self.landing_zone = QSAContextLandingZone(
+                pool, -(-max_context_len // ps) * ps
+            )
+
         self._warmup_kernels()
         logger.info(
             "QSA HiSparse coordinator: top_k=%d blocks, B=%d, %d request slots, %d layers, "
-            "host %d blocks",
+            "host %d blocks, session resume %s (landing zone %.1f MB)",
             top_k,
             hot,
             num_slots - 1,
             layer_num,
             self.mem_pool_host.size,
+            session_resume,
+            0.0 if self.landing_zone is None else self.landing_zone.nbytes / 1e6,
         )
 
     # ------------------------------------------------------------ helpers
@@ -242,16 +267,45 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         locs = self.req_to_token_pool.req_to_token[req_pool_idx, 0:num_tokens:bt]
         return locs.to(torch.int64) // bt
 
-    def _free_host(self, req_pool_idx: int) -> None:
-        host = self.mem_pool_host.allocated_host_indices(
-            self.req_to_host_pool,
-            req_pool_idx,
-            self.req_to_host_pool_allocated_len[req_pool_idx],
-        )
-        if host.numel() > 0:
-            self.mem_pool_host.free(host)
-        self.req_to_host_pool[req_pool_idx, :] = -1
-        self.req_to_host_pool_allocated_len[req_pool_idx] = 0
+    def release_host_row(self, req_pool_idx: int, keep: int) -> None:
+        """Free host blocks [keep, allocated) of row r and clear the row (M1b
+        design §2.2 step 5, §11.5).
+
+        Blocks [0, keep) stay allocated: the session record the request pinned
+        owns them (keep = its P / 4; 0 when nothing is kept). With
+        session_resume the cache's finish path calls this after request_finished
+        / abort_staging_request; without it those two call it with keep = 0.
+        Idempotent: a row with nothing allocated is left as is.
+        """
+        r = req_pool_idx
+        page = self.layout.page_blocks
+        if keep < 0 or keep % page:
+            raise ValueError(f"keep={keep} host blocks is not a multiple of the page ({page})")
+        allocated = int(self.req_to_host_pool_allocated_len[r])
+        adopted = self._host_prefix_blocks[r]
+        if allocated == 0:
+            if adopted:
+                raise RuntimeError(f"row {r} adopted {adopted} host blocks but holds none")
+            return
+        if not adopted <= keep <= allocated:
+            raise RuntimeError(
+                f"row {r}: keep={keep} outside [adopted prefix {adopted}, allocated {allocated}]"
+            )
+        if r in self._staging:
+            raise RuntimeError(f"row {r} is staging; abort_staging_request comes first")
+        # Blocks freed here may be handed out at once: order the frees after any
+        # forward (swap-in reads) and decode backup (writes) still in flight.
+        if self.decode_producer_stream is not None:
+            device_module.current_stream().wait_stream(self.decode_producer_stream)
+        self.wait_for_pending_backup()
+        freed = self.req_to_host_pool[r, keep:allocated]
+        if bool((freed < 0).any()):
+            raise RuntimeError(f"row {r}: unallocated entries inside [{keep}, {allocated})")
+        if freed.numel() > 0:
+            self.mem_pool_host.free(freed)
+        self.req_to_host_pool[r, :] = -1
+        self.req_to_host_pool_allocated_len[r] = 0
+        self._host_prefix_blocks[r] = 0
 
     def _warmup_kernels(self) -> None:
         """Load the JIT modules now rather than inside a CUDA-graph capture (design §4)."""
@@ -279,8 +333,16 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         if r in self._staging:
             raise RuntimeError(f"request slot {r} is already staging")
         layout = self.layout
-        plan = layout.staging_plan(prompt_len)
-        logical_blocks = self._logical_blocks(r, prompt_len)
+        # Blocks [0, h) of a resumed request are its record's, on host only
+        # (h07); every copy below that reads the prefill area covers [h, nb).
+        h = self._host_prefix_blocks[r]
+        if int(self.req_to_host_pool_allocated_len[r]) != h:
+            raise RuntimeError(
+                f"staging {req.rid}: host row holds "
+                f"{int(self.req_to_host_pool_allocated_len[r])} blocks, adopted prefix {h}"
+            )
+        plan = layout.staging_plan(prompt_len, h)
+        logical_blocks = self._logical_blocks(r, prompt_len)[h:]
         prefill_blocks = self.mem_pool_device.mapping[logical_blocks]
         if bool(
             (
@@ -293,16 +355,26 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
             self.req_to_host_pool,
             self.req_to_host_pool_allocated_len,
             r,
-            0,
-            plan.full_blocks,
+            h,
+            plan.full_blocks - h,
         )
         slab = self.req_to_device_buffer[r]
-        src = [prefill_blocks[: plan.identity_blocks]]
-        dst = [slab[: plan.identity_blocks]]
+        src, dst = [], []
+        from_prefill = plan.slab_from_prefill
+        if len(from_prefill):
+            src.append(prefill_blocks[from_prefill.start - h : from_prefill.stop - h])
+            dst.append(slab[from_prefill.start : from_prefill.stop])
         if plan.newest_block is not None:
-            src.append(prefill_blocks[plan.newest_block : plan.newest_block + 1])
+            if plan.newest_block < h:
+                raise RuntimeError(f"staging {req.rid}: newest block inside the host prefix")
+            src.append(prefill_blocks[plan.newest_block - h : plan.newest_block - h + 1])
             dst.append(slab[layout.hot_blocks : layout.hot_blocks + 1])
-        d2d_src, d2d_dst = torch.cat(src), torch.cat(dst)
+        empty = slab[:0]
+        d2d_src = torch.cat(src) if src else empty
+        d2d_dst = torch.cat(dst) if dst else empty
+        from_host = plan.slab_from_host
+        load_src = self.req_to_host_pool[r, from_host.start : from_host.stop]
+        load_dst = slab[from_host.start : from_host.stop]
 
         req.hisparse_staging = True
         start_event = device_module.Event()
@@ -311,11 +383,12 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         with device_module.stream(self.write_staging_stream):
             start_event.wait(self.write_staging_stream)
             self.mem_pool_host.backup_blocks(
-                prefill_blocks[: plan.full_blocks], host_blocks
+                prefill_blocks[: plan.full_blocks - h], host_blocks
             )
             self.mem_pool_device.copy_blocks(d2d_src, d2d_dst)
+            self.mem_pool_host.load_blocks(load_src, load_dst)
             finish_event.record()
-            for t in (prefill_blocks, host_blocks, d2d_src, d2d_dst):
+            for t in (prefill_blocks, host_blocks, d2d_src, d2d_dst, load_src, load_dst):
                 t.record_stream(self.write_staging_stream)
         self._staging[r] = (prefill_blocks, logical_blocks)
         self.ack_staging_queue.append(HiSparseAct(start_event, finish_event, req))
@@ -342,7 +415,8 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         prefill_blocks, logical_blocks = self._staging.pop(r)
         self.token_to_kv_pool_allocator.free_prefill_blocks(prefill_blocks)
         self.mem_pool_device.mapping[logical_blocks] = 0
-        self._free_host(r)
+        if not self.session_resume:
+            self.release_host_row(r, 0)
         self._skip_first_backup[r] = False
         req.hisparse_staging = False
 
@@ -496,10 +570,108 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         if prefill_held.numel() > 0:
             self.token_to_kv_pool_allocator.free_prefill_blocks(prefill_held)
         mapping[logical_blocks] = 0
-        self._free_host(r)
+        if not self.session_resume:
+            self.release_host_row(r, 0)
         self.req_device_buffer_tokens[:, r, :] = -1
         self.lru_slots[:, r, :].copy_(self._lru_init)
         self._skip_first_backup[r] = False
+
+    # ------------------------------------------------------------ session resume (M1b h07)
+
+    def adopt_host_prefix(self, reqs: Sequence[Req]) -> None:
+        """Give each resumed request its session record's host blocks [0, P/4)
+        (design §2.2 step 3). Call after alloc_for_extend has written the
+        record's logical slots into req_to_token[r, :P] and before the extend
+        forward; once per admission, on a row that holds no host blocks.
+
+        Contract (h09): req.hisparse_resume.host_blocks is the record's int64
+        CUDA tensor of P/4 host blocks, P = len(req.prefix_indices) =
+        req.kv.cache_protected_len, a positive multiple of the page size. The
+        record keeps owning the blocks; release_host_row(r, keep >= P/4) leaves them.
+        """
+        if not self.session_resume:
+            raise RuntimeError("adopt_host_prefix needs session_resume")
+        page, bt = self.layout.page_blocks, self.layout.block_tokens
+        for req in reqs:
+            r = req.kv.req_pool_idx
+            host = req.hisparse_resume.host_blocks
+            h = host.numel()
+            if host.dtype != torch.int64 or host.dim() != 1 or host.device != self.req_to_host_pool.device:
+                raise ValueError(
+                    f"{req.rid}: record host blocks must be 1-D int64 on "
+                    f"{self.req_to_host_pool.device}, got {host.dtype} {tuple(host.shape)} on {host.device}"
+                )
+            if h == 0 or h % page:
+                raise ValueError(f"{req.rid}: {h} host blocks is not a positive multiple of {page}")
+            if len(req.prefix_indices) != h * bt or req.kv.cache_protected_len != h * bt:
+                raise RuntimeError(
+                    f"{req.rid}: resume point {h * bt} but prefix {len(req.prefix_indices)}, "
+                    f"cache_protected_len {req.kv.cache_protected_len}"
+                )
+            if (
+                int(self.req_to_host_pool_allocated_len[r])
+                or self._host_prefix_blocks[r]
+                or r in self._staging
+            ):
+                raise RuntimeError(f"{req.rid}: row {r} already holds host blocks")
+            self.req_to_host_pool[r, :h] = host
+            self.req_to_host_pool_allocated_len[r] = h
+            self._host_prefix_blocks[r] = h
+
+    def host_prefix_lens(self, req_pool_indices: Sequence[int]) -> List[int]:
+        """Tokens of each row's adopted host prefix (0 for none)."""
+        bt = self.layout.block_tokens
+        return [self._host_prefix_blocks[r] * bt for r in req_pool_indices]
+
+    def has_host_prefix(self) -> bool:
+        return any(self._host_prefix_blocks)
+
+    def fill_host_prefix_context(
+        self,
+        layer_index: int,
+        segments: Sequence[Tuple[int, int, int]],
+        k_context: torch.Tensor,
+        v_context: torch.Tensor,
+    ) -> None:
+        """Write the host part of resumed prefixes into a packed prefill context,
+        on the current stream (design §4.3). segments: (req_pool_idx, P, first
+        context row) per request with a host prefix of P tokens; rows
+        [start, start + P) of k_context / v_context receive positions [0, P).
+
+        Records go through the landing zone, as many requests per fill as it
+        holds, then are copied out into the context (the extra D2D disappears
+        once the zone doubles as the 0030 workspace).
+        """
+        zone = self.landing_zone
+        if zone is None:
+            raise RuntimeError("fill_host_prefix_context needs session_resume")
+        bt = self.layout.block_tokens
+        zone_k, zone_v = (p.view(k_context.dtype) for p in zone.planes)
+        group: List[Tuple[int, int, int, int]] = []
+
+        def flush() -> None:
+            host = torch.cat([self.req_to_host_pool[r, :n] for r, n, _, _ in group])
+            self.mem_pool_host.fill_context_host(layer_index, host, zone)
+            for _, n, start, off in group:
+                k_context[start : start + n * bt].copy_(zone_k[off * bt : (off + n) * bt])
+                v_context[start : start + n * bt].copy_(zone_v[off * bt : (off + n) * bt])
+
+        used = 0
+        for r, prefix, start in segments:
+            n = self._host_prefix_blocks[r]
+            if prefix <= 0 or prefix != n * bt:
+                raise RuntimeError(
+                    f"row {r}: host segment of {prefix} tokens, adopted prefix {n * bt}"
+                )
+            if n > zone.capacity_blocks:
+                raise RuntimeError(f"row {r}: {n} host blocks exceed the landing zone")
+            if used + n > zone.capacity_blocks:
+                flush()
+                group, used = [], 0
+            group.append((r, n, start, used))
+            used += n
+        if group:
+            flush()
 
     # ------------------------------------------------------------ diagnostics
 
@@ -517,26 +689,49 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
             host_token_usage=host_tokens / (host.size * bt),
         )
 
-    def check_idle_invariants(self) -> None:
-        """With nothing running or staging, every pool and table is back at its start (R3)."""
+    def check_idle_invariants(
+        self,
+        parked_logical: Optional[torch.Tensor] = None,
+        parked_host: Optional[torch.Tensor] = None,
+    ) -> None:
+        """With nothing running or staging, every pool and table is back at its
+        start (R3), except what parked session records hold (M1b h07):
+        parked_logical / parked_host are their logical token slots and host
+        blocks, concatenated (None: nothing parked, the M1a case)."""
         problems = []
         if self.ack_staging_queue or self._staging:
             problems.append(
                 f"staging queue {len(self.ack_staging_queue)}, staging slots {sorted(self._staging)}"
             )
         alloc = self.token_to_kv_pool_allocator
+        n_parked = 0 if parked_logical is None else parked_logical.numel()
         for name, sub, full in (
-            ("logical", alloc.logical_attn_allocator, self.layout.logical_tokens),
+            ("logical", alloc.logical_attn_allocator, self.layout.logical_tokens - n_parked),
             ("prefill area", alloc.prefill_block_allocator, self.layout.prefill_blocks),
         ):
             if sub.available_size() != full:
                 problems.append(f"{name} allocator {sub.available_size()} / {full} free")
+        if n_parked:
+            logical = alloc.logical_attn_allocator
+            pages = torch.unique(parked_logical.to(torch.int64) // logical.page_size)
+            if pages.numel() * logical.page_size != n_parked or bool(
+                torch.isin(pages, logical.get_all_free_pages().to(pages.device)).any()
+            ):
+                problems.append("parked logical slots are not whole pages held off the free list")
         host = self.mem_pool_host
-        if host.available_size() != host.size or bool(host.slot_used.any()):
+        used = host.slot_used.nonzero().flatten()
+        parked = (
+            torch.empty(0, dtype=torch.int64)
+            if parked_host is None
+            else torch.sort(parked_host.to("cpu", torch.int64)).values
+        )
+        if host.available_size() != host.size - parked.numel() or not torch.equal(used, parked):
             problems.append(
                 f"host {host.available_size()} / {host.size} free, "
-                f"{int(host.slot_used.sum())} slots marked used"
+                f"{used.numel()} slots marked used, {parked.numel()} parked"
             )
+        if any(self._host_prefix_blocks):
+            problems.append("adopted host prefixes left on idle rows")
         mapping = self.mem_pool_device.mapping
         if bool(mapping[:-1].any()) or int(mapping[-1]) != -1:
             problems.append(f"mapping has {int((mapping[:-1] != 0).sum())} live entries")
@@ -617,6 +812,17 @@ def create_qsa_hisparse_coordinator(model_runner) -> QSAHiSparseCoordinator:
             "QSA HiSparse with decode CUDA graphs needs --cuda-graph-max-bs-decode >= "
             f"--max-running-requests ({num_reqs}), got {decode_graph.max_bs}"
         )
+    # M1b h07: session resume from host-resident prefixes. Only the session
+    # cache (h09, --radix-cache-backend qsa_hisparse_session) parks prefixes and
+    # calls release_host_row; with any other cache host rows would never be freed.
+    session_resume = user.get("qsa_session_resume", False)
+    if not isinstance(session_resume, bool):
+        raise ValueError(f"hisparse_config.qsa_session_resume must be a bool, got {session_resume!r}")
+    if session_resume and get_memory().radix_cache_backend != "qsa_hisparse_session":
+        raise ValueError(
+            "hisparse_config.qsa_session_resume needs --radix-cache-backend "
+            f"qsa_hisparse_session (M1b h09), got {get_memory().radix_cache_backend!r}"
+        )
     return QSAHiSparseCoordinator(
         req_to_token_pool=model_runner.req_to_token_pool,
         token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
@@ -626,4 +832,5 @@ def create_qsa_hisparse_coordinator(model_runner) -> QSAHiSparseCoordinator:
         swap_in_block_size=parse_hisparse_config().swap_in_block_size,
         # one token per request (no spec), so graph rows = its max batch size
         max_decode_rows=int(decode_graph.max_bs or 0),
+        session_resume=session_resume,
     )
