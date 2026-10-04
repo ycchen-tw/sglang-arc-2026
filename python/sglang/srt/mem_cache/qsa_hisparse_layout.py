@@ -18,6 +18,13 @@ Device layout in blocks (design §1.2):
 
 Slab slot i < B is an LRU slot, slot B holds the newest block once the request
 is long (seq_blocks > B), slots B+1.. are the kernel's page padding.
+
+Speculative verify (arc-forge M5 h16, design §4): a verify of K rows writes
+positions committed .. committed + K - 1, which touch up to W = ring_width(K)
+consecutive blocks that are not on host yet. Each block b >= B of them lives in
+ring slot B + b % W (W <= page_blocks - 1, so the ring fits the padding slots);
+a block b < B lives in its identity slot as always. W = 1 is the decode rule:
+the newest block in slot B.
 """
 
 from __future__ import annotations
@@ -110,7 +117,8 @@ class StagingPlan:
 
     D2H: prompt blocks [host_blocks, full_blocks) -> host (complete blocks only).
     Slab: prompt blocks [0, identity_blocks) -> slab slots [0, identity_blocks),
-    plus newest_block -> slot B when a long prompt ends in a partial block.
+    plus newest_block -> slot B when a long prompt ends in a partial block (its
+    ring slot ring_slot(newest_block, W) when the coordinator verifies K > 1 rows, h16).
 
     host_blocks = h > 0 when blocks [0, h) are a resumed prefix already on host
     with no device rows (arc-forge M1b h07, design §4.4): they are not copied to
@@ -230,6 +238,49 @@ class QSAHiSparseLayout:
     def newest_slot(self, seq_len: int) -> int:
         """s* = min(nb - 1, B): identity slot while short, slot B once long (design §1.7)."""
         return min(self.seq_blocks(seq_len) - 1, self.hot_blocks)
+
+    # ------------------------------------------------------------ speculative verify (M5 h16)
+
+    def ring_width(self, verify_tokens: int) -> int:
+        """W: blocks one verify window of verify_tokens consecutive positions can
+        touch, wherever it starts (ceil((K + bt - 1) / bt); K = 1 gives 1)."""
+        if verify_tokens < 1:
+            raise ValueError(f"verify_tokens must be >= 1, got {verify_tokens}")
+        w = _ceil_div(verify_tokens + self.block_tokens - 1, self.block_tokens)
+        if w > self.page_blocks - 1:
+            raise ValueError(
+                f"{verify_tokens} verify tokens need a ring of {w} slots; the slab "
+                f"pads B with only {self.page_blocks - 1}"
+            )
+        return w
+
+    def ring_slot(self, block: int, ring_width: int) -> int:
+        """Slab slot of a block the current (or a later) verify window writes:
+        its identity slot below B, ring slot B + block % W from B on. With
+        ring_width 1 this is the decode rule min(block, B)."""
+        if block < 0 or not 1 <= ring_width <= self.page_blocks - 1:
+            raise ValueError(f"ring_slot(block={block}, ring_width={ring_width})")
+        if block < self.hot_blocks:
+            return block
+        return self.hot_blocks + block % ring_width
+
+    def ring_floor(self, committed: int) -> int:
+        """First block not on host before a verify at `committed` tokens: blocks
+        [0, committed // bt) are complete and backed up (h17's backup rule). The
+        swap-in kernel reads it as row 0's seq_blocks - 1 (= committed // bt)."""
+        if committed < 0:
+            raise ValueError(f"committed must be >= 0, got {committed}")
+        return committed // self.block_tokens
+
+    def verify_backup(self, committed: int, accepted: int) -> range:
+        """Blocks a verify at `committed` completes and h17 backs up to host once
+        `accepted` (1 .. K) tokens are accepted: [committed // bt, (committed +
+        accepted) // bt). Each still sits in ring_slot(block) until the next verify
+        writes (design §5.2)."""
+        if accepted < 1:
+            raise ValueError(f"accepted must be >= 1, got {accepted}")
+        bt = self.block_tokens
+        return range(committed // bt, (committed + accepted) // bt)
 
     def staging_plan(self, prompt_len: int, host_blocks: int = 0) -> StagingPlan:
         """Staging copies of a prompt of prompt_len tokens whose blocks [0, host_blocks)

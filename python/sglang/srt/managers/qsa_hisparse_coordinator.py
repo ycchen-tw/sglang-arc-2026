@@ -29,6 +29,16 @@ With qsa_snapshot_interval set (M1b h08), decode also snapshots the GDN / PLE
 state every T positions: D2D live -> staging mamba slot in the backup window,
 async D2H to a pinned host buffer, published to an owner (h09) once the D2H is
 seen done (QSAHiSparseSnapshots below).
+
+Speculative verify (arc-forge M5 h16, design §3-§4, §6): with verify_tokens K > 1
+a TARGET_VERIFY forward has K rows per request (request-major). The swap-in
+resolves a request's K rows one after another in one CTA, the window's blocks
+>= B live in ring slots B + b % W (W = layout.ring_width(K)), the per-row decode
+buffers hold max_bs * K rows, and verify_overflow is set when a row evicts a
+block an earlier row of its request selected (checked with the step result:
+check_verify_overflow). Mapping a window's logical blocks to their ring slots at
+allocation (ring_blocks) and the backup after accept are h17's; the decode-row
+path (map_last_loc_to_buffer and its backup) is K = 1 only.
 """
 
 from __future__ import annotations
@@ -112,11 +122,12 @@ INHERITED_STATE = (
 
 
 class QSAHiSparseDecodeMeta(NamedTuple):
-    """Per-forward views of the coordinator's persistent decode buffers ([:bs])."""
+    """Per-forward views of the coordinator's persistent decode buffers ([:rows]); a verify
+    forward has K rows per request (h16)."""
 
     seq_blocks: torch.Tensor  # int32, ceil(seq_len / block_tokens): the kernel's seq_lens
-    newest_dev: torch.Tensor  # int32, device block of slab slot min(seq_blocks - 1, B)
-    rows: torch.Tensor  # int32 [bs, top_k * block_tokens + block_tokens - 1], hot rows (h04 writes)
+    newest_dev: torch.Tensor  # int32, device block of the row's tail slot ring_slot(seq_blocks - 1)
+    rows: torch.Tensor  # int32 [rows, top_k * block_tokens + block_tokens - 1], hot rows (h04 writes)
 
 
 class QSAHiSparseCoordinator(HiSparseCoordinator):
@@ -131,6 +142,7 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         max_decode_rows: int = 0,
         session_resume: bool = False,
         snapshot: Optional["QSAHiSparseSnapshotConfig"] = None,
+        verify_tokens: int = 1,
     ):
         # No super().__init__(): upstream's asserts an MLA pool and builds an MLA host pool.
         if not isinstance(token_to_kv_pool_allocator, QSAHiSparseTokenToKVPoolAllocator):
@@ -156,6 +168,9 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.mem_pool_device = pool
         self.layout = layout
+        # M5 h16: K rows per request in a verify forward; W ring slots after the LRU slots.
+        self.verify_tokens = verify_tokens
+        self.ring_width = layout.ring_width(verify_tokens)
         self.top_k = top_k
         self.compress_ratio = layout.block_tokens
         self.device_buffer_size = layout.hot_blocks
@@ -221,12 +236,16 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         self.req_to_host_pool_allocated_len = torch.zeros(
             num_slots, dtype=torch.int64, device="cpu"
         )
-        # Decode rows: real requests plus CUDA-graph padding (max_decode_rows).
-        max_rows = max(num_slots, max_decode_rows)
+        # Decode rows: real requests plus CUDA-graph padding (max_decode_rows), K rows
+        # per request in a verify forward (h16; the caller scales max_decode_rows).
+        max_rows = max(num_slots * verify_tokens, max_decode_rows)
         self.top_k_device_locs_buffer = torch.full(
             (max_rows, top_k), -1, dtype=torch.int32, device=device
         )
         self.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
+        # h16: set by a multi-row verify swap-in that evicted a block an earlier row of
+        # the same request selected; never cleared (the server stops on it).
+        self.verify_overflow = torch.zeros(1, dtype=torch.int32, device=device)
         self._skip_first_backup = [False] * num_slots
 
         self.write_staging_stream = device_module.Stream()
@@ -282,7 +301,8 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         self._warmup_kernels()
         logger.info(
             "QSA HiSparse coordinator: top_k=%d blocks, B=%d, %d request slots, %d layers, "
-            "host %d blocks, session resume %s (landing zone %.1f MB)",
+            "host %d blocks, session resume %s (landing zone %.1f MB), verify rows %d "
+            "(ring %d slots, %d decode rows)",
             top_k,
             hot,
             num_slots - 1,
@@ -290,6 +310,9 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
             self.mem_pool_host.size,
             session_resume,
             0.0 if self.landing_zone is None else self.landing_zone.nbytes / 1e6,
+            verify_tokens,
+            self.ring_width,
+            max_rows,
         )
 
     # ------------------------------------------------------------ helpers
@@ -404,8 +427,10 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         if plan.newest_block is not None:
             if plan.newest_block < h:
                 raise RuntimeError(f"staging {req.rid}: newest block inside the host prefix")
+            # h16: the ring slot a verify window reads it from (slot B when K = 1)
+            ring = layout.ring_slot(plan.newest_block, self.ring_width)
             src.append(prefill_blocks[plan.newest_block - h : plan.newest_block - h + 1])
-            dst.append(slab[layout.hot_blocks : layout.hot_blocks + 1])
+            dst.append(slab[ring : ring + 1])
         empty = slab[:0]
         d2d_src = torch.cat(src) if src else empty
         d2d_dst = torch.cat(dst) if dst else empty
@@ -469,6 +494,13 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
     ) -> None:
         if out_cache_loc.shape != seq_lens.shape:
             raise RuntimeError("QSA HiSparse decodes one token per request")
+        if self.verify_tokens > 1:
+            # h16: a speculative coordinator maps a verify window's blocks to ring slots
+            # at allocation and backs up after accept (h17); slot B alone is the K = 1 rule.
+            raise RuntimeError(
+                f"QSA HiSparse decode-row mapping with verify_tokens={self.verify_tokens}: "
+                "speculative decode goes through the verify path"
+            )
         self._eager_backup_previous_token(
             seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
         )
@@ -582,23 +614,82 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
     def prepare_decode_meta(
         self, seq_lens: torch.Tensor, req_pool_indices: torch.Tensor, bs: int
     ) -> QSAHiSparseDecodeMeta:
-        """Fill the persistent per-row buffers for one decode forward.
+        """Fill the persistent per-row buffers for one decode or verify forward.
 
-        No host sync, so it can run inside a CUDA-graph capture; seq_lens and
-        req_pool_indices may be int32 or int64. The backend reads the buffers,
-        not the returned views.
+        bs counts rows: one per request in a decode forward, K per request in a
+        verify forward (h16), where seq_lens / req_pool_indices are the rows' own
+        (position + 1, and the row's request). A row's tail block (seq_blocks - 1)
+        sits in ring_slot(seq_blocks - 1): its identity slot below B, B + b % W from
+        B on (min(nb - 1, B) for W = 1). No host sync, so it can run inside a
+        CUDA-graph capture; seq_lens and req_pool_indices may be int32 or int64.
+        The backend reads the buffers, not the returned views.
         """
         if bs > self.seq_blocks.numel():
             raise ValueError(f"batch {bs} exceeds {self.seq_blocks.numel()} decode rows")
         bt = self.layout.block_tokens
         seq_blocks = self.seq_blocks[:bs]
         seq_blocks.copy_((seq_lens[:bs] + bt - 1) // bt)
-        slot = (seq_blocks.to(torch.int64) - 1).clamp(max=self.layout.hot_blocks)
+        slot = self._ring_slots(seq_blocks.to(torch.int64) - 1)
         newest_dev = self.newest_dev[:bs]
         newest_dev.copy_(
             self.req_to_device_buffer[req_pool_indices[:bs].to(torch.int64), slot]
         )
         return QSAHiSparseDecodeMeta(seq_blocks, newest_dev, self.rows[:bs])
+
+    # ------------------------------------------------------------ speculative verify (M5 h16)
+
+    def _ring_slots(self, blocks: torch.Tensor) -> torch.Tensor:
+        """layout.ring_slot on a device tensor of block ids (int64), no host sync."""
+        hot = self.layout.hot_blocks
+        return torch.where(blocks < hot, blocks, hot + blocks % self.ring_width)
+
+    def ring_blocks(self, req_pool_indices: torch.Tensor, blocks: torch.Tensor) -> torch.Tensor:
+        """Device blocks of the slab slots blocks[i] of request req_pool_indices[i] live in
+        while a verify window writes them: what h17's allocation writes into
+        mapping[logical block] for a spec request's new blocks (int64, no host sync)."""
+        if req_pool_indices.shape != blocks.shape:
+            raise ValueError(
+                f"ring_blocks: {tuple(req_pool_indices.shape)} request slots for "
+                f"{tuple(blocks.shape)} blocks"
+            )
+        return self.req_to_device_buffer[
+            req_pool_indices.to(torch.int64), self._ring_slots(blocks.to(torch.int64))
+        ]
+
+    def swap_in_selected_pages(
+        self,
+        req_pool_indices: torch.Tensor,
+        compressed_seq_lens: torch.Tensor,
+        top_k_result: torch.Tensor,
+        layer_id: int,
+        rows_per_req: int = 1,
+    ) -> torch.Tensor:
+        """Resolve one layer's top-k rows to slab blocks (upstream's entry; QSA has no
+        shared-index prefetch). rows_per_req = K for a verify forward: every request
+        owns K consecutive rows of all three inputs (h16)."""
+        if not 1 <= rows_per_req <= self.verify_tokens:
+            raise ValueError(
+                f"{rows_per_req} rows per request, the coordinator verifies at most "
+                f"{self.verify_tokens} (verify_tokens)"
+            )
+        return self._run_swap_in_kernel(
+            req_pool_indices,
+            compressed_seq_lens,
+            top_k_result,
+            layer_id,
+            rows_per_req=rows_per_req,
+        )
+
+    def check_verify_overflow(self, flag: Optional[torch.Tensor] = None) -> None:
+        """Raise if a multi-row verify swap-in set the overflow flag (design §3.3).
+
+        flag: a host copy of verify_overflow (the step result carries one, and the
+        result processor checks it with raise_on_verify_overflow before the step's
+        tokens leave); None reads the device flag, a host sync (eager and tests only)."""
+        raise_on_verify_overflow(
+            self.verify_overflow if flag is None else flag,
+            f"B={self.device_buffer_size}, K={self.verify_tokens}, top-k={self.top_k}",
+        )
 
     def _run_swap_in_kernel(
         self,
@@ -607,13 +698,16 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         top_k_result: torch.Tensor,
         layer_id: int,
         record_plan: bool = False,
+        rows_per_req: int = 1,
     ) -> torch.Tensor:
         """Resolve one layer's top-k blocks to slab blocks, loading misses from host."""
         if record_plan:
             raise NotImplementedError("QSA HiSparse has no shared-index prefetch")
         if self._debug_host_records and not torch.cuda.is_current_stream_capturing():
-            self._check_host_records(req_pool_indices, compressed_seq_lens, top_k_result)
-        top_k_device_locs = self.top_k_device_locs_buffer[: req_pool_indices.size(0)]
+            self._check_host_records(
+                req_pool_indices, compressed_seq_lens, top_k_result, rows_per_req
+            )
+        top_k_device_locs = self.top_k_device_locs_buffer[: top_k_result.size(0)]
         load_cache_to_device_buffer_planar(
             top_k_tokens=top_k_result,
             device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
@@ -631,6 +725,9 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
             block_size=self.swap_in_block_size,
             num_real_reqs=self.num_real_reqs,
             skip_io=self.skip_io,
+            rows_per_req=rows_per_req,
+            ring_width=self.ring_width,
+            overflow_flag=self.verify_overflow,
         )
         return top_k_device_locs
 
@@ -639,21 +736,24 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         req_pool_indices: torch.Tensor,
         compressed_seq_lens: torch.Tensor,
         top_k_result: torch.Tensor,
+        rows_per_req: int = 1,
     ) -> None:
         """ARC_HISPARSE_QSA_DEBUG: every block the swap-in kernel may copy from host has a record.
 
-        On a slow-path row (seq_blocks > B) any selected block but the newest
-        (slot B) can miss, and a miss copies from req_to_host_pool[r, block]. A -1
-        there is a broken lifecycle rule (staging or decode backup skipped); the
-        kernel would read before the host pool, an illegal memory access that
-        poisons the CUDA context. Host sync, so eager only.
+        On a slow-path row (seq_blocks > B) any selected block below the request's
+        ring floor (its first row's seq_blocks - 1: the newest block of a decode
+        row, floor(committed / 4) of a verify, h16) can miss, and a miss copies from
+        req_to_host_pool[r, block]. A -1 there is a broken lifecycle rule (staging
+        or a backup skipped); the kernel would read before the host pool, an
+        illegal memory access that poisons the CUDA context. Host sync, so eager only.
         """
-        n = int(self.num_real_reqs)
+        n = int(self.num_real_reqs) * rows_per_req
         rpi = req_pool_indices[:n].to(torch.int64)
         nb = compressed_seq_lens[:n].to(torch.int64)
         top_k = top_k_result[:n].to(torch.int64)
         slow = nb > self.device_buffer_size
-        may_miss = slow[:, None] & (top_k >= 0) & (top_k < nb[:, None] - 1)
+        ring_lo = nb.view(-1, rows_per_req)[:, :1].expand(-1, rows_per_req).reshape(-1) - 1
+        may_miss = slow[:, None] & (top_k >= 0) & (top_k < ring_lo[:, None])
         host = self.req_to_host_pool[rpi[:, None], top_k.clamp(min=0)]
         lost = may_miss & (host < 0)
         if bool(lost.any()):
@@ -1001,7 +1101,12 @@ def create_qsa_hisparse_coordinator(model_runner) -> QSAHiSparseCoordinator:
     from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
     from sglang.srt.mem_cache.sparsity import parse_hisparse_config
     from sglang.srt.model_executor.cuda_graph_config import Backend
-    from sglang.srt.runtime_context import get_exec, get_memory
+    from sglang.srt.runtime_context import (
+        get_exec,
+        get_memory,
+        get_spec,
+        max_speculative_num_draft_tokens,
+    )
 
     pool = model_runner.token_to_kv_pool
     if not isinstance(pool, HiSparseQSATokenToKVPool):
@@ -1059,6 +1164,12 @@ def create_qsa_hisparse_coordinator(model_runner) -> QSAHiSparseCoordinator:
         _check_session_host_budget(
             pool, user, snapshot, model_runner.req_to_token_pool.mamba_pool
         )
+    # M5 h16: a TARGET_VERIFY forward has K rows per request (the decode graph
+    # runner captures TARGET_VERIFY with bs * K tokens), so the per-row buffers hold
+    # K x the graph's max batch size. h05 still refuses spec (h17 serves it).
+    verify_tokens = 1
+    if get_spec().speculative_algorithm is not None:
+        verify_tokens = int(max_speculative_num_draft_tokens() or 1)
     return QSAHiSparseCoordinator(
         req_to_token_pool=model_runner.req_to_token_pool,
         token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
@@ -1066,11 +1177,25 @@ def create_qsa_hisparse_coordinator(model_runner) -> QSAHiSparseCoordinator:
         device=model_runner.device,
         tp_group=model_runner.tp_group.cpu_group,
         swap_in_block_size=parse_hisparse_config().swap_in_block_size,
-        # one token per request (no spec), so graph rows = its max batch size
-        max_decode_rows=int(decode_graph.max_bs or 0),
+        max_decode_rows=int(decode_graph.max_bs or 0) * verify_tokens,
         session_resume=session_resume,
         snapshot=snapshot,
+        verify_tokens=verify_tokens,
     )
+
+
+def raise_on_verify_overflow(flag: torch.Tensor, detail: str = "") -> None:
+    """arc-forge M5 h16: raise when the QSA HiSparse verify swap-in flagged that a
+    row evicted a block an earlier row of its request selected, so that step's
+    attention read the wrong KV (B < K x top-k was not enough for the selection;
+    the coordinator's startup log line gives B and K). Called with the step
+    result's host copy of the flag, before the step's tokens are sent."""
+    if int(flag.reshape(-1)[0]):
+        raise RuntimeError(
+            "QSA HiSparse verify swap-in overflow: a verify row evicted a block an "
+            "earlier row of its request selected, so this step's tokens were computed "
+            f"from wrong KV and are not sent ({detail or 'see the coordinator log for B and K'})"
+        )
 
 
 def session_host_blocks(layout) -> int:

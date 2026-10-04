@@ -924,6 +924,13 @@ class SchedulerBatchResultProcessor:
     ):
         if result.copy_done is not None:
             result.copy_done.synchronize()
+        if result.hisparse_verify_overflow is not None:
+            # arc-forge M5 h16: raise before any of this step's tokens is sent
+            from sglang.srt.managers.qsa_hisparse_coordinator import (
+                raise_on_verify_overflow,
+            )
+
+            raise_on_verify_overflow(result.hisparse_verify_overflow)
         auxiliary_output_starts = self.snapshot_auxiliary_output_starts(batch, result)
         auxiliary_output = result.auxiliary_host_output
         if result.routed_experts_output is not None:

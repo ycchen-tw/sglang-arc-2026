@@ -44,7 +44,7 @@ def build_qsa_row_ranges(
 
 
 class QSAHiSparseDecode(msgspec.Struct, frozen=True):
-    """Per-forward HiSparse decode state (arc-forge QSA HiSparse h04).
+    """Per-forward HiSparse decode / verify state (arc-forge QSA HiSparse h04, h16).
 
     Every tensor is a ``[:bs]`` view of a coordinator buffer that
     ``coord.prepare_decode_meta`` refreshes in place (eager metadata build,
@@ -54,10 +54,14 @@ class QSAHiSparseDecode(msgspec.Struct, frozen=True):
     coord: object
     # [bs] int32, ceil(seq_len / ratio): the swap-in kernel's sequence lengths.
     seq_blocks: torch.Tensor
-    # [bs] int32, device block of hot slot min(seq_blocks - 1, B).
+    # [bs] int32, device block of the row's tail slot ring_slot(seq_blocks - 1)
+    # (min(seq_blocks - 1, B) for a decode row).
     newest_dev: torch.Tensor
     # [bs, token_topk + ratio - 1] int32 device rows, rewritten by every layer.
     rows: torch.Tensor
+    # arc-forge M5 h16: rows per request, K for a TARGET_VERIFY forward (bs is then
+    # requests x K, request-major), 1 for decode.
+    rows_per_req: int = 1
 
 
 class QSAIndexerMetadata(msgspec.Struct, frozen=True):

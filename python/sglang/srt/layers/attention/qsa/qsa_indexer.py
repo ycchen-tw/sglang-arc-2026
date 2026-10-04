@@ -622,30 +622,45 @@ class QSAIndexer(MultiPlatformOp):
         hisparse,
         req_pool_indices: torch.Tensor,
         pool,
+        verify_queries_per_request: Optional[int] = None,
     ) -> torch.Tensor:
-        """DECODE selection under HiSparse offload: swap the selected blocks into
-        each request's hot buffer, then expand them to the logical indices
-        (returned, unchanged) and to device rows (written to hisparse.rows,
-        which the sparse-attention gather reads)."""
+        """DECODE / TARGET_VERIFY selection under HiSparse offload: swap the
+        selected blocks into each request's hot buffer, then expand them to the
+        logical indices (returned, unchanged) and to device rows (written to
+        hisparse.rows, which the sparse-attention gather reads). A verify forward
+        (arc-forge M5 h16) has hisparse.rows_per_req = K rows per request,
+        request-major; the swap-in resolves them one after another per request."""
+        k = verify_queries_per_request or 1
+        if hisparse.rows_per_req != k:
+            raise ValueError(
+                f"QSA HiSparse state has {hisparse.rows_per_req} rows per request, "
+                f"the selection {k}"
+            )
         block_indices = self._select_decode_blocks(
             q,
             compressed_cache,
             compressed_page_table,
             compressed_lengths,
             max_model_len,
+            verify_queries_per_request=verify_queries_per_request,
         )
         rows = block_indices.shape[0]
-        if req_pool_indices.shape[0] != rows or hisparse.seq_blocks.shape[0] != rows:
+        if (
+            req_pool_indices.shape[0] != rows
+            or hisparse.seq_blocks.shape[0] != rows
+            or rows % k
+        ):
             raise ValueError(
                 "QSA HiSparse decode rows disagree: "
                 f"top-k={rows}, req_pool_indices={req_pool_indices.shape[0]}, "
-                f"seq_blocks={hisparse.seq_blocks.shape[0]}"
+                f"seq_blocks={hisparse.seq_blocks.shape[0]}, rows per request {k}"
             )
         device_blocks = hisparse.coord.swap_in_selected_pages(
             req_pool_indices=req_pool_indices,
             compressed_seq_lens=hisparse.seq_blocks,
             top_k_result=block_indices,
             layer_id=pool.full_layer_index(self.layer_id),
+            rows_per_req=k,
         )
         if _ARC_HISPARSE_QSA_DEBUG and not get_is_capture_mode():
             _check_hisparse_selection(
@@ -788,9 +803,9 @@ class QSAIndexer(MultiPlatformOp):
             )
             hisparse = indexer_metadata.hisparse
             if hisparse is not None:
-                if not forward_mode.is_decode():
+                if not (forward_mode.is_decode() or is_target_verify):
                     raise NotImplementedError(
-                        f"QSA HiSparse offload supports DECODE only, got {forward_mode}"
+                        f"QSA HiSparse offload supports DECODE and TARGET_VERIFY, got {forward_mode}"
                     )
                 return self.select_decode_tokens_hisparse(
                     q,
@@ -803,6 +818,11 @@ class QSAIndexer(MultiPlatformOp):
                     hisparse=hisparse,
                     req_pool_indices=indexer_metadata.req_pool_indices,
                     pool=indexer_metadata.token_to_kv_pool,
+                    verify_queries_per_request=_qsa_grouped_queries_per_request(
+                        forward_batch,
+                        is_target_verify=is_target_verify,
+                        is_draft_extend=False,
+                    ),
                 )
             return self.select_decode_tokens(
                 q,

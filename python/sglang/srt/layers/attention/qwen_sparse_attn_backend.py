@@ -466,17 +466,25 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
 
     def _hisparse_decode_state(
-        self, sequence_lengths: torch.Tensor, req_pool_indices: torch.Tensor
+        self,
+        sequence_lengths: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        rows_per_req: int = 1,
     ) -> QSAHiSparseDecode:
         """Refresh the coordinator's per-row decode buffers for these rows (on
-        the forward stream) and view them for this forward."""
+        the forward stream) and view them for this forward. A TARGET_VERIFY
+        forward (arc-forge M5 h16) passes its rows (K per request, each with its
+        own length and request) and rows_per_req = K."""
         coord = self.hisparse_coordinator
         bs = sequence_lengths.shape[0]
+        if bs % rows_per_req:
+            raise RuntimeError(f"{bs} HiSparse rows are not a multiple of {rows_per_req} per request")
         state = QSAHiSparseDecode(
             coord=coord,
             seq_blocks=coord.seq_blocks[:bs],
             newest_dev=coord.newest_dev[:bs],
             rows=coord.rows[:bs],
+            rows_per_req=rows_per_req,
         )
         if (
             state.seq_blocks.shape[0] != bs
@@ -495,8 +503,31 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
         if hisparse is None:
             return
+        # One row per request for DECODE, K per request for TARGET_VERIFY (h16): the
+        # captured metadata's rows, whatever the replayed batch size.
+        rows = metadata.sequence_lengths.shape[0]
+        if rows != bs * hisparse.rows_per_req:
+            raise RuntimeError(
+                f"QSA HiSparse graph metadata has {rows} rows for batch {bs} x "
+                f"{hisparse.rows_per_req} rows per request"
+            )
         self.hisparse_coordinator.prepare_decode_meta(
-            metadata.sequence_lengths, metadata.row_req_pool_indices, bs
+            metadata.sequence_lengths, metadata.row_req_pool_indices, rows
+        )
+
+    def _hisparse_rows_per_req(self, forward_mode, spec_info) -> int:
+        """K rows per request of a HiSparse forward: the verify width for
+        TARGET_VERIFY (h16), 1 for DECODE. The draft runner's modes (draft
+        extend, the MTP shared index) never reach HiSparse (its pool is h17's)."""
+        if forward_mode.is_decode():
+            return 1
+        if forward_mode.is_target_verify():
+            k = int(getattr(spec_info, "draft_token_num", 0) or 0)
+            if k < 1:
+                raise RuntimeError(f"QSA HiSparse TARGET_VERIFY without a draft width: {spec_info}")
+            return k
+        raise NotImplementedError(
+            f"QSA HiSparse offload supports DECODE and TARGET_VERIFY, got {forward_mode}"
         )
 
     def _store_kv(self, layer, loc, k: torch.Tensor, v: torch.Tensor) -> None:
@@ -851,10 +882,14 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
         speculative_paged = self._is_speculative_paged_mode(forward_batch.forward_mode)
         if self.hisparse_coordinator is not None and (
-            speculative_paged or self.should_reuse_mtp_sparse_indices(forward_batch)
+            forward_batch.forward_mode.is_draft_extend_v2()
+            or self.should_reuse_mtp_sparse_indices(forward_batch)
         ):
+            # h16 serves the target's TARGET_VERIFY; the draft runner's modes run on
+            # its own (non-HiSparse) pool, h17
             raise NotImplementedError(
-                "QSA HiSparse offload does not support speculative decoding"
+                "QSA HiSparse offload does not run the speculative draft modes "
+                f"({forward_batch.forward_mode})"
             )
         if speculative_paged:
             logical_positions = forward_batch.positions
@@ -1012,12 +1047,17 @@ class QwenSparseAttnBackend(AttentionBackend):
                 # text only: extend positions are [prefix, seq) per request
                 max_position_cpu = max(host_lengths) - 1
         hisparse = None
-        if (
-            self.hisparse_coordinator is not None
-            and forward_batch.forward_mode.is_decode()
-        ):
+        if self.hisparse_coordinator is not None and decode_like:
+            k = self._hisparse_rows_per_req(
+                forward_batch.forward_mode, getattr(forward_batch, "spec_info", None)
+            )
+            if sequence_lengths.numel() != forward_batch.batch_size * k:
+                raise RuntimeError(
+                    f"QSA HiSparse verify: {sequence_lengths.numel()} rows for "
+                    f"{forward_batch.batch_size} requests x {k}"
+                )
             hisparse = self._hisparse_decode_state(
-                sequence_lengths, row_req_pool_indices
+                sequence_lengths, row_req_pool_indices, rows_per_req=k
             )
         indexer_metadata = QSAIndexerMetadata(
             sequence_lengths=sequence_lengths,
@@ -1198,10 +1238,12 @@ class QwenSparseAttnBackend(AttentionBackend):
             raise RuntimeError("QSA CUDA graph state is not initialized")
         pool = self.token_to_kv_pool
         speculative_paged = self._is_speculative_paged_mode(forward_mode)
-        if self.hisparse_coordinator is not None and not forward_mode.is_decode():
-            raise NotImplementedError(
-                f"QSA HiSparse offload captures DECODE graphs only, got {forward_mode}"
-            )
+        # h16: DECODE and TARGET_VERIFY graphs (K rows per request); raises for others
+        hisparse_k = (
+            self._hisparse_rows_per_req(forward_mode, spec_info)
+            if self.hisparse_coordinator is not None
+            else 1
+        )
         metadata_rows = num_tokens if speculative_paged else bs
         if speculative_paged:
             row_lengths, row_req_pool_indices, row_prefix_lengths = (
@@ -1234,8 +1276,14 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
         hisparse = None
         if self.hisparse_coordinator is not None:
+            if metadata_rows != bs * hisparse_k:
+                raise RuntimeError(
+                    f"QSA HiSparse graph capture: {metadata_rows} rows for batch {bs} x {hisparse_k}"
+                )
             hisparse = self._hisparse_decode_state(
-                self._graph_seq_lens[:bs], self._graph_row_req_pool_indices[:bs]
+                self._graph_seq_lens[:metadata_rows],
+                self._graph_row_req_pool_indices[:metadata_rows],
+                rows_per_req=hisparse_k,
             )
         indexer_metadata = QSAIndexerMetadata(
             sequence_lengths=self._graph_seq_lens[:metadata_rows],

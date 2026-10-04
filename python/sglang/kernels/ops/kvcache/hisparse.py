@@ -552,6 +552,9 @@ def load_cache_to_device_buffer_planar(
     block_size: int,
     num_real_reqs: torch.Tensor,
     skip_io: bool = False,
+    rows_per_req: int = 1,
+    ring_width: int = 1,
+    overflow_flag: torch.Tensor | None = None,
 ) -> None:
     """HiSparse swap-in whose miss copy moves one planar host record per item.
 
@@ -560,6 +563,14 @@ def load_cache_to_device_buffer_planar(
     items x plane_bytes[q]; item d of plane q starts at byte d * plane_bytes[q].
     Rows of top_k_tokens beyond num_real_reqs[0] get -1 and are not resolved.
     All checks are metadata-only, so the call is CUDA-graph capturable.
+
+    Multi-row verify (arc-forge M5 h16): each request owns rows_per_req (K)
+    consecutive rows of top_k_tokens / seq_lens / top_k_device_locs /
+    req_pool_indices, resolved one after another against its tables; num_real_reqs
+    counts requests. Selected blocks >= max(first row's seq_len - 1, hot_buffer_size)
+    resolve to ring slot hot_buffer_size + block % ring_width. With K > 1,
+    overflow_flag (int32 [1] on the device, never cleared here) is set when a
+    row evicts a block an earlier row of its request selected.
     """
     num_planes = len(plane_bytes)
     if not 1 <= num_planes <= PLANAR_MAX_PLANES or len(device_planes) != num_planes:
@@ -639,6 +650,23 @@ def load_cache_to_device_buffer_planar(
         _check_index_tensor(name, t, (torch.int32, torch.int64), 1)
         if t.numel() < bs:
             raise ValueError(f"{name} has {t.numel()} rows, batch has {bs}")
+    if rows_per_req < 1 or bs % rows_per_req:
+        raise ValueError(f"{bs} top-k rows are not a multiple of rows_per_req {rows_per_req}")
+    if ring_width < 1 or hot_buffer_size + ring_width > device_buffer_tokens.size(1):
+        raise ValueError(
+            f"ring_width {ring_width} does not fit the {device_buffer_tokens.size(1) - hot_buffer_size} "
+            "slots after the LRU slots"
+        )
+    if overflow_flag is None:
+        if rows_per_req > 1:
+            raise ValueError("a multi-row verify swap-in needs overflow_flag")
+        overflow_flag = torch.empty(0, dtype=torch.int32, device=top_k_tokens.device)
+    elif (
+        overflow_flag.dtype != torch.int32
+        or overflow_flag.numel() < 1
+        or not overflow_flag.is_cuda
+    ):
+        raise ValueError("overflow_flag must be an int32 CUDA tensor with >= 1 element")
     if (
         num_real_reqs.dtype != torch.int32
         or num_real_reqs.numel() != 1
@@ -664,4 +692,7 @@ def load_cache_to_device_buffer_planar(
         seq_lens,
         lru_slots,
         num_real_reqs,
+        rows_per_req,
+        ring_width,
+        overflow_flag,
     )

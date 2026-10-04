@@ -1485,6 +1485,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
             batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
+            # arc-forge M5 h16: the QSA HiSparse verify swap-in's overflow flag rides the
+            # step result to the host; the result processor raises on it before this
+            # step's tokens are sent.
+            # (upstream's DSv4 HiSparseCoordinator has no multi-row verify: untouched)
+            coord = self._target_worker.model_runner.hisparse_coordinator
+            if coord is not None:
+                from sglang.srt.managers.qsa_hisparse_coordinator import (
+                    QSAHiSparseCoordinator,
+                )
+
+                if isinstance(coord, QSAHiSparseCoordinator):
+                    batch_output.hisparse_verify_overflow = coord.verify_overflow
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)

@@ -32,9 +32,10 @@ def _round_up(x: int, m: int) -> int:
 
 
 def swap_in_smem_bytes(hot_blocks: int, top_k: int) -> int:
-    """Dynamic smem of the swap-in kernel (hisparse.cuh SmemLayout)."""
+    """Dynamic smem of the swap-in kernel (hisparse.cuh SmemLayout; h16 adds the
+    one-bit-per-slot touched map of a multi-row verify, `chunks` words)."""
     chunks = -(-hot_blocks // 32)
-    int32_words = top_k + 2 * (chunks + 1) + 2 * top_k + 2
+    int32_words = top_k + 2 * (chunks + 1) + 2 * top_k + 2 + chunks
     int16_words = hot_blocks + 2 * top_k
     return 4 * int32_words + 2 * int16_words
 
