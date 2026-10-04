@@ -160,6 +160,10 @@ def validate_qsa_hisparse(server_args: ServerArgs) -> None:
     view = resolved_view(server_args)
     # arc-forge M1b h09: the session cache is the one prefix reuse QSA HiSparse has.
     session = view.radix_cache_backend == QSA_HISPARSE_SESSION_BACKEND
+    nvfp4 = view.kv_cache_dtype == "nvfp4"
+    qsa_nvfp4 = (
+        os.environ.get("ARC_QSA_NVFP4") == "1" and os.environ.get("ARC_FULL_NVFP4") != "1"
+    )
     need = {
         f"no --radix-cache-backend other than {QSA_HISPARSE_SESSION_BACKEND}": view.radix_cache_backend
         in (None, QSA_HISPARSE_SESSION_BACKEND),
@@ -179,7 +183,9 @@ def validate_qsa_hisparse(server_args: ServerArgs) -> None:
         "no mamba extra buffer": not mamba_extra_buffer_of(view),
         "no --enable-mixed-chunk": not view.enable_mixed_chunk,
         "--max-running-requests set": view.max_running_requests is not None,
-        "--kv-cache-dtype fp8_e4m3 (M1a)": view.kv_cache_dtype == "fp8_e4m3",
+        "--kv-cache-dtype fp8_e4m3 or nvfp4": view.kv_cache_dtype in ("fp8_e4m3", "nvfp4"),
+        # NVFP4 (arc-forge h12): the QSA packed-read path, no dequant workspace
+        "ARC_QSA_NVFP4=1 and no ARC_FULL_NVFP4 with NVFP4 KV": not nvfp4 or qsa_nvfp4,
         "no PD disaggregation": view.disaggregation_mode == "null",
         "no hierarchical cache": not view.enable_hierarchical_cache,
         "no unified memory pool": not view.enable_unified_memory,
@@ -191,7 +197,7 @@ def validate_qsa_hisparse(server_args: ServerArgs) -> None:
     missing = [what for what, ok in need.items() if not ok]
     if missing:
         raise ValueError(
-            "--enable-hisparse on a QSA model (M1a) requires: " + "; ".join(missing)
+            "--enable-hisparse on a QSA model requires: " + "; ".join(missing)
         )
     tree = verify_qsa_hisparse_manifest()
     # warning: resolution runs before the server configures log levels

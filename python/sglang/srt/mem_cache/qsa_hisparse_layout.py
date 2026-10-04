@@ -97,7 +97,8 @@ def kv_plane_spec(*, k_row_bytes: int, v_row_bytes: int, block_tokens: int) -> P
 
 
 # NVFP4 KV (M3): 2 heads x 256 dims x 4 tokens -> 1024 B payload and 128 B of
-# per-16 scales per plane. Described here, not wired into the pool yet.
+# per-16 scales per plane. The pool derives its spec from the NVFP4 buffers (h12);
+# for REAP320 that is this one.
 NVFP4_PLANES = PlaneSpec(
     (("k", 1024), ("v", 1024), ("k_scale", 128), ("v_scale", 128))
 )

@@ -134,34 +134,63 @@ class HiSparseQSATokenToKVPool(QSATokenToKVPool):
             self.plane_spec.record_bytes,
         )
 
+    def _full_kv_planes(self) -> tuple[tuple[str, list], ...]:
+        """(name, per-layer device buffers) of every plane, in record order."""
+        fkv = self.full_kv_pool
+        planes = (("k", fkv.k_buffer), ("v", fkv.v_buffer))
+        if fkv.is_quantized_kv_cache:
+            # NVFP4 (arc-forge h12): packed payload, then the per-16 block scales.
+            planes += (("k_scale", fkv.k_scale_buffer), ("v_scale", fkv.v_scale_buffer))
+        return planes
+
     def _check_full_kv_pool(self) -> PlaneSpec:
         fkv = self.full_kv_pool
         if type(fkv) is not MHATokenToKVPool:
             raise NotImplementedError(
                 f"QSA HiSparse needs a plain MHATokenToKVPool, got {type(fkv).__name__}"
             )
-        if fkv.is_quantized_kv_cache:
-            raise NotImplementedError(
-                "QSA HiSparse planes for quantized (NVFP4) KV are M3; only FP8/BF16 KV is wired"
-            )
         if fkv.use_hnd or fkv.kv_cache_layout != "nhd":
             raise ValueError(
                 f"QSA HiSparse needs a token-major NHD KV cache, got layout {fkv.kv_cache_layout!r}"
             )
+        if fkv.is_quantized_kv_cache:
+            if fkv.quant_method.name != "nvfp4":
+                raise NotImplementedError(
+                    f"QSA HiSparse wires FP8/BF16 and NVFP4 KV, got {fkv.quant_method.name!r}"
+                )
+            if fkv.dq_k_buffer is not None or fkv.dq_v_buffer is not None:
+                # a pool-sized dequant workspace is addressed by logical slots
+                raise NotImplementedError(
+                    "QSA HiSparse NVFP4 needs the packed-read path (ARC_QSA_NVFP4=1, "
+                    "no dequant workspace)"
+                )
         rows = self.layout.device_tokens + self.page_size
-        for name, bufs in (("k", fkv.k_buffer), ("v", fkv.v_buffer)):
+        spec = []
+        for name, bufs in self._full_kv_planes():
+            if bufs is None or len(bufs) != self.layer_num:
+                raise ValueError(f"{name} plane needs {self.layer_num} layer buffers")
             for i, buf in enumerate(bufs):
                 if not buf.is_contiguous() or buf.shape[0] != rows:
                     raise ValueError(
-                        f"{name}_buffer[{i}] must be contiguous with {rows} rows, got "
+                        f"{name}[{i}] must be contiguous with {rows} rows, got "
                         f"{tuple(buf.shape)} contiguous={buf.is_contiguous()}"
                     )
-        item = fkv.store_dtype.itemsize
-        return kv_plane_spec(
-            k_row_bytes=fkv.head_num * fkv.head_dim * item,
-            v_row_bytes=fkv.head_num * fkv.v_head_dim * item,
-            block_tokens=self.layout.block_tokens,
-        )
+                if fkv.is_quantized_kv_cache and buf.dtype != torch.uint8:
+                    raise ValueError(f"NVFP4 {name}[{i}] must be uint8, got {buf.dtype}")
+            row_bytes = {buf[0].numel() * buf.element_size() for buf in bufs}
+            if len(row_bytes) != 1:
+                raise ValueError(f"{name} plane rows differ across layers: {sorted(row_bytes)}")
+            spec.append((name, row_bytes.pop() * self.layout.block_tokens))
+        if not fkv.is_quantized_kv_cache:
+            item = fkv.store_dtype.itemsize
+            want = kv_plane_spec(
+                k_row_bytes=fkv.head_num * fkv.head_dim * item,
+                v_row_bytes=fkv.head_num * fkv.v_head_dim * item,
+                block_tokens=self.layout.block_tokens,
+            )
+            if want.planes != tuple(spec):
+                raise ValueError(f"KV planes {spec} are not the [K | V] rows {want.planes}")
+        return PlaneSpec(tuple(spec))
 
     # ------------------------------------------------------------ addressing
 
@@ -170,9 +199,8 @@ class HiSparseQSATokenToKVPool(QSATokenToKVPool):
         return self._transfer_full_attention_id(layer_id)
 
     def device_planes(self, layer_index: int) -> tuple[torch.Tensor, ...]:
-        """Device planes of one layer in record order (K, V)."""
-        fkv = self.full_kv_pool
-        return fkv.k_buffer[layer_index], fkv.v_buffer[layer_index]
+        """Device planes of one layer in record order (K, V; NVFP4 adds K scale, V scale)."""
+        return tuple(bufs[layer_index] for _, bufs in self._full_kv_planes())
 
     def rows_of(self, loc: torch.Tensor) -> torch.Tensor:
         """Logical token slots -> device KV rows through ``mapping`` (int64)."""
@@ -256,9 +284,9 @@ class QSAContextLandingZone:
     """Persistent device buffer the host part of a resumed prefix lands in, one
     layer at a time, before the prefill context is assembled (arc-forge M1b h07,
     design §4.3). Same planes as the device pool (FP8 / BF16: token-major K and
-    V); its one-entry pointer tables are built once, so a fill is one
-    transfer_hicache_all_layer launch per K/V pair. NVFP4 (M3) records need a
-    raw scratch plus expansion instead and are not wired here.
+    V; NVFP4, h12: packed K, V and their block scales, which the backend then
+    expands); its one-entry pointer tables are built once, so a fill is one
+    transfer_hicache_all_layer launch per K/V pair.
     """
 
     def __init__(self, pool: HiSparseQSATokenToKVPool, capacity_tokens: int):
@@ -267,10 +295,6 @@ class QSAContextLandingZone:
             raise ValueError(
                 f"landing zone of {capacity_tokens} tokens is not a positive multiple "
                 f"of page_size {layout.page_size}"
-            )
-        if len(pool.plane_spec.planes) != 2:
-            raise NotImplementedError(
-                "QSA HiSparse host-prefix fill is FP8/BF16 only; NVFP4 records are M3"
             )
         self.plane_spec = pool.plane_spec
         self.block_tokens = layout.block_tokens

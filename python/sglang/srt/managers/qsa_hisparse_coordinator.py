@@ -38,7 +38,7 @@ import logging
 import os
 from collections import Counter
 from dataclasses import dataclass
-from typing import Dict, List, NamedTuple, Optional, Protocol, Sequence, Tuple
+from typing import Callable, Dict, List, NamedTuple, Optional, Protocol, Sequence, Tuple
 
 import torch
 
@@ -73,6 +73,9 @@ logger = logging.getLogger(__name__)
 # Test flag (design §6): wait for staging right after admission so a request
 # joins decode on the next round, as the full-resident baseline does.
 _SYNC_STAGING_ENV = "ARC_HISPARSE_QSA_SYNC_STAGING"
+# Debug flag (shared with the indexer's selection check): before each eager
+# swap-in, check that every block the kernel may copy from host has a record.
+_DEBUG_ENV = "ARC_HISPARSE_QSA_DEBUG"
 
 # State the inherited HiSparseCoordinator methods read (design §2: the subclass
 # skips super().__init__ and must set every one of them itself).
@@ -163,6 +166,10 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         # Timing probe: skip the host->device bytes (garbage output; benchmarking only).
         self.skip_io = envs.SGLANG_DEBUG_HISPARSE_SKIP_IO.get()
         self._sync_staging = os.environ.get(_SYNC_STAGING_ENV, "0") == "1"
+        debug = os.environ.get(_DEBUG_ENV, "0")
+        if debug not in ("0", "1"):
+            raise ValueError(f"{_DEBUG_ENV} must be 0 or 1, got {debug!r}")
+        self._debug_host_records = debug == "1"
 
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=tp_group)
@@ -599,6 +606,8 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         """Resolve one layer's top-k blocks to slab blocks, loading misses from host."""
         if record_plan:
             raise NotImplementedError("QSA HiSparse has no shared-index prefetch")
+        if self._debug_host_records and not torch.cuda.is_current_stream_capturing():
+            self._check_host_records(req_pool_indices, compressed_seq_lens, top_k_result)
         top_k_device_locs = self.top_k_device_locs_buffer[: req_pool_indices.size(0)]
         load_cache_to_device_buffer_planar(
             top_k_tokens=top_k_result,
@@ -619,6 +628,36 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
             skip_io=self.skip_io,
         )
         return top_k_device_locs
+
+    def _check_host_records(
+        self,
+        req_pool_indices: torch.Tensor,
+        compressed_seq_lens: torch.Tensor,
+        top_k_result: torch.Tensor,
+    ) -> None:
+        """ARC_HISPARSE_QSA_DEBUG: every block the swap-in kernel may copy from host has a record.
+
+        On a slow-path row (seq_blocks > B) any selected block but the newest
+        (slot B) can miss, and a miss copies from req_to_host_pool[r, block]. A -1
+        there is a broken lifecycle rule (staging or decode backup skipped); the
+        kernel would read before the host pool, an illegal memory access that
+        poisons the CUDA context. Host sync, so eager only.
+        """
+        n = int(self.num_real_reqs)
+        rpi = req_pool_indices[:n].to(torch.int64)
+        nb = compressed_seq_lens[:n].to(torch.int64)
+        top_k = top_k_result[:n].to(torch.int64)
+        slow = nb > self.device_buffer_size
+        may_miss = slow[:, None] & (top_k >= 0) & (top_k < nb[:, None] - 1)
+        host = self.req_to_host_pool[rpi[:, None], top_k.clamp(min=0)]
+        lost = may_miss & (host < 0)
+        if bool(lost.any()):
+            i, j = lost.nonzero()[0].tolist()
+            raise RuntimeError(
+                f"QSA HiSparse swap-in: request slot {int(rpi[i])} (seq_blocks "
+                f"{int(nb[i])}) selected block {int(top_k[i, j])}, which can miss but "
+                f"has no host record ({int(lost.sum())} such entries in this batch)"
+            )
 
     # ------------------------------------------------------------ release
 
@@ -711,6 +750,7 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         segments: Sequence[Tuple[int, int, int]],
         k_context: torch.Tensor,
         v_context: torch.Tensor,
+        expand: Optional[Callable[[QSAContextLandingZone, List[Tuple[int, int, int]]], None]] = None,
     ) -> None:
         """Write the host part of resumed prefixes into a packed prefill context,
         on the current stream (design §4.3). segments: (req_pool_idx, P, first
@@ -719,18 +759,26 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
 
         Records go through the landing zone, as many requests per fill as it
         holds, then are copied out into the context (the extra D2D disappears
-        once the zone doubles as the 0030 workspace).
+        once the zone doubles as the 0030 workspace). A zone of packed records
+        (NVFP4, arc-forge h12) is not the context yet: ``expand(zone, [(blocks,
+        first context row, first zone block), ...])`` writes each request's
+        part instead of the copy.
         """
         zone = self.landing_zone
         if zone is None:
             raise RuntimeError("fill_host_prefix_context needs session_resume")
+        if expand is None and len(zone.planes) != 2:
+            raise RuntimeError("packed (NVFP4) host records need an expansion into the context")
         bt = self.layout.block_tokens
-        zone_k, zone_v = (p.view(k_context.dtype) for p in zone.planes)
         group: List[Tuple[int, int, int, int]] = []
 
         def flush() -> None:
             host = torch.cat([self.req_to_host_pool[r, :n] for r, n, _, _ in group])
             self.mem_pool_host.fill_context_host(layer_index, host, zone)
+            if expand is not None:
+                expand(zone, [(n, start, off) for _, n, start, off in group])
+                return
+            zone_k, zone_v = (p.view(k_context.dtype) for p in zone.planes)
             for _, n, start, off in group:
                 k_context[start : start + n * bt].copy_(zone_k[off * bt : (off + n) * bt])
                 v_context[start : start + n * bt].copy_(zone_v[off * bt : (off + n) * bt])

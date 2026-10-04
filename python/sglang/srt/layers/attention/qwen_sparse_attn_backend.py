@@ -327,9 +327,11 @@ class QwenSparseAttnBackend(AttentionBackend):
         """HiSparse decode reads KV through coordinator device rows, which only
         the trtllm-gen/XQA gather is wired for; every other decode path indexes
         the device pool with logical req_to_token slots."""
-        if self.arc_nvfp4:
+        if self.arc_nvfp4_sm100:
+            # h12 wires sm_120's token-major scale planes; the sm_100 paged
+            # scale layout goes through the same gather but is unvalidated.
             raise NotImplementedError(
-                "QSA HiSparse offload supports the FP8 KV pool only (M1a)"
+                "QSA HiSparse NVFP4 is validated on sm_120 XQA only (M3)"
             )
         if _QSA_DIRECT_DECODE:
             raise RuntimeError(
@@ -1578,12 +1580,11 @@ class QwenSparseAttnBackend(AttentionBackend):
         cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
         # Resumed session prefixes on host (arc-forge M1b h07); None without any.
         host_lens = self._hisparse_host_prefix_lens(forward_batch)
-        if host_lens is not None:
-            if self.arc_nvfp4:
-                raise NotImplementedError(
-                    "QSA HiSparse host-prefix context for NVFP4 KV is M3 (whole-record "
-                    "H2D into a raw scratch, then expansion)"
-                )
+        if host_lens is not None and self.arc_nvfp4:
+            k_context, v_context = self._hisparse_host_prefix_context_nvfp4(
+                layer, forward_batch, sequence_lens, host_lens, q
+            )
+        elif host_lens is not None:
             k_context, v_context = self._hisparse_host_prefix_context(
                 layer, forward_batch, sequence_lens, host_lens
             )
@@ -1719,6 +1720,104 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         return k_context, v_context
 
+    def _hisparse_host_prefix_context_nvfp4(
+        self, layer, forward_batch, sequence_lens, host_lens, q: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """NVFP4 twin of _hisparse_host_prefix_context (arc-forge h12): request
+        i's rows [host_lens[i], seq) are expanded from its device rows and rows
+        [0, host_lens[i]) from its host records, which the landing zone holds as
+        the four packed planes. Both go through the fused 0030 expansion with the
+        layer's global scales, so the context is _nvfp4_expand_context's over a
+        full-resident pool. One expansion per segment: its output slice must be
+        contiguous, and a request's two segments come from different buffers."""
+        pool = self.token_to_kv_pool
+        coord = self.hisparse_coordinator
+        planes = pool.get_raw_kv_buffer(layer.layer_id)
+        method = pool.get_kv_cache_quant_method()
+        layer_id = layer.layer_id
+        scales = (
+            method.k_scales_gpu[layer_id : layer_id + 1],
+            method.v_scales_gpu[layer_id : layer_id + 1],
+        )
+        heads, dim = planes[0].shape[1], planes[0].shape[2] * 2
+        dtype = torch.float8_e4m3fn if _ARC_QSA_NVFP4_PREFILL == "fp8" else q.dtype
+        shape = (sum(sequence_lens), heads, dim)
+        k_context = torch.empty(shape, dtype=dtype, device=q.device)
+        v_context = torch.empty(shape, dtype=dtype, device=q.device)
+        slot_table, _ = self._context_slot_table(forward_batch, sequence_lens, host_lens)
+        req_indices = forward_batch.req_pool_indices.tolist()
+        segments = []
+        start = 0
+        for i, (seq, host) in enumerate(zip(sequence_lens, host_lens)):
+            if not 0 <= host < seq:
+                raise RuntimeError(
+                    f"QSA HiSparse context: host prefix {host} of a {seq}-token request"
+                )
+            self._nvfp4_expand_rows(
+                planes,
+                slot_table[i, host:seq],
+                k_context[start + host : start + seq],
+                v_context[start + host : start + seq],
+                scales,
+            )
+            if host:
+                segments.append((req_indices[i], host, start))
+            start += seq
+        bt = self.compress_ratio
+
+        def expand(zone, group):
+            for blocks, first, off in group:
+                rows = torch.arange(
+                    off * bt, (off + blocks) * bt, dtype=torch.int32, device=q.device
+                )
+                self._nvfp4_expand_rows(
+                    zone.planes,
+                    rows,
+                    k_context[first : first + blocks * bt],
+                    v_context[first : first + blocks * bt],
+                    scales,
+                )
+
+        coord.fill_host_prefix_context(
+            coord.layer_index(layer_id), segments, k_context, v_context, expand=expand
+        )
+        return k_context, v_context
+
+    def _nvfp4_expand_rows(self, planes, rows, out_k, out_v, scales) -> None:
+        """Expand packed NVFP4 rows ``rows`` (int32, 1-D) of ``planes`` into
+        ``out_k``/``out_v``: one request's segment of the fused expansion, with
+        its table padded to the fixed width (the kernel specializes on it)."""
+        n = rows.numel()
+        if n == 0:
+            return
+        k_fp4, v_fp4, k_sf, v_sf = planes
+        table = self._nvfp4_fixed_width(rows.view(1, -1))
+        qwen_sparse_nvfp4_expand_triton(
+            k_fp4,
+            v_fp4,
+            k_sf,
+            v_sf,
+            table,
+            torch.zeros(1, dtype=torch.int64, device=rows.device),
+            torch.tensor([0, n], dtype=torch.int64, device=rows.device),
+            out_k,
+            out_v,
+            scales[0],
+            scales[1],
+            n,
+        )
+
+    def _nvfp4_fixed_width(self, table: torch.Tensor) -> torch.Tensor:
+        """A HiSparse context table padded to req_to_token's width: the expansion
+        kernel takes the row stride as a constexpr, so a table as wide as the
+        longest request would compile one kernel per distinct length."""
+        width = self.req_to_token_pool.req_to_token.shape[1]
+        if table.shape[1] > width:
+            raise RuntimeError(
+                f"QSA context table of {table.shape[1]} columns exceeds req_to_token's {width}"
+            )
+        return F.pad(table, (0, width - table.shape[1])).contiguous()
+
     def _nvfp4_expand_context(
         self, layer, forward_batch, cu_seqlens_k, sequence_lens, q: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1739,6 +1838,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         v_context = torch.empty(shape, dtype=dtype, device=q.device)
         layer_id = layer.layer_id
         slot_table, slot_rows = self._context_slot_table(forward_batch, sequence_lens)
+        if self.hisparse_coordinator is not None:
+            slot_table = self._nvfp4_fixed_width(slot_table)
         qwen_sparse_nvfp4_expand_triton(
             k_fp4,
             v_fp4,
@@ -1803,6 +1904,45 @@ class QwenSparseAttnBackend(AttentionBackend):
             self._trtllm_sparse_tables[key] = cached
         return cached
 
+    def _decode_gather_tables(self, metadata, forward_batch, topk_indices):
+        """(table, table rows, indices, lengths) the decode gather addresses the
+        pool with: req_to_token over the logical indices, or under HiSparse an
+        identity table over the device rows the hot expansion wrote."""
+        batch = topk_indices.shape[0]
+        hisparse = metadata.indexer_metadata.hisparse
+        if (hisparse is None) != (self.hisparse_coordinator is None):
+            raise RuntimeError(
+                "QSA decode metadata disagrees with the HiSparse coordinator"
+            )
+        if hisparse is None:
+            rows = (
+                metadata.row_req_pool_indices
+                if metadata.row_req_pool_indices is not None
+                else forward_batch.req_pool_indices
+            )
+            return (
+                self.req_to_token_pool.req_to_token,
+                rows,
+                topk_indices,
+                metadata.sequence_lengths,
+            )
+        # The pool holds device rows only: gather hisparse.rows through an
+        # identity table (one row, bound rows_limit) instead of mapping the
+        # logical indices through req_to_token. valid_counts stay logical;
+        # the two index sets share one valid pattern.
+        if hisparse.rows.shape != topk_indices.shape:
+            raise RuntimeError(
+                f"HiSparse rows {tuple(hisparse.rows.shape)} do not match "
+                f"the top-k indices {tuple(topk_indices.shape)}"
+            )
+        coord = hisparse.coord
+        return (
+            coord.identity_rows,
+            coord.zeros_i32[:batch],
+            hisparse.rows,
+            coord.rows_limit[:batch],
+        )
+
     def _forward_trtllm_sparse(
         self,
         q: torch.Tensor,
@@ -1844,34 +1984,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             q.dtype,
             k_buffer.device,
         )
-        hisparse = metadata.indexer_metadata.hisparse
-        if (hisparse is None) != (self.hisparse_coordinator is None):
-            raise RuntimeError(
-                "QSA decode metadata disagrees with the HiSparse coordinator"
-            )
-        if hisparse is None:
-            gather_table = self.req_to_token_pool.req_to_token
-            gather_rows = (
-                metadata.row_req_pool_indices
-                if metadata.row_req_pool_indices is not None
-                else forward_batch.req_pool_indices
-            )
-            gather_indices = topk_indices
-            gather_lens = sequence_lens
-        else:
-            # The pool holds device rows only: gather hisparse.rows through an
-            # identity table (one row, bound rows_limit) instead of mapping the
-            # logical indices through req_to_token. valid_counts stay logical;
-            # the two index sets share one valid pattern.
-            if hisparse.rows.shape != topk_indices.shape:
-                raise RuntimeError(
-                    f"HiSparse rows {tuple(hisparse.rows.shape)} do not match "
-                    f"the top-k indices {tuple(topk_indices.shape)}"
-                )
-            gather_table = hisparse.coord.identity_rows
-            gather_rows = hisparse.coord.zeros_i32[:batch]
-            gather_indices = hisparse.rows
-            gather_lens = hisparse.coord.rows_limit[:batch]
+        gather_table, gather_rows, gather_indices, gather_lens = (
+            self._decode_gather_tables(metadata, forward_batch, topk_indices)
+        )
         qwen_sparse_kv_extraction_compact_triton(
             k_buffer,
             v_buffer,
@@ -2014,10 +2129,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         packed_ks, packed_vs = self._get_fa2_scratch(
             rows, num_kv_heads, scale_dim, torch.uint8, device
         )
-        req_indices = (
-            metadata.row_req_pool_indices
-            if metadata.row_req_pool_indices is not None
-            else forward_batch.req_pool_indices
+        # HiSparse (arc-forge h12): the same identity-table swap as the FP8 path.
+        gather_table, gather_rows, gather_indices, gather_lens = (
+            self._decode_gather_tables(metadata, forward_batch, topk_indices)
         )
         # sm_100 wants the scale planes paged and the value plane grouped; the
         # gather writes that order directly rather than paying a second strided
@@ -2035,10 +2149,10 @@ class QwenSparseAttnBackend(AttentionBackend):
                 v_fp4,
                 k_sf.view(torch.uint8),
                 v_sf.view(torch.uint8),
-                self.req_to_token_pool.req_to_token,
-                req_indices,
-                topk_indices,
-                sequence_lens,
+                gather_table,
+                gather_rows,
+                gather_indices,
+                gather_lens,
                 cu_strided,
                 packed_k,
                 packed_v,
@@ -2058,10 +2172,10 @@ class QwenSparseAttnBackend(AttentionBackend):
                 qwen_sparse_kv_extraction_compact_triton(
                     src_k,
                     src_v,
-                    self.req_to_token_pool.req_to_token,
-                    req_indices,
-                    topk_indices,
-                    sequence_lens,
+                    gather_table,
+                    gather_rows,
+                    gather_indices,
+                    gather_lens,
                     cu_strided,
                     dst_k,
                     dst_v,
