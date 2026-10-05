@@ -49,3 +49,8 @@
   - NVFP4 KV 加 HiSparse 走 sm_100 的 trtllm-gen gather；上游對 hybrid GDN 只准 triton／trtllm_mha／fa4 這幾種 attention backend。
   - 0004 的 distributed MTP top-1 不支援 attention DP，起服就 raise（`SGLANG_QWEN4_MTP_DISTRIBUTED_TOPK1=0`）。
 - **rejection sampling**：draft decode graph 的 `draft_probs` 在 verify 前 clone（`c70c0178`），所有平台都適用。
+- **執行期 VRAM**（arc-forge `docs/research/g4_runtime_vram_headroom_20261005.md`；G4 c110、0.92 真實遊戲的裝置最少剩餘 0.84 → 3.19 GiB）：
+  - PLE short conv 的 extend 批次不再補成 (請求數, 最長列, 通道)，改用 `kernels/ops/qwen4_ple_varlen.py`，和補齊版逐位相同；PLE forward 的中間值用完即釋放、殘差與 mask 改 in-place（逐位相同）。不分平台、沒有旗標。
+  - Qwen3-VL vision：每次 ViT forward 最多 `ARC_VIT_MAX_PATCHES`（預設 16384）個 patch、MLP 每段最多 `ARC_VIT_MLP_ROWS`（預設 8192）列；設 `0` 回到一次算完。數學相同，不保證逐位。
+  - 影片解碼後的 frame 只在 `--mm-feature-transport` 為 `cuda_ipc`／`cuda_vmm` 時 pin；`cpu` 時 tokenizer process 不 pin，不再在 GPU 上多開一個 550 MiB 的 CUDA context。
+  - DFlash 群組只有一個 rank 時，drafter graph 進 target 的 graph pool、在 target 的 capture stream 上 capture（`ARC_DFLASH_SHARED_GRAPH_POOL=0` 關閉）；L4 的 attention-TP pair 維持自己的 pool。
