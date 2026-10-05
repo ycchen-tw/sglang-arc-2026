@@ -441,10 +441,12 @@ def embed_mm_inputs(
             embedder = getattr(multimodal_model, f"get_{modality_id}_feature", None)
         if len(items) != 0:
             assert embedder is not None, f"no embedding method found for {modality}"
-            placeholder_tensor = torch.as_tensor(
-                [item.pad_value for item in items],
-                device=input_ids.device,
-            )
+            # arc: built in pinned memory and copied without blocking. A list straight onto the device is a pageable
+            # H2D copy, which waits for the whole stream: on an extend batch that is the verify still in flight
+            # (~100 ms at c110 K=8), and the extend's own launches can no longer run ahead of the GPU.
+            placeholder_tensor = torch.tensor(
+                [item.pad_value for item in items], dtype=torch.int64, pin_memory=True
+            ).to(input_ids.device, non_blocking=True)
             # calculate per request items length offset
             items_size = [0]
             items_offsets = []
