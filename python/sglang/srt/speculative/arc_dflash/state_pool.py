@@ -287,10 +287,23 @@ class StatePool:
         return None
 
     @torch.no_grad()
-    def capture(self, sizes):
+    def capture(self, sizes, target_pool=None, target_stream=None):
         """One graph per batch size. Warm-up runs eagerly first (allocator, autotuners); it only touches the
-        scratch slot, as does the captured replay with the default index."""
-        stream = torch.cuda.Stream(device=self.device)
+        scratch slot, as does the captured replay with the default index.
+
+        target_pool / target_stream: capture into the target's graph memory pool, on the target's capture stream
+        (the caching allocator hands a freed block back only to the stream that allocated it, so a new stream gets
+        none of the target's freed blocks). Safe because the drafter's outputs live in static buffers outside the
+        pool (tokens_out / probs_out / cand_out, the state pool) and its replays never overlap the target's."""
+        if (target_pool is None) != (target_stream is None):
+            raise ValueError("target_pool and target_stream go together")
+        if target_pool is not None:
+            if self.graph_pool is not None:
+                raise RuntimeError("drafter graphs already captured into their own pool")
+            self.graph_pool = target_pool
+            stream = target_stream
+        else:
+            stream = torch.cuda.Stream(device=self.device)
         stream.wait_stream(torch.cuda.current_stream(self.device))
         with torch.cuda.stream(stream):
             for size in sorted(sizes, reverse=True):
