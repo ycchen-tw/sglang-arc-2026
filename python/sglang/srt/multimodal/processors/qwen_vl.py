@@ -395,12 +395,17 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         )
 
         # Also match the legacy sglang <image> sentinel used by /generate,
-        # so the artifact fast path can normalize it before build_input_ids.
+        # so the artifact fast path can normalize it before build_input_ids --
+        # unless --no-mm-literal-image-sentinel (chat/Responses traffic, where a
+        # literal <image> is text the model or a tool wrote).
+        native_image = r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>"
         self.mm_tokens = MultimodalSpecialTokens(
             image_token="<|vision_start|><|image_pad|><|vision_end|>",
             image_token_id=hf_config.image_token_id,
             image_token_regex=re.compile(
-                r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>|<image>"
+                native_image + r"|<image>"
+                if get_mm().mm_literal_image_sentinel
+                else native_image
             ),
             video_token_id=self.VIDEO_TOKEN_ID,
             audio_token_id=self.audio_token_id,
