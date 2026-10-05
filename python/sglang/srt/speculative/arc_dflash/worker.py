@@ -27,8 +27,10 @@ Routed experts: ARC_DFLASH_MOE=cutlass (FlashInfer CUTLASS W4A4, the target's ke
 ARC_DFLASH_CALIB for GEMM2's static input scale; one rank only) or marlin (SGLang's NVFP4 Marlin W4A16, any group
 size). Default: cutlass on compute capability >= 10, else marlin.
 A dense drafter export (config ffn_type dense_shared, from arc-forge convert_dense.py) has no routed experts or router:
-build_dense_drafter loads it as is, with the linears stored in block FP8 on fp8.Fp8BlockLinear; one rank only for now,
-and ARC_DFLASH_KEEP / CALIB / MOE / ROUTER_STATS must be unset.
+build_dense_drafter loads it as is, with the linears stored in block FP8 on fp8.Fp8BlockLinear (CUTLASS on sm_120,
+Triton on sm_89). On a group of N > 1 the dense FFN is replicated (no collective) and, with ARC_DFLASH_ATTN_TP=1, the
+attention heads are split as for the MoE drafter (q/k/v rows and o_proj columns sliced at load, 128-aligned so FP8
+blocks stay whole; o_proj all-reduced). ARC_DFLASH_KEEP / CALIB / MOE / ROUTER_STATS must be unset.
 
 Draft state per request is a fixed SWA window (`window` = 1024 tokens x layers, plus the newest conv boundary) in a
 slot pool sized per DP group (max_running_requests / attention DP + 16 slots). The request's state is dropped when it
@@ -193,7 +195,7 @@ def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, 
 
     from safetensors import safe_open
 
-    from .fp8 import Fp8BlockLinear
+    from .fp8 import BLOCK, AllReduced, Fp8BlockLinear
 
     raw = json.loads((directory / "config.json").read_text())
     quant = raw.pop("quantization", None)
@@ -203,8 +205,35 @@ def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, 
         raise ValueError(f"{directory}: incomplete export")
     if c.ffn_type != "dense_shared" or c.block_size != 8:
         raise ValueError(f"{directory}: not a dense B8 drafter (ffn_type {c.ffn_type}, block {c.block_size})")
-    if group.world_size != 1:
-        raise ValueError(f"the dense drafter runs on one rank; the attention-TP group has {group.world_size}")
+    rank, size = group.rank_in_group, group.world_size
+    shard = size > 1 and os.environ.get("ARC_DFLASH_ATTN_TP", "1") == "1"
+    if shard and (c.num_attention_heads % size or c.num_key_value_heads % size):
+        raise ValueError(f"{c.num_attention_heads}/{c.num_key_value_heads} heads do not divide across {size} ranks")
+    heads, kv, dim = c.num_attention_heads // size, c.num_key_value_heads // size, c.head_dim
+
+    def attention_slice(name):
+        """(axis, start, count) of this rank's part of an attention projection, or None (kept whole)."""
+        if not shard or ".self_attn." not in name:
+            return None
+        proj = name.rsplit(".", 1)[-1]
+        if proj == "q_proj":  # [head, 2 * head_dim] rows per head: the value and its gate, contiguous
+            return 0, rank * heads * 2 * dim, heads * 2 * dim
+        if proj in ("k_proj", "v_proj"):
+            return 0, rank * kv * dim, kv * dim
+        if proj == "o_proj":
+            return 1, rank * heads * dim, heads * dim
+        return None
+
+    def narrow(t, cut):
+        axis, start, count = cut
+        return t.narrow(axis, start, count)
+
+    def narrow_fp8(weight, scale, cut):
+        axis, start, count = cut
+        if start % BLOCK or count % BLOCK:
+            raise ValueError(f"attention slice {cut} cuts through a {BLOCK}x{BLOCK} FP8 block")
+        return weight.narrow(axis, start, count), scale.narrow(axis, start // BLOCK, count // BLOCK)
+
     if quant is not None and quant.get("method") != "block_fp8":
         raise ValueError(f"{directory}: quantization {quant.get('method')!r}; this loader reads block_fp8 only")
     with torch.device("meta"):
@@ -224,17 +253,24 @@ def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, 
                         raise ValueError(f"{directory}: {key} without its weight")
                     continue
                 value = f.get_tensor(key)
+                name = key[: -len(".weight")] if key.endswith(".weight") else None
+                cut = attention_slice(name) if name is not None else None
                 if value.dtype == torch.float8_e4m3fn:
-                    name = key[: -len(".weight")]
-                    if not key.endswith(".weight") or name + ".weight_scale_inv" not in keys:
+                    if name is None or name + ".weight_scale_inv" not in keys:
                         raise ValueError(f"{directory}: FP8 tensor {key} without weight_scale_inv")
                     old = model.get_submodule(name)
                     if not isinstance(old, nn.Linear) or tuple(old.weight.shape) != tuple(value.shape):
                         raise ValueError(f"{directory}: {key} {tuple(value.shape)} does not replace {type(old).__name__}")
+                    scale = f.get_tensor(name + ".weight_scale_inv")
+                    if cut is not None:
+                        value, scale = narrow_fp8(value, scale, cut)
                     parent, _, child = name.rpartition(".")
-                    setattr(model.get_submodule(parent), child,
-                            Fp8BlockLinear(value, f.get_tensor(name + ".weight_scale_inv")))
+                    setattr(model.get_submodule(parent), child, Fp8BlockLinear(value, scale))
                     fp8_modules.append(name)
+                elif cut is not None:  # a BF16 attention projection: this rank's slice replaces the whole matrix
+                    linear = model.get_submodule(name)
+                    linear.weight = nn.Parameter(narrow(value, cut).contiguous(), requires_grad=False)
+                    linear.in_features, linear.out_features = linear.weight.shape[1], linear.weight.shape[0]
                 else:
                     with torch.no_grad():
                         model.get_parameter(key).copy_(value)
@@ -253,6 +289,20 @@ def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, 
     if stray:
         raise RuntimeError(f"{directory}: FP8 modules {stray[:4]} are not declared in config quantization.modules")
     model.lm_head = build_head(target_model, model_dir, device, c.vocab_size, c.hidden_size, group)
+    if shard:
+        # the per-rank heads: the attention modules, the window state pool and the blank states all read them
+        AllReduced.forward = torch.compiler.disable(AllReduced.forward)
+        for layer in model.layers:
+            attention = layer.self_attn
+            attention.c = replace(c, num_attention_heads=heads, num_key_value_heads=kv)
+            want = {"q_proj": (heads * 2 * dim, c.hidden_size), "k_proj": (kv * dim, c.hidden_size),
+                    "v_proj": (kv * dim, c.hidden_size), "o_proj": (c.hidden_size, heads * dim)}
+            for proj, shape in want.items():
+                got = tuple(getattr(attention, proj).weight.shape)
+                if got != shape:
+                    raise RuntimeError(f"rank {rank}: {proj} is {got} after the attention split, want {shape}")
+            attention.o_proj = AllReduced(attention.o_proj, group)
+        model.config = replace(c, num_attention_heads=heads, num_key_value_heads=kv)
     model.fp8_modules = tuple(fp8_modules)
     fast_drafter.install(model)
     return model.eval().requires_grad_(False)
