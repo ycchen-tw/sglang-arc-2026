@@ -370,6 +370,18 @@ class SchedulerBatchResultProcessor:
                     ):
                         req.kv.kv_committed_len += 1
                     if req.finished():
+                        # A request that finishes in its prefill step (max_new_tokens=1: /health_generate,
+                        # /health on an idle server, scoring) never reaches the decode path's hook below.
+                        # Without this the DFlash drafter keeps its draft-state slot until ARC_DFLASH_EVICT_CYCLES
+                        # decode cycles pass -- never on an idle server -- and max_running_requests + 16 such
+                        # requests exhaust the pool and kill the scheduler.
+                        if isinstance(self.draft_worker, BaseSpecWorker):
+                            self.draft_worker.note_request_finished(
+                                rid=req.rid,
+                                natural_stop=isinstance(
+                                    req.finished_reason, FINISH_MATCHED_TOKEN
+                                ),
+                            )
                         if sampling_mask_finish_reason is None:
                             self._maybe_collect_routed_experts(req)
                             self._maybe_collect_indexer_topk(req)
