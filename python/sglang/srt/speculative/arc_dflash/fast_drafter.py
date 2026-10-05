@@ -71,30 +71,63 @@ def convolve(self, x, delta, side, boundary):
     return ((b0 + d0) * xs + (b1 + d1) * ps).flatten(-2)
 
 
-def install(model):
+# Inductor options under which every compiled kernel's launch configuration is a function of its graph and size
+# hints alone. By default inductor benchmarks the candidate configs of each Triton kernel on its first launch and keeps
+# the fastest, and loads compiled graphs (with the configs other processes picked) from the on-disk FX graph cache.
+# Both are per process: on an sm_100 attention-TP group of 4, 23 of 36 benchmarked drafter kernels picked a different
+# config on some rank (pointwise XBLOCK/num_warps, reduction R0_BLOCK), and the group's replicas -- which must
+# compute bit-identical windows and proposals -- drifted apart within the first prefill.
+DETERMINISTIC_OPTIONS = {
+    "triton.autotune_pointwise": False,  # one heuristic config per pointwise kernel, no on-device benchmark
+    "deterministic": True,  # one config per reduction (no RBLOCK / num_warps tuning), no numerics-moving benchmarks
+    "coordinate_descent_tuning": False,
+    "fx_graph_cache": False,  # never a graph compiled in another process (picked per device, other size hints)
+    "autotune_local_cache": False,  # never a best config another process measured
+}
+
+
+def compile_mode(replicas: int, device) -> str:
+    """ARC_DFLASH_COMPILE: 0 (eager), 1 (inductor, kernels autotuned per process), det (inductor with
+    DETERMINISTIC_OPTIONS). Default: det on an attention-TP group of more than one rank on sm_100, where per-rank
+    autotuning was measured to break the group's agreement; 1 elsewhere (one GPU: nothing to agree with; other
+    architectures keep their validated configuration -- set det to opt in)."""
+    value = os.environ.get("ARC_DFLASH_COMPILE")
+    if value is None:
+        return "det" if replicas > 1 and torch.cuda.get_device_capability(device)[0] == 10 else "1"
+    if value not in ("0", "1", "det"):
+        raise ValueError(f"ARC_DFLASH_COMPILE must be 0, 1 or det, got {value!r}")
+    return value
+
+
+def install(model, replicas: int = 1, device=None):
+    """`replicas`: ranks of the attention-TP group that run this drafter in lockstep."""
     for module in model.modules():
         if isinstance(module, Attention):
             module.forward = types.MethodType(attention_forward, module)
         elif isinstance(module, GroupedConv):
             module.convolve = types.MethodType(convolve, module)
     # default on (server: c110 K=4 draft 13.4 -> 10.9 ms, +25 s at start for the compile); ARC_DFLASH_COMPILE=0 off
-    if os.environ.get("ARC_DFLASH_COMPILE", "1") == "1":
-        compile_layers(model)
+    mode = compile_mode(replicas, torch.cuda.current_device() if device is None else device)
+    if mode != "0":
+        compile_layers(model, deterministic=mode == "det")
+    return mode
 
 
-def compile_layers(model):
+def compile_layers(model, deterministic: bool = False):
     """Fuse the drafter's elementwise work with inductor: each decoder layer (hyper-connection norms and low-rank
     mixes, grouped convs, residual updates, q/k norm and rotary, router softmax/top-k, shared expert) and the final
     mixer. The window attention (Triton) and the NVFP4 experts (CUTLASS) stay opaque: graph breaks around them.
     dynamic=True keeps one compile per layer across the CUDA graph buckets; it happens in the eager warm-up that
-    precedes each capture, never inside one."""
+    precedes each capture, never inside one. `deterministic`: compile with DETERMINISTIC_OPTIONS."""
     from . import nvfp4
 
+    options = dict(DETERMINISTIC_OPTIONS) if deterministic else None
     ring_attention.attend = torch.compiler.disable(ring_attention.attend)
     nvfp4.Nvfp4Experts.forward = torch.compiler.disable(nvfp4.Nvfp4Experts.forward)
     for layer in model.layers:
-        layer.forward = torch.compile(layer.forward, dynamic=True)
-    model.hyper_connection_mixer.forward = torch.compile(model.hyper_connection_mixer.forward, dynamic=True)
+        layer.forward = torch.compile(layer.forward, dynamic=True, options=options)
+    model.hyper_connection_mixer.forward = torch.compile(model.hyper_connection_mixer.forward, dynamic=True,
+                                                         options=options)
 
 
 @torch.no_grad()

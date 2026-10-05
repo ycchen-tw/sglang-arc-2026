@@ -178,7 +178,7 @@ def build_drafter(directory: Path, device, target_model, model_dir: Path, keep, 
         fused_serving.shard_attention_for_tp(model, rank, size, group)
         model.config = replace(c, num_attention_heads=c.num_attention_heads // size,
                                num_key_value_heads=c.num_key_value_heads // size)
-    fast_drafter.install(model)
+    model.compile_mode = fast_drafter.install(model, replicas=size, device=device)
     return model.eval().requires_grad_(False)
 
 
@@ -307,13 +307,13 @@ class DFlashDraftWorker:
         logger.info(
             "DFlash drafter %s on attention-TP group %s (rank %d/%d, attention DP %d), %s experts: %d layers, experts "
             "kept %s (%s on this rank), weights %.2f GiB, state pool %d slots %.2f GiB (window %d, %s layout), "
-            "lm_head %s, loaded in %.1f s; prefill tail %d, rejection sampling %s, verify width %d",
+            "lm_head %s, loaded in %.1f s; prefill tail %d, rejection sampling %s, verify width %d, compile %s",
             directory, list(self.group.ranks), self.group.rank_in_group, self.group.world_size, dp, self.backend,
             self.model.config.num_layers, [len(keep[str(i)]) for i in range(self.model.config.num_layers)],
             [e.num_local if self.backend == "marlin" else e.num_experts for e in experts],
             self.weight_bytes / 2**30, self.pool.slots, self.pool.bytes() / 2**30, self.model.config.window, layout,
             type(self.model.lm_head).__name__, self._weight_load_time, self.prefill_tail, self.use_rejection_sampling,
-            self.width,
+            self.width, self.model.compile_mode,
         )
 
     # ---- EagleDraftWorker surface used by EAGLEWorkerV2 / the scheduler ----------------------------------------
