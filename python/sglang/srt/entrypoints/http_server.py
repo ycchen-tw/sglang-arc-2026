@@ -846,8 +846,22 @@ async def server_info():
             # `None` when publishing is disabled or misconfigured; see
             # `runtime_context.describe_kv_events_publisher` for the contract.
             "kv_events": describe_kv_events_publisher(server_args),
+            "session_ledger": (
+                _global_state.tokenizer_manager.session_ledger.status()
+                if _global_state.tokenizer_manager.session_ledger is not None
+                else None
+            ),
         }
     )
+
+
+@app.get("/session_ledger/status")
+async def session_ledger_status():
+    """arc-forge TITO session ledger: instance, directory, counters, queue, lossy."""
+    ledger = _global_state.tokenizer_manager.session_ledger
+    if ledger is None:
+        raise HTTPException(status_code=404, detail="session ledger is off (--session-replay)")
+    return ledger.status()
 
 
 @app.get("/get_load")

@@ -291,6 +291,9 @@ class ReqState:
     output_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
     output_token_sampling_mask: List = dataclasses.field(default_factory=list)
     output_token_sampling_logprobs: List = dataclasses.field(default_factory=list)
+    # session ledger turned return_logprob / return_routed_experts on for this request (the client did not ask)
+    ledger_logprobs: bool = False
+    ledger_routing: bool = False
 
     # Cached flat-format prompt top logprob fields; rebuilt only when more
     # prefill chunks arrive, so streaming decode chunks reuse the payload.
@@ -513,6 +516,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Init logging and dumping
         self.init_request_logging_and_dumping()
 
+        # arc-forge TITO session ledger (after the tokenizer, before any request)
+        self.init_session_ledger()
+
         # Init weight update
         self.init_weight_update()
 
@@ -533,6 +539,46 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.cuda_vmm_feature_transport = CudaVmmFeatureTransport(
             self.server_args, self.mm_processor
         )
+
+    def init_session_ledger(self):
+        """--session-replay / --session-ledger-*: see managers/session_ledger.py."""
+        serving = get_serving()
+        self.session_ledger = None
+        if not serving.session_replay:
+            if (
+                serving.session_ledger_dir is not None
+                or serving.session_ledger_all
+                or serving.session_ledger_logprobs
+                or serving.session_ledger_routing
+            ):
+                raise ValueError("--session-ledger-* needs --session-replay")
+            return
+        from sglang.srt.managers.session_ledger import SessionLedger, server_meta
+
+        self.session_ledger = SessionLedger(
+            tokenizer=self.tokenizer,
+            eos_token_ids=self.model_config.hf_eos_token_id,
+            ledger_dir=serving.session_ledger_dir,
+            record_all=serving.session_ledger_all,
+            logprobs=serving.session_ledger_logprobs,
+            routing=serving.session_ledger_routing,
+            routing_server_enabled=get_exec().features.enable_return_routed_experts,
+            max_bytes=serving.session_ledger_max_bytes,
+            tokenizer_worker_num=serving.tokenizer_worker_num,
+            server_meta=server_meta(self.server_args),
+            port=self.server_args.port,
+        )
+
+    def _session_ledger_intake(self, obj, tokenized_obj) -> None:
+        if self.session_ledger is None or not isinstance(obj, GenerateReqInput):
+            return
+        if self.max_req_input_len is None:
+            raise RuntimeError("session ledger: max_req_input_len is not set yet")
+        self.session_ledger.on_intake(obj, tokenized_obj, self.max_req_input_len)
+        state = self.rid_to_state[obj.rid]
+        state.ledger_logprobs = self.session_ledger.forced_logprobs
+        state.ledger_routing = self.session_ledger.forced_routing
+        self.session_ledger.sweep(self.rid_to_state)
 
     def init_model_config(self):
         server_args = self.server_args
@@ -894,6 +940,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Tokenize the request and send it to the scheduler
                 if obj.is_single:
                     tokenized_obj = await self._tokenize_one_request(obj)
+                    self._session_ledger_intake(obj, tokenized_obj)
                     state = self.rid_to_state[obj.rid]
                     if obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
@@ -1950,6 +1997,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if getattr(obj, "parallel_sample_num", 1) == 1:
             if self._should_use_batch_tokenization(batch_size, obj):
                 tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
+                for i in range(batch_size):
+                    self._session_ledger_intake(obj[i], tokenized_objs[i])
                 await self._send_batch_request(tokenized_objs)
 
                 # Set up generators for each request in the batch
@@ -1972,6 +2021,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     for i in range(batch_size):
                         tmp_obj = obj[i]
                         tokenized_obj = await self._tokenize_one_request(tmp_obj)
+                        self._session_ledger_intake(tmp_obj, tokenized_obj)
                         state = self.rid_to_state[tmp_obj.rid]
                         if tmp_obj.return_prompt_token_ids:
                             state.prompt_token_ids = list(tokenized_obj.input_ids)
@@ -2371,6 +2421,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     recv_obj,
                     i,
                 )
+            elif state.ledger_logprobs:
+                # session ledger only: keep the sampled-token values, nothing goes to the client
+                vals = recv_obj.output_token_logprobs_val
+                if vals is not None and vals[i] is not None:
+                    state.output_token_logprobs_val.extend(vals[i])
             if (
                 isinstance(state.obj, GenerateReqInput)
                 and state.obj.return_sampling_mask
@@ -2588,6 +2643,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
                 if get_spec().speculative_algorithm:
                     self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
+                if self.session_ledger is not None:
+                    self.session_ledger.on_finish(
+                        rid, state, meta_info, recv_obj.finished_reasons[i]
+                    )
+                    if state.ledger_routing:  # recorded; the client did not ask for it
+                        meta_info.pop("routed_experts", None)
+                        meta_info.pop("routed_experts_meta", None)
                 if self.enable_metrics:
                     scheduler_time_stats = (
                         recv_obj.time_stats[i]
