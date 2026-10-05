@@ -436,12 +436,11 @@ class QwenSparseAttnBackend(AttentionBackend):
             if int(coord.rows_limit.max()) > coord.identity_rows.shape[1]:
                 raise RuntimeError("HiSparse rows_limit exceeds the identity table")
             return
-        if self.arc_nvfp4_sm100:
-            # h12 wires sm_120's token-major scale planes; the sm_100 paged
-            # scale layout goes through the same gather but is unvalidated.
-            raise NotImplementedError(
-                "QSA HiSparse NVFP4 is validated on sm_120 XQA only (M3)"
-            )
+        # NVFP4 on sm_100 (B200) takes the same gather as without HiSparse: the pool planes
+        # are token-major on every architecture; HiSparse only swaps the gather's source
+        # table for the identity table over the device rows (_decode_gather_tables), and the
+        # sm_100 destination layout (HND payload, paged scales, 4-token value-scale groups)
+        # is what _forward_trtllm_sparse_nvfp4 already writes for trtllm-gen.
         if _QSA_DIRECT_DECODE:
             raise RuntimeError(
                 "SGLANG_QSA_DIRECT_DECODE reads req_to_token slots; turn it off "
