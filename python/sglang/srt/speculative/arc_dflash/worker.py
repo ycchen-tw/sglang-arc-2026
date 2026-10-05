@@ -311,7 +311,7 @@ def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, 
             attention.o_proj = AllReduced(attention.o_proj, group)
         model.config = replace(c, num_attention_heads=heads, num_key_value_heads=kv)
     model.fp8_modules = tuple(fp8_modules)
-    fast_drafter.install(model)
+    model.compile_mode = fast_drafter.install(model, replicas=size, device=device)
     return model.eval().requires_grad_(False)
 
 
