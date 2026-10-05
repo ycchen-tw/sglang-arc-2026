@@ -351,13 +351,30 @@ class DFlashDraftWorker:
         free_before = torch.cuda.mem_get_info(self.device)[0]
         # the group's all-reduce / all-gather inside the graphs go through pynccl, which SGLang enables only here
         capture = self.group.graph_capture() if self.group.world_size > 1 else contextlib.nullcontext()
+        # ARC_DFLASH_SHARED_GRAPH_POOL (default 1): on one rank the drafter graphs go into the target's graph memory
+        # pool on its capture stream (G4 c110: drafter graphs 0.44 -> 0.08 GiB, accept unchanged). Attention-TP
+        # groups (L4) keep their own pool: not validated under the group's graph_capture.
+        shared = os.environ.get("ARC_DFLASH_SHARED_GRAPH_POOL", "1")
+        if shared not in ("0", "1"):
+            raise ValueError(f"ARC_DFLASH_SHARED_GRAPH_POOL must be 0 or 1, got {shared!r}")
+        target_pool = target_stream = None
+        if shared == "1" and self.group.world_size == 1:
+            from sglang.srt.model_executor.runner_utils import (
+                get_global_graph_memory_pool,
+                get_or_create_global_graph_capture_stream,
+            )
+
+            target_pool = get_global_graph_memory_pool()  # None when the target runs without CUDA graphs
+            if target_pool is not None:
+                target_stream = get_or_create_global_graph_capture_stream()
         with capture:
-            self.pool.capture(sizes)
+            self.pool.capture(sizes, target_pool=target_pool, target_stream=target_stream)
         torch.cuda.synchronize(self.device)
         self.graph_seconds = time.monotonic() - begin
         logger.info(
-            "DFlash draft CUDA graphs for batch sizes %s in %.1f s, %.2f GiB",
+            "DFlash draft CUDA graphs for batch sizes %s in %.1f s, %.2f GiB (%s)",
             sizes, self.graph_seconds, (free_before - torch.cuda.mem_get_info(self.device)[0]) / 2**30,
+            "target's graph pool" if target_pool is not None else "own graph pool",
         )
 
     def _rebuild_topk1_chain_buffers(self):
