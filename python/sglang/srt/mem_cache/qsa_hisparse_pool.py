@@ -558,7 +558,7 @@ class QSAHiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.logical_attn_allocator.free(free_index)
         if held.numel() > 0:
             self.prefill_block_allocator.free(held)
-        mapping[blocks] = 0
+        mapping.index_fill_(0, blocks, 0)  # `mapping[blocks] = 0` copies a CPU scalar (stream sync)
 
     def clear(self):
         self.logical_attn_allocator.clear()

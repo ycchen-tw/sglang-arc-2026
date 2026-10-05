@@ -3576,15 +3576,17 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
         )
 
+        # arc: host lists to the device through pinned memory without blocking; torch.tensor(list, device=cuda)
+        # is a pageable H2D copy, a stream sync per HiSparse prefill-to-decode transition (G4 sync audit)
         req_pool_indices = [r.kv.req_pool_idx for r in reqs]
-        batch.req_pool_indices = torch.tensor(
-            req_pool_indices, dtype=torch.int64, device=device
-        )
         batch.req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
+        batch.req_pool_indices = batch.req_pool_indices_cpu.pin_memory().to(device, non_blocking=True)
         seq_lens = [len(r.origin_input_ids) + len(r.output_ids) - 1 for r in reqs]
-        batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=device)
         batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
-        batch.orig_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+        batch.seq_lens = batch.seq_lens_cpu.pin_memory().to(device, non_blocking=True)
+        batch.orig_seq_lens = (
+            torch.tensor(seq_lens, dtype=torch.int32, pin_memory=True).to(device, non_blocking=True)
+        )
         batch.seq_lens_sum = sum(seq_lens)
         if self.spec_algorithm.is_none():
             # Stash last token into relay; resolve_forward_inputs will gather.
