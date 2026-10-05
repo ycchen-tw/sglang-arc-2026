@@ -58,6 +58,7 @@ MM_TOKEN_FIELDS = ("im_token_id", "im_start_id", "im_end_id", "slice_start_id", 
 EVENTS_ROTATE_BYTES = 1 << 30
 ROUTING_ROTATE_BYTES = 4 << 30
 QUEUE_MAX_EVENTS = 200_000
+STATUS_EVERY_S = 300.0  # a status event this often: a killed server writes no "end"
 
 
 def _i64(tokens) -> np.ndarray:
@@ -348,6 +349,7 @@ class _Writer:
         self.media_written: set = set(n for n in os.listdir(os.path.join(root, "media")))
         self.bytes_written = 0
         self.lossy = 0
+        self.lossy_unreported = 0
         self.error: Optional[str] = None
         self.thread = threading.Thread(target=self._run, name="session-ledger-writer", daemon=True)
         self.thread.start()
@@ -356,9 +358,14 @@ class _Writer:
         if self.error is not None:
             raise RuntimeError(f"session ledger writer died: {self.error}")
         try:
+            if self.lossy_unreported:
+                # the drop itself goes on disk as soon as there is room again
+                self.q.put_nowait(({"ev": "lossy", "t": time.time(), "dropped": self.lossy_unreported}, (), None))
+                self.lossy_unreported = 0
             self.q.put_nowait((event, media, routing))
         except queue.Full:
             self.lossy += 1
+            self.lossy_unreported += 1
             logger.error("SESSION_LEDGER queue full (%d events): dropped one, ledger is lossy", self.q.qsize())
 
     def depth(self) -> int:
@@ -525,6 +532,7 @@ class SessionLedger:
         self.version_seq = 0  # ledger-wide: a session's version never repeats, across segments or reopens
         self.counters: Counter = Counter()
         self._sweep_tick = 0
+        self._next_status = time.time() + STATUS_EVERY_S
         # set by on_intake for the TokenizerManager: did the ledger turn these on for this request
         self.forced_logprobs = False
         self.forced_routing = False
@@ -686,9 +694,13 @@ class SessionLedger:
             if sess is None:
                 kind, cause = "new", "evicted"  # evicted or closed
             else:
+                # another request committed first: the intake rules again, against the new S
                 n = len(sess.S)
-                if len(p.key) >= n and _lcp(p.key.astype(np.int64), sess.S.astype(np.int64)) == n:
-                    kind, prefix_len = "extend", n  # another request committed first; still an extension
+                lcp = _lcp(p.key.astype(np.int64), sess.S.astype(np.int64))
+                if lcp == n and len(p.key) >= n:
+                    kind, prefix_len = "extend", n
+                elif sess.gen_start <= lcp < n:
+                    kind, prefix_len = "extend", lcp  # rewinds into the generation committed meanwhile
                 else:
                     kind, cause = "branch", "concurrent"
         new_S = np.concatenate((p.key, gen))
@@ -714,7 +726,7 @@ class SessionLedger:
                 self._close(sess, f"split:{cause}")
                 del self.sessions[p.sid]
                 self.bytes -= sess.S.nbytes
-            seg, k = self._open(p.sid, "single" if p.sid is None else "new" if cause == "new" else f"split:{cause}"), 0
+            seg, k = self._open(p.sid, cause if p.sid is not None else "single"), 0
             prefix_len = 0
             if p.sid is not None:
                 self.version_seq += 1
@@ -730,6 +742,10 @@ class SessionLedger:
             sess.last_used = time.time()
         if self.writer is not None:
             self._write_append(p, state, meta_info, finish_reason, gen, seg, k, prefix_len, kind, media, rewind)
+            now = time.time()
+            if now >= self._next_status:
+                self._next_status = now + STATUS_EVERY_S
+                self.writer.put({"ev": "status", "t": now, "status": self.status()})
             if p.sid is None:
                 self.writer.put({"ev": "seg_close", "sid": None, "seg": seg, "t": time.time(), "reason": "single",
                                  "n_tokens": int(len(new_S)), "sha256": hashlib.sha256(new_S.astype("<i4").tobytes()).hexdigest()})
@@ -833,6 +849,7 @@ class SessionLedger:
             self._close(sess, "shutdown")
         self.sessions.clear()
         if self.writer is not None:
+            self.writer.put({"ev": "end", "t": time.time(), "status": self.status()})
             self.writer.close()
 
 
