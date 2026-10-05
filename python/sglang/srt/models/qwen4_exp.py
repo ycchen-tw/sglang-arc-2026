@@ -1263,6 +1263,7 @@ class Qwen4ExpPLELayer(nn.Module):
             embeddings = self.ple_embedding(batch, forward_batch)
         key, _ = self.key_proj(embeddings)
         value, _ = self.value_proj(embeddings)
+        del embeddings  # each (tokens, 4 x hidden) intermediate goes as soon as it is consumed (prefill peak)
         token_count = hidden_states.shape[0]
         hidden_size = self.hidden_size
         hc_count = self.hc_count
@@ -1276,6 +1277,7 @@ class Qwen4ExpPLELayer(nn.Module):
         key_normed = self._apply_ple_norm(self.norm_key, key)
         query_normed = self._apply_ple_norm(self.norm_query, query)
         gate = (key_normed * query_normed).sum(dim=-1, keepdim=True)
+        del key, query, key_normed, query_normed
         gate = gate / math.sqrt(hidden_size)
         fused_gate_value = False
         if batch.use_decode_fast_path:
@@ -1299,13 +1301,14 @@ class Qwen4ExpPLELayer(nn.Module):
             forward_batch,
             batch,
         )
-        output = gated_value + conv_output
-        if not batch.use_decode_fast_path:
-            output = torch.where(
-                batch.valid_tokens.unsqueeze(-1),
-                output,
-                torch.zeros_like(output),
-            )
+        del gated_value_normed
+        if batch.use_decode_fast_path:
+            output = gated_value + conv_output
+        else:
+            # in place: gated_value is a fresh product consumed only here; masked_fill_ == where(valid, x, 0)
+            output = gated_value.add_(conv_output)
+            del conv_output
+            output.masked_fill_(~batch.valid_tokens.unsqueeze(-1), 0)
         return _pad_token_rows(output, batch.physical_tokens)
 
 
