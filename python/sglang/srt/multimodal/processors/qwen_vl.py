@@ -53,7 +53,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
 )
 from sglang.srt.runtime_context import get_mm, get_parallel
 from sglang.srt.utils import cpu_has_amx_support, is_cpu
-from sglang.srt.utils.video_decoder import VideoDecoderWrapper
+from sglang.srt.utils.video_decoder import VideoDecoderWrapper, pin_decoded_frames
 from sglang.utils import logger
 
 IMAGE_FACTOR = 28
@@ -308,7 +308,7 @@ async def preprocess_video(
         [resized_height, resized_width],
         interpolation=InterpolationMode.BILINEAR,
     )
-    if not is_cpu():
+    if pin_decoded_frames():  # not in a CPU-transport tokenizer process (see video_decoder)
         video = video.pin_memory()
     video_metadata = {
         "fps": video_fps,

@@ -259,6 +259,11 @@ class BaseMultimodalProcessor(ABC):
             else "cpu"
         )
         self.use_cuda_ipc = self.mm_feature_transport == "cuda_ipc"
+        # ARC: with CPU transport this process never copies decoded video frames to the GPU; pinning them would
+        # create a CUDA context (550 MiB) on the serving GPU from the tokenizer process
+        from sglang.srt.utils.video_decoder import set_pin_decoded_frames
+
+        set_pin_decoded_frames(self.mm_feature_transport != "cpu")
         self.use_ipc_pool_handle_cache = (
             self.use_cuda_ipc and envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
         )

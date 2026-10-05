@@ -40,6 +40,22 @@ def _is_cpu_engine() -> bool:
     return is_cpu()
 
 
+# ARC: decoded frames are pinned for a fast H2D copy in this process. A process that ships multimodal features to the
+# scheduler over CPU transport (the tokenizer process with --mm-feature-transport cpu) never copies them to the GPU,
+# and pin_memory() there creates a CUDA context: 550 MiB of device memory on the serving GPU, taken by the first
+# video. BaseMultimodalProcessor sets this from its transport; the default keeps the upstream behaviour.
+_PIN_DECODED_FRAMES = True
+
+
+def set_pin_decoded_frames(pin: bool) -> None:
+    global _PIN_DECODED_FRAMES
+    _PIN_DECODED_FRAMES = bool(pin)
+
+
+def pin_decoded_frames() -> bool:
+    return _PIN_DECODED_FRAMES and not _is_cpu_engine()
+
+
 class VideoDecoderWrapper:
     """Unified video decoder that uses torchcodec when available, decord as fallback.
 
@@ -147,13 +163,13 @@ class VideoDecoderWrapper:
 
         if _BACKEND == "torchcodec":
             batch = self._decoder.get_frames_at(indices)
-            if _is_cpu_engine():
+            if batch.data.is_cuda or not pin_decoded_frames():
                 return batch.data
-            return batch.data if batch.data.is_cuda else batch.data.pin_memory()
+            return batch.data.pin_memory()
         else:
             arr = self._decoder.get_batch(indices).asnumpy()
             output = torch.from_numpy(arr)
-            return output if _is_cpu_engine() else output.pin_memory()
+            return output.pin_memory() if pin_decoded_frames() else output
 
     def _parallel_decode(self, indices, num_threads):
         """Decode frames using multiple VideoDecoder instances in parallel threads."""
@@ -187,9 +203,9 @@ class VideoDecoderWrapper:
                 results[idx] = future.result()
 
         output = torch.cat(results, dim=0)
-        if _is_cpu_engine():
+        if output.is_cuda or not pin_decoded_frames():
             return output
-        return output if output.is_cuda else output.pin_memory()
+        return output.pin_memory()
 
     @property
     def source_bytes(self) -> bytes | None:
