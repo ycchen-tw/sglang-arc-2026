@@ -15,6 +15,7 @@
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
 
 import logging
+import os
 import re
 from collections import defaultdict
 from functools import lru_cache, partial
@@ -127,6 +128,14 @@ def _resolve_vision_tp(
     return tp_size, tp_rank
 
 
+def _arc_env_rows(name: str, default: int) -> int:
+    """ARC memory caps for the vision tower: a non-negative int, 0 = no cap (one call, the upstream behaviour)."""
+    raw = os.environ.get(name, str(default))
+    if not raw.isdigit():
+        raise ValueError(f"{name} must be a non-negative integer, got {raw!r}")
+    return int(raw)
+
+
 class Qwen3_VisionMLP(nn.Module):
     def __init__(
         self,
@@ -168,9 +177,22 @@ class Qwen3_VisionMLP(nn.Module):
         self.act = ACT2FN[hidden_act]
 
     def forward(self, x: torch.Tensor):
-        x_fc1, _ = self.linear_fc1(x)
-        mlp_output, _ = self.linear_fc2(self.act(x_fc1))
-        return mlp_output
+        # ARC_VIT_MLP_ROWS: the MLP is per patch, so long items run in row chunks into one output (a ~32k-patch
+        # video held fc1 + act at 0.25 GiB each); 0 = one call
+        rows = _arc_env_rows("ARC_VIT_MLP_ROWS", 8192)
+        if rows == 0 or x.shape[0] <= rows:
+            x_fc1, _ = self.linear_fc1(x)
+            mlp_output, _ = self.linear_fc2(self.act(x_fc1))
+            return mlp_output
+        out = None
+        for start in range(0, x.shape[0], rows):
+            x_fc1, _ = self.linear_fc1(x[start : start + rows])
+            part, _ = self.linear_fc2(self.act(x_fc1))
+            del x_fc1
+            if out is None:
+                out = part.new_empty((x.shape[0], *part.shape[1:]))
+            out[start : start + part.shape[0]] = part
+        return out
 
 
 class Qwen3VLVisionPatchEmbed(nn.Module):
@@ -1441,16 +1463,35 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 pixel_values_device=self.visual.device,
                 pixel_values_dtype=self.visual.dtype,
             )
-        pixel_values, borrowed_items, packed_ready = self._materialize_visual_items(
-            items, range(len(items)), preserve_for_reprefill=True
-        )
-        assert pixel_values.dim() == 2, pixel_values.dim()
-        visual_features = self.visual(pixel_values, grid_thw=grid_thw)
-        if borrowed_items:
-            self._offload_packed_visual_inputs(
-                pixel_values, borrowed_items, packed_ready
+        # ARC_VIT_MAX_PATCHES: one ViT forward per group of items of at most this many patches (activations scale
+        # with the patch count; 4 videos in one extend batch peaked at 1.6-2.3 GiB). Attention is per item
+        # (cu_seqlens) and MLP / merger per patch, so the concatenated groups are the same rows. 0 = one call.
+        cap = _arc_env_rows("ARC_VIT_MAX_PATCHES", 16384)
+        patches = (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]).tolist()
+        if len(patches) != len(items):
+            raise RuntimeError(
+                f"one grid row per item expected: {len(patches)} rows for {len(items)} items"
             )
-        return visual_features
+        groups, start, acc = [], 0, 0
+        for i, n in enumerate(patches):
+            if cap and i > start and acc + n > cap:
+                groups.append((start, i))
+                start, acc = i, 0
+            acc += n
+        groups.append((start, len(items)))
+        outputs = []
+        for lo, hi in groups:
+            pixel_values, borrowed_items, packed_ready = self._materialize_visual_items(
+                items, range(lo, hi), preserve_for_reprefill=True
+            )
+            assert pixel_values.dim() == 2, pixel_values.dim()
+            outputs.append(self.visual(pixel_values, grid_thw=grid_thw[lo:hi]))
+            if borrowed_items:
+                self._offload_packed_visual_inputs(
+                    pixel_values, borrowed_items, packed_ready
+                )
+            del pixel_values
+        return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
 
     def _materialize_visual_items(
         self,
