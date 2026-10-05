@@ -70,6 +70,18 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         )
         self._distributed_topk1 = envs.SGLANG_QWEN4_MTP_DISTRIBUTED_TOPK1.get()
         if self._distributed_topk1:
+            # DP attention gives each attention-DP group its own batch, but the
+            # vocab-parallel lm_head shards over the full TP group. The (max, id)
+            # all-gather in draft_topk1_postprocess_distributed would mix rows of
+            # different DP groups, and an idle DP group (bs == 0) returns before
+            # the all-gather, so the busy group waits forever (silent deadlock
+            # until the scheduler watchdog fires).
+            if get_parallel().attn_dp_size != 1:
+                raise ValueError(
+                    "Qwen4 distributed MTP top-1 does not support DP attention "
+                    f"(attn_dp_size={get_parallel().attn_dp_size}); set "
+                    "SGLANG_QWEN4_MTP_DISTRIBUTED_TOPK1=0"
+                )
             spec = get_spec()
             if (
                 spec.speculative_eagle_topk != 1
