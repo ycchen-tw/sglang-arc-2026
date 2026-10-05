@@ -351,12 +351,21 @@ class _Writer:
         self.lossy = 0
         self.lossy_unreported = 0
         self.error: Optional[str] = None
+        # shutdown waits for room instead of dropping: its seg_close/end events are what tells a clean stop
+        # from a crash
+        self.blocking = False
         self.thread = threading.Thread(target=self._run, name="session-ledger-writer", daemon=True)
         self.thread.start()
 
     def put(self, event: dict, media: Sequence[Tuple[str, bytes]] = (), routing: Optional[bytes] = None) -> None:
         if self.error is not None:
             raise RuntimeError(f"session ledger writer died: {self.error}")
+        if self.blocking:
+            if self.lossy_unreported:
+                self.q.put(({"ev": "lossy", "t": time.time(), "dropped": self.lossy_unreported}, (), None))
+                self.lossy_unreported = 0
+            self.q.put((event, media, routing))
+            return
         try:
             if self.lossy_unreported:
                 # the drop itself goes on disk as soon as there is room again
@@ -376,6 +385,8 @@ class _Writer:
         self.thread.join(timeout)
         if self.thread.is_alive():
             raise RuntimeError(f"session ledger writer did not drain in {timeout}s ({self.q.qsize()} left)")
+        if self.error is not None:
+            raise RuntimeError(f"session ledger writer died: {self.error}")
 
     def _run(self) -> None:
         try:
@@ -678,6 +689,9 @@ class SessionLedger:
         p = self.pending.pop(rid, None)
         if p is None:
             return
+        if self._shut:
+            self.counters["finished_after_shutdown"] += 1  # the writer is closed: nothing can be recorded
+            return
         gen = np.asarray(state.output_ids, dtype=np.int32)
         ftype = (finish_reason or {}).get("type")
         if ftype not in ("stop", "length"):
@@ -845,6 +859,8 @@ class SessionLedger:
         if self._shut:
             return
         self._shut = True
+        if self.writer is not None:
+            self.writer.blocking = True
         for sess in list(self.sessions.values()):
             self._close(sess, "shutdown")
         self.sessions.clear()

@@ -555,6 +555,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return
         from sglang.srt.managers.session_ledger import SessionLedger, server_meta
 
+        if serving.session_ledger_routing:
+            # Routed experts are gathered at request end from a host buffer indexed by KV slot. HiCache reloads
+            # host-backed prefixes into new slots (their rows hold an earlier occupant's routing), and distributed
+            # HiSparse (attention DP) was never validated with the capture: refuse both rather than record
+            # silently stale routing. QSA HiSparse TP1 is fine (logical slots; arc-forge 2026-10-05 G1b).
+            if get_memory().enable_hierarchical_cache:
+                raise ValueError("--session-ledger-routing does not support --enable-hierarchical-cache "
+                                 "(reloaded prefixes get new KV slots: their routing rows would be stale)")
+            if get_memory().enable_hisparse and get_parallel().enable_dp_attention:
+                raise ValueError("--session-ledger-routing with distributed HiSparse (--enable-dp-attention) "
+                                 "is not validated")
         self.session_ledger = SessionLedger(
             tokenizer=self.tokenizer,
             eos_token_ids=self.model_config.hf_eos_token_id,
