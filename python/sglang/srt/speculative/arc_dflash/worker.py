@@ -197,6 +197,13 @@ def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, 
 
     from .fp8 import BLOCK, AllReduced, Fp8BlockLinear
 
+    # the runner's device is "cuda" without an index; safetensors would read "cuda" as cuda:0 on every rank (on L4 the
+    # other three ranks then put their drafter on GPU 0 and the TP group's KV budget fails there): name this rank's GPU
+    device = torch.device(device)
+    if device.type != "cuda":
+        raise ValueError(f"the dense drafter loads onto a CUDA device, got {device}")
+    if device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
     raw = json.loads((directory / "config.json").read_text())
     quant = raw.pop("quantization", None)
     c = Config(**raw)
