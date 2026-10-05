@@ -1052,6 +1052,9 @@ class Qwen4ExpPLELayer(nn.Module):
                 conv_state[track_indices] = next_state.to(dtype=conv_state.dtype)
             return F.silu(conv_output)
 
+        if not batch.mode.is_target_verify():
+            # extend (and non-fused decode) rows: no (requests, longest row, channels) padding
+            return self._short_conv_ragged(x, forward_batch, batch, conv_state)
         state = conv_state.index_select(0, batch.state_indices).to(dtype=x.dtype)
         padded_seq = x.new_zeros(
             (batch.lengths.shape[0], batch.row_width, self.conv_channels)
@@ -1122,6 +1125,44 @@ class Qwen4ExpPLELayer(nn.Module):
                 )
 
         return F.silu(conv_output[batch.req_indices, batch.token_offsets])
+
+    def _short_conv_ragged(
+        self,
+        x: torch.Tensor,
+        forward_batch: ForwardBatch,
+        batch: _PLEBatch,
+        conv_state: torch.Tensor,
+    ) -> torch.Tensor:
+        """The padded path's values bitwise, from the flat token rows: the padded tensors were up to
+        prefill-max-requests x chunk x conv_channels each (4.16 GiB peak at 8 x 8192), now one (T, channels)."""
+        from sglang.kernels.ops.qwen4_ple_varlen import (
+            qwen4_ple_conv_state_at,
+            qwen4_ple_conv_varlen,
+        )
+
+        state = conv_state.index_select(0, batch.state_indices).to(dtype=x.dtype)
+        starts = torch.cumsum(batch.lengths, 0) - batch.lengths
+        out = qwen4_ple_conv_varlen(
+            x.contiguous(),
+            state,
+            self.conv1d.weight.to(dtype=x.dtype),
+            starts,
+            batch.req_indices,
+            batch.token_offsets,
+            self.short_conv_dilation,
+        )
+        state_len = self.short_conv_state_len
+        conv_state[batch.state_indices] = qwen4_ple_conv_state_at(
+            x, state, starts, batch.lengths, state_len
+        ).to(dtype=conv_state.dtype)
+        # Same boundary mamba uses, into the slot the radix tree reads.
+        track = _ple_track_targets(forward_batch, batch)
+        if track is not None:
+            track_indices, track_offsets = track
+            conv_state[track_indices] = qwen4_ple_conv_state_at(
+                x, state, starts, track_offsets, state_len
+            ).to(dtype=conv_state.dtype)
+        return out
 
     def forward_idle(self, forward_batch: ForwardBatch) -> None:
         if self._prefetch_state is not None:
