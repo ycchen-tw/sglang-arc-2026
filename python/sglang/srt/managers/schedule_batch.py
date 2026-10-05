@@ -1889,6 +1889,13 @@ class Req(ReqDllmMixin):
             return
 
     def reset_for_retract(self):
+        if getattr(self, "arc_mm_features_released", False):
+            # arc: the features were dropped after prefill (ARC_MM_RELEASE_AFTER_PREFILL); re-prefilling the
+            # images is impossible, and silently embedding nothing would be wrong.
+            raise RuntimeError(
+                f"request {self.rid} is retracted after its multimodal features were released at prefill end; "
+                "run with ARC_MM_RELEASE_AFTER_PREFILL=0 if retraction is expected"
+            )
         # Increment retraction count before resetting other state. We should not reset this
         # since we are tracking the total number of retractions for each request.
         self.retraction_count += 1

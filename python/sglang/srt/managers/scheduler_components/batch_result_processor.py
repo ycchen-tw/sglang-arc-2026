@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
@@ -80,6 +81,25 @@ if TYPE_CHECKING:
     from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 
 logger = logging.getLogger(__name__)
+
+
+# arc: a request's multimodal features (pixel values, moved back to CPU after the extend's embedding) are dead
+# once its prefill is complete -- the embeddings are in the KV cache and decode never reads them. Upstream keeps
+# them until the request finishes. A codex turn re-sends its whole history, every old screenshot included
+# (~10 MB of fp32 pixels each), so at c110 the live requests' CPU features grew ~1 GiB per 5 min (G4 probe,
+# 110 -> 165 items for 110 requests) and host RAM ran out on Kaggle. ARC_MM_RELEASE_AFTER_PREFILL=0 keeps
+# upstream behaviour; a retracted request that would need them again refuses loudly (Req.reset_for_retract).
+_ARC_MM_RELEASE = os.environ.get("ARC_MM_RELEASE_AFTER_PREFILL", "1")
+if _ARC_MM_RELEASE not in ("0", "1"):
+    raise ValueError(f"ARC_MM_RELEASE_AFTER_PREFILL must be 0 or 1, got {_ARC_MM_RELEASE!r}")
+
+
+def _arc_release_mm_after_prefill(req) -> None:
+    mm_inputs = req.multimodal_inputs
+    if _ARC_MM_RELEASE != "1" or mm_inputs is None:
+        return
+    mm_inputs.release_features()
+    req.arc_mm_features_released = True
 
 
 def _get_speculative_output_stride(result: GenerationBatchResult) -> int:
@@ -343,6 +363,7 @@ class SchedulerBatchResultProcessor:
 
                 if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()
+                    _arc_release_mm_after_prefill(req)
 
                     if sampling_mask_finish_reason is not None:
                         req.to_finish = sampling_mask_finish_reason
