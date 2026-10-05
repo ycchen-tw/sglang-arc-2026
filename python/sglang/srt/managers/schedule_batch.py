@@ -1220,8 +1220,10 @@ class Req(ReqDllmMixin):
         self.return_routed_experts = return_routed_experts
         self.routed_experts_start_len = routed_experts_start_len
         self.routed_experts: Optional[torch.Tensor] = (
-            None  # cpu tensor: shape (seqlen, topk)
+            None  # cpu int16 tensor: shape (n, num_layers, topk)
         )
+        # {"dtype", "shape", "start"} of routed_experts; set together with it.
+        self.routed_experts_meta: Optional[dict] = None
 
         self.return_indexer_topk = return_indexer_topk
         self.indexer_topk: Optional[torch.Tensor] = (
@@ -1895,6 +1897,7 @@ class Req(ReqDllmMixin):
 
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
         self.routed_experts = None
+        self.routed_experts_meta = None
         self.indexer_topk = None
         self.last_node = None
         self.kv.cache_protected_len = 0

@@ -318,7 +318,12 @@ def extract_routed_experts_from_openai_response(response):
     if routed_experts is None:
         raise ValueError("OpenAI response sglext missing routed_experts.")
     return extract_routed_experts_from_meta_info(
-        {"meta_info": {"routed_experts": routed_experts}}
+        {
+            "meta_info": {
+                "routed_experts": routed_experts,
+                "routed_experts_meta": sglext.get("routed_experts_meta"),
+            }
+        }
     )
 
 

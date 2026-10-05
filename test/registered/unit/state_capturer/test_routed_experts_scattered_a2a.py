@@ -36,10 +36,11 @@ class TestGetLocalSliceBackendBranch(CustomTestCase):
 
     def _capturer(self):
         cap = object.__new__(re_mod.RoutedExpertsCapturer)
-        buf = torch.arange(self.T * self.L * self.K, dtype=torch.int32).reshape(
-            self.T, self.L, self.K
+        # Layer-major [L, T, K], the routing_replay_out layout.
+        buf = torch.arange(self.T * self.L * self.K, dtype=torch.int16).reshape(
+            self.L, self.T, self.K
         )
-        cap.device_cache = SimpleNamespace(buffer=buf)
+        cap.device_buffer = buf
         cap.topk_size = self.K
         return cap, buf
 
@@ -56,7 +57,7 @@ class TestGetLocalSliceBackendBranch(CustomTestCase):
             ),
         ):
             out = self._slice(cap, n_local=5)
-        self.assertTrue(torch.equal(out, buf[0:5, :, : self.K]))
+        self.assertTrue(torch.equal(out, buf[:, 0:5, : self.K]))
 
     def test_deepep_v2_matches_deepep(self):
         cap, _ = self._capturer()
@@ -81,7 +82,7 @@ class TestGetLocalSliceBackendBranch(CustomTestCase):
             mock.patch.object(re_mod, "get_dp_local_slice_cpu", return_value=(6, 4)),
         ):
             out = self._slice(cap, n_local=999)
-        self.assertTrue(torch.equal(out, buf[6:10, :, : self.K]))
+        self.assertTrue(torch.equal(out, buf[:, 6:10, : self.K]))
 
 
 if __name__ == "__main__":

@@ -3077,6 +3077,11 @@ class ServingChatTestCase(unittest.TestCase):
                         "storage_backend": "file",
                     },
                     "routed_experts": "cm91dGUtYQ==",
+                    "routed_experts_meta": {
+                        "dtype": "int16",
+                        "shape": [1, 2, 2],
+                        "start": 0,
+                    },
                     "finish_reason": {"type": "stop", "matched": None},
                     "weight_version": "default",
                 },
@@ -3087,6 +3092,10 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.assertIsNotNone(response.sglext)
         self.assertEqual(response.sglext.routed_experts, "cm91dGUtYQ==")
+        self.assertEqual(
+            response.sglext.routed_experts_meta,
+            {"dtype": "int16", "shape": [1, 2, 2], "start": 0},
+        )
         self.assertEqual(
             response.sglext.cached_tokens_details.model_dump(exclude_none=True),
             {

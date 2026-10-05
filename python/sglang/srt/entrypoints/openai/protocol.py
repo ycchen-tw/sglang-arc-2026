@@ -441,7 +441,10 @@ class SglExt(BaseModel):
     should be added as fields here rather than directly on the choice object.
     """
 
+    # Base64 of the routed experts; decode with routed_experts_meta
+    # ({"dtype": "int16", "shape": [n, num_layers, top_k], "start": s}).
     routed_experts: Optional[str] = None
+    routed_experts_meta: Optional[Dict[str, Any]] = None
     cached_tokens_details: Optional[CachedTokensDetails] = None
     spec_tokens_details: Optional[Union[SpecTokensDetails, List[SpecTokensDetails]]] = (
         None

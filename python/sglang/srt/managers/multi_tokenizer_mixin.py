@@ -256,6 +256,9 @@ def _handle_output_by_index(output, i):
             routed_experts=_extract_field_by_index(
                 output, "routed_experts", i, check_length=False
             ),
+            routed_experts_meta=_extract_field_by_index(
+                output, "routed_experts_meta", i, check_length=False
+            ),
             indexer_topk=_extract_field_by_index(
                 output, "indexer_topk", i, check_length=False
             ),
@@ -376,6 +379,9 @@ def _handle_output_by_index(output, i):
             ),
             routed_experts=_extract_field_by_index(
                 output, "routed_experts", i, check_length=False
+            ),
+            routed_experts_meta=_extract_field_by_index(
+                output, "routed_experts_meta", i, check_length=False
             ),
             indexer_topk=_extract_field_by_index(
                 output, "indexer_topk", i, check_length=False

@@ -354,6 +354,7 @@ class _GenerationStreamAccumulator:
     weight_versions: list = field(default_factory=list)
     output_hidden_states: Optional[list] = None
     routed_experts: Optional[list] = None
+    routed_experts_meta: Optional[list] = None
     indexer_topk: Optional[list] = None
     customized_info: dict = field(default_factory=dict)
     beam_search_output: list = field(default_factory=list)
@@ -388,6 +389,7 @@ class _GenerationStreamAccumulator:
             self.output_hidden_states = []
         if self.return_routed_experts:
             self.routed_experts = []
+            self.routed_experts_meta = []
         if self.return_indexer_topk:
             self.indexer_topk = []
 
@@ -661,8 +663,18 @@ class _GenerationStreamAccumulator:
             else:
                 self.output_hidden_states.append(None)
         if self.return_routed_experts:
+            if req.return_routed_experts and (
+                (req.routed_experts is None) != (req.routed_experts_meta is None)
+            ):
+                raise RuntimeError(
+                    f"req {req.rid}: routed_experts and routed_experts_meta must "
+                    "be set together"
+                )
             self.routed_experts.append(
                 req.routed_experts if req.return_routed_experts else None
+            )
+            self.routed_experts_meta.append(
+                req.routed_experts_meta if req.return_routed_experts else None
             )
         if self.return_indexer_topk:
             self.indexer_topk.append(
@@ -753,6 +765,7 @@ class _GenerationStreamAccumulator:
             output_token_sampling_logprobs=self.output_token_sampling_logprobs,
             output_hidden_states=self.output_hidden_states,
             routed_experts=self.routed_experts,
+            routed_experts_meta=self.routed_experts_meta,
             indexer_topk=self.indexer_topk,
             customized_info=(
                 wrap_as_pickle(self.customized_info) if self.customized_info else None

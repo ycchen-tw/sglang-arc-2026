@@ -186,6 +186,26 @@ def _get_routing_for_flashinfer_routed(topk_output) -> FlashInferRouting:
     )
 
 
+def _routing_replay_out(topk_config, num_tokens: int) -> Optional[torch.Tensor]:
+    """Routed-experts (R3) capture buffer for a logits-based (BYPASSED) call.
+
+    The TRT-LLM routing kernel computes top-k itself, so SGLang's capture site
+    in select_experts never runs on these paths; instead the kernel writes the
+    selected global expert ids into this layer's ``int16 [rows, top_k]`` slice
+    of the capturer's device buffer. None when capture is off or the TopK is
+    draft-side.
+    """
+    if not topk_config.allow_routed_experts_capture:
+        return None
+    # Lazy import: state_capturer.routed_experts imports layers.moe.
+    from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
+
+    capturer = get_global_experts_capturer()
+    if capturer is None:
+        return None
+    return capturer.routing_replay_out(topk_config.layer_id, num_tokens)
+
+
 def _routing_top_k(routing: FlashInferRouting) -> int:
     """Both routing forms carry top_k as the last dim of their ids tensor."""
     ids = routing[0] if isinstance(routing, tuple) else routing
@@ -903,6 +923,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 routing_method_type=routing_method_type,
                 use_shuffled_weight=use_shuffled_weight,
                 tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
+                routing_replay_out=_routing_replay_out(topk_config, a_q.shape[0]),
             )
             if defer_finalize:
                 from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
@@ -982,6 +1003,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             routing_method_type=routing_method_type,
             tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
             activation_type=quant_info.activation_type,
+            routing_replay_out=_routing_replay_out(topk_config, a_q.shape[0]),
         )
         symm_output.copy_(output)
         output = symm_output
@@ -1186,6 +1208,9 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
             tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
             output=symm_output,
             enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
+            routing_replay_out=_routing_replay_out(
+                topk_output.topk_config, x_quant.shape[0]
+            ),
         )
         return StandardCombineInput(hidden_states=symm_output)
 
@@ -1221,6 +1246,9 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
         tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
         output=symm_output,
         enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
+        routing_replay_out=_routing_replay_out(
+            topk_output.topk_config, x_quant.shape[0]
+        ),
     )[0]
     return StandardCombineInput(hidden_states=trtllm_gen_output)
 
@@ -1486,6 +1514,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             activation_type=activation_type,
             tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
             enable_pdl=trtllm_moe_enable_pdl(hs_fp4.shape[0]),
+            routing_replay_out=_routing_replay_out(topk_config, hs_fp4.shape[0]),
         )
         if not defer_finalize:
             moe_kwargs["output"] = symm_output
@@ -1620,6 +1649,9 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
                 routed_scaling_factor=runner_config.routed_scaling_factor,
                 tune_max_num_tokens=next_power_of_2(hidden_states.shape[0]),
                 activation_type=activation_type,
+                routing_replay_out=_routing_replay_out(
+                    topk_config, hidden_states.shape[0]
+                ),
             )
 
     return StandardCombineInput(hidden_states=final_hidden_states)

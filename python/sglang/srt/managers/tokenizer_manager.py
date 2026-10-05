@@ -2501,11 +2501,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if getattr(recv_obj, "routed_experts", None):
                 val = recv_obj.routed_experts[i]
                 if val is not None:
+                    # The bytes are int16 (not int32): a consumer must decode
+                    # with routed_experts_meta, so the two travel together.
+                    routed_meta = (
+                        recv_obj.routed_experts_meta[i]
+                        if recv_obj.routed_experts_meta is not None
+                        else None
+                    )
+                    if routed_meta is None:
+                        raise RuntimeError(
+                            f"routed_experts for rid {recv_obj.rids[i]} arrived "
+                            "without routed_experts_meta"
+                        )
                     # BatchStrOutput is pre-encoded by the detokenizer;
                     # BatchTokenIDOutput (skip_tokenizer_init) bypasses it.
                     if isinstance(val, torch.Tensor):
                         val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
                     meta_info["routed_experts"] = val
+                    meta_info["routed_experts_meta"] = routed_meta
             if getattr(recv_obj, "indexer_topk", None):
                 val = recv_obj.indexer_topk[i]
                 if val is not None:
