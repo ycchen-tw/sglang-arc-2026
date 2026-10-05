@@ -38,6 +38,10 @@ class Config:
     conv_group_size: int = 16
     selector_top_k: int = 16
     selector_rank: int = 256
+    # "moe": routed experts + router (the trained export); "dense_shared": one SwiGLU of width
+    # dense_intermediate_size in place of the routed experts and router, shared expert and its gate unchanged
+    ffn_type: str = "moe"
+    dense_intermediate_size: int = 0
 
     def __post_init__(self):
         if self.hidden_size % self.conv_group_size or self.window < 1:
@@ -50,6 +54,10 @@ class Config:
             raise ValueError("invalid GQA geometry")
         if not 1 <= self.num_experts_per_tok <= self.num_experts:
             raise ValueError("invalid routed expert count")
+        if self.ffn_type not in ("moe", "dense_shared"):
+            raise ValueError(f"unknown ffn_type {self.ffn_type!r}")
+        if (self.ffn_type == "dense_shared") != (self.dense_intermediate_size > 0):
+            raise ValueError("dense_intermediate_size is set exactly when ffn_type is dense_shared")
         if not 1 <= self.selector_top_k <= self.vocab_size:
             raise ValueError("invalid selector top-K")
         rotary = int(self.head_dim * self.partial_rotary_factor)
@@ -472,10 +480,24 @@ class MoE(nn.Module):
         return y.reshape(shape)
 
 
+class DenseWithShared(nn.Module):
+    """The routed MoE replaced by one dense SwiGLU; the shared expert and its sigmoid gate as in MoE."""
+
+    def __init__(self, c):
+        super().__init__()
+        self.routed = MLP(c, c.dense_intermediate_size)
+        self.shared_expert = MLP(c, c.shared_expert_intermediate_size)
+        self.shared_expert_gate = nn.Linear(c.hidden_size, 1, bias=False)
+
+    def forward(self, x):
+        return self.routed(x) + self.shared_expert(x) * torch.sigmoid(self.shared_expert_gate(x))
+
+
 class Decoder(nn.Module):
     def __init__(self, c):
         super().__init__()
-        self.self_attn, self.mlp = Attention(c), MoE(c)
+        self.self_attn = Attention(c)
+        self.mlp = MoE(c) if c.ffn_type == "moe" else DenseWithShared(c)
         self.attn_hyper_connection, self.mlp_hyper_connection = GatedResidual(c), GatedResidual(c)
         self.attention_conv, self.mlp_conv = GroupedConv(c), GroupedConv(c)
 

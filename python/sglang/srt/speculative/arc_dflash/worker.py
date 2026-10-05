@@ -26,6 +26,11 @@ replicated: identical inputs through identical kernels, so every rank proposes t
 Routed experts: ARC_DFLASH_MOE=cutlass (FlashInfer CUTLASS W4A4, the target's kernel on sm_100/sm_120; needs
 ARC_DFLASH_CALIB for GEMM2's static input scale; one rank only) or marlin (SGLang's NVFP4 Marlin W4A16, any group
 size). Default: cutlass on compute capability >= 10, else marlin.
+A dense drafter export (config ffn_type dense_shared, from arc-forge convert_dense.py) has no routed experts or router:
+build_dense_drafter loads it as is, with the linears stored in block FP8 on fp8.Fp8BlockLinear (CUTLASS on sm_120,
+Triton on sm_89). On a group of N > 1 the dense FFN is replicated (no collective) and, with ARC_DFLASH_ATTN_TP=1, the
+attention heads are split as for the MoE drafter (q/k/v rows and o_proj columns sliced at load, 128-aligned so FP8
+blocks stay whole; o_proj all-reduced). ARC_DFLASH_KEEP / CALIB / MOE / ROUTER_STATS must be unset.
 
 Draft state per request is a fixed SWA window (`window` = 1024 tokens x layers, plus the newest conv boundary) in a
 slot pool sized per DP group (max_running_requests / attention DP + 16 slots). The request's state is dropped when it
@@ -182,6 +187,134 @@ def build_drafter(directory: Path, device, target_model, model_dir: Path, keep, 
     return model.eval().requires_grad_(False)
 
 
+def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, group):
+    """A dense-routed drafter export: every tensor loaded as stored, embedding from the target and the target's
+    lm_head. A `<module>.weight` stored as e4m3 must come with `<module>.weight_scale_inv` and becomes an
+    Fp8BlockLinear; the set of FP8 modules must match the config's quantization record."""
+    import fnmatch
+
+    from safetensors import safe_open
+
+    from .fp8 import BLOCK, AllReduced, Fp8BlockLinear
+
+    # the runner's device is "cuda" without an index; safetensors would read "cuda" as cuda:0 on every rank (on L4 the
+    # other three ranks then put their drafter on GPU 0 and the TP group's KV budget fails there): name this rank's GPU
+    device = torch.device(device)
+    if device.type != "cuda":
+        raise ValueError(f"the dense drafter loads onto a CUDA device, got {device}")
+    if device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    raw = json.loads((directory / "config.json").read_text())
+    quant = raw.pop("quantization", None)
+    c = Config(**raw)
+    manifest = json.loads((directory / "initialization_manifest.json").read_text())
+    if not manifest.get("complete"):
+        raise ValueError(f"{directory}: incomplete export")
+    if c.ffn_type != "dense_shared" or c.block_size != 8:
+        raise ValueError(f"{directory}: not a dense B8 drafter (ffn_type {c.ffn_type}, block {c.block_size})")
+    rank, size = group.rank_in_group, group.world_size
+    shard = size > 1 and os.environ.get("ARC_DFLASH_ATTN_TP", "1") == "1"
+    if shard and (c.num_attention_heads % size or c.num_key_value_heads % size):
+        raise ValueError(f"{c.num_attention_heads}/{c.num_key_value_heads} heads do not divide across {size} ranks")
+    heads, kv, dim = c.num_attention_heads // size, c.num_key_value_heads // size, c.head_dim
+
+    def attention_slice(name):
+        """(axis, start, count) of this rank's part of an attention projection, or None (kept whole)."""
+        if not shard or ".self_attn." not in name:
+            return None
+        proj = name.rsplit(".", 1)[-1]
+        if proj == "q_proj":  # [head, 2 * head_dim] rows per head: the value and its gate, contiguous
+            return 0, rank * heads * 2 * dim, heads * 2 * dim
+        if proj in ("k_proj", "v_proj"):
+            return 0, rank * kv * dim, kv * dim
+        if proj == "o_proj":
+            return 1, rank * heads * dim, heads * dim
+        return None
+
+    def narrow(t, cut):
+        axis, start, count = cut
+        return t.narrow(axis, start, count)
+
+    def narrow_fp8(weight, scale, cut):
+        axis, start, count = cut
+        if start % BLOCK or count % BLOCK:
+            raise ValueError(f"attention slice {cut} cuts through a {BLOCK}x{BLOCK} FP8 block")
+        return weight.narrow(axis, start, count), scale.narrow(axis, start // BLOCK, count // BLOCK)
+
+    if quant is not None and quant.get("method") != "block_fp8":
+        raise ValueError(f"{directory}: quantization {quant.get('method')!r}; this loader reads block_fp8 only")
+    with torch.device("meta"):
+        model = MTP3(c)
+    model.embed_tokens = TargetEmbedding(target_model.get_input_embeddings())
+    model.lm_head = nn.Module()  # replaced below
+    model = model.to_empty(device=device).to(torch.bfloat16)
+    loaded, fp8_modules = set(), []
+    for filename in manifest["files"]:
+        with safe_open(str(directory / filename), framework="pt", device=str(device)) as f:
+            keys = set(f.keys())
+            for key in sorted(keys):
+                if key in ("embed_tokens.weight", "lm_head.weight"):
+                    raise ValueError(f"{directory}: a deployment export does not carry {key} (shared with the target)")
+                if key.endswith(".weight_scale_inv"):
+                    if key[: -len("_scale_inv")] not in keys:
+                        raise ValueError(f"{directory}: {key} without its weight")
+                    continue
+                value = f.get_tensor(key)
+                name = key[: -len(".weight")] if key.endswith(".weight") else None
+                cut = attention_slice(name) if name is not None else None
+                if value.dtype == torch.float8_e4m3fn:
+                    if name is None or name + ".weight_scale_inv" not in keys:
+                        raise ValueError(f"{directory}: FP8 tensor {key} without weight_scale_inv")
+                    old = model.get_submodule(name)
+                    if not isinstance(old, nn.Linear) or tuple(old.weight.shape) != tuple(value.shape):
+                        raise ValueError(f"{directory}: {key} {tuple(value.shape)} does not replace {type(old).__name__}")
+                    scale = f.get_tensor(name + ".weight_scale_inv")
+                    if cut is not None:
+                        value, scale = narrow_fp8(value, scale, cut)
+                    parent, _, child = name.rpartition(".")
+                    setattr(model.get_submodule(parent), child, Fp8BlockLinear(value, scale))
+                    fp8_modules.append(name)
+                elif cut is not None:  # a BF16 attention projection: this rank's slice replaces the whole matrix
+                    linear = model.get_submodule(name)
+                    linear.weight = nn.Parameter(narrow(value, cut).contiguous(), requires_grad=False)
+                    linear.in_features, linear.out_features = linear.weight.shape[1], linear.weight.shape[0]
+                else:
+                    with torch.no_grad():
+                        model.get_parameter(key).copy_(value)
+                loaded.add(key)
+    with torch.device("meta"):
+        expected = {n for n, _ in MTP3(c).named_parameters()}
+    missing = expected - loaded - {"embed_tokens.weight", "lm_head.weight"}
+    if missing or loaded - expected:
+        raise RuntimeError(f"dense drafter export misses {sorted(missing)[:8]}, extra {sorted(loaded - expected)[:8]}")
+    patterns = [] if quant is None else quant["modules"]
+    # after the replacement, a declared module still in nn.Linear was stored in BF16
+    declared = [n for n, m in model.named_modules() if isinstance(m, nn.Linear) and any(fnmatch.fnmatch(n, p) for p in patterns)]
+    if declared:
+        raise RuntimeError(f"{directory}: config declares FP8 for {declared[:4]}... but they are stored in BF16")
+    stray = [n for n in fp8_modules if not any(fnmatch.fnmatch(n, p) for p in patterns)]
+    if stray:
+        raise RuntimeError(f"{directory}: FP8 modules {stray[:4]} are not declared in config quantization.modules")
+    model.lm_head = build_head(target_model, model_dir, device, c.vocab_size, c.hidden_size, group)
+    if shard:
+        # the per-rank heads: the attention modules, the window state pool and the blank states all read them
+        AllReduced.forward = torch.compiler.disable(AllReduced.forward)
+        for layer in model.layers:
+            attention = layer.self_attn
+            attention.c = replace(c, num_attention_heads=heads, num_key_value_heads=kv)
+            want = {"q_proj": (heads * 2 * dim, c.hidden_size), "k_proj": (kv * dim, c.hidden_size),
+                    "v_proj": (kv * dim, c.hidden_size), "o_proj": (c.hidden_size, heads * dim)}
+            for proj, shape in want.items():
+                got = tuple(getattr(attention, proj).weight.shape)
+                if got != shape:
+                    raise RuntimeError(f"rank {rank}: {proj} is {got} after the attention split, want {shape}")
+            attention.o_proj = AllReduced(attention.o_proj, group)
+        model.config = replace(c, num_attention_heads=heads, num_key_value_heads=kv)
+    model.fp8_modules = tuple(fp8_modules)
+    fast_drafter.install(model)
+    return model.eval().requires_grad_(False)
+
+
 class SlotStager:
     """Request slot ids to the device without a stream sync. `torch.tensor(list, device="cuda")` copies from
     pageable memory, and CUDA synchronizes the stream before a pageable host-to-device copy: twice per decode cycle
@@ -241,9 +374,17 @@ class DFlashDraftWorker:
         self.use_rejection_sampling = bool(spec.speculative_use_rejection_sampling)
         self.check_agree = os.environ.get("ARC_DFLASH_CHECK_AGREE") == "1"
         directory = Path(drafter_dir())
-        keep = json.loads(Path(os.environ["ARC_DFLASH_KEEP"]).read_text())
-        self.backend = moe_backend(self.device)
-        calib = json.loads(Path(os.environ["ARC_DFLASH_CALIB"]).read_text()) if self.backend == "cutlass" else None
+        raw = json.loads((directory / "config.json").read_text())
+        dense = raw.get("ffn_type", "moe") == "dense_shared"
+        if dense:
+            for name in ("ARC_DFLASH_KEEP", "ARC_DFLASH_CALIB", "ARC_DFLASH_MOE", "ARC_DFLASH_ROUTER_STATS"):
+                if os.environ.get(name):
+                    raise ValueError(f"{name} is for the MoE drafter; {directory} is a dense export")
+            keep, calib, self.backend = None, None, "dense"
+        else:
+            keep = json.loads(Path(os.environ["ARC_DFLASH_KEEP"]).read_text())
+            self.backend = moe_backend(self.device)
+            calib = json.loads(Path(os.environ["ARC_DFLASH_CALIB"]).read_text()) if self.backend == "cutlass" else None
         self.prefill_tail = _env_int("ARC_DFLASH_PREFILL_TAIL", 2048)
         # tokens per drafter forward when a window is rebuilt (default: the whole tail in one forward)
         self.prefill_chunk = _env_int("ARC_DFLASH_PREFILL_CHUNK", self.prefill_tail)
@@ -251,8 +392,12 @@ class DFlashDraftWorker:
         self.use_graphs = os.environ.get("ARC_DFLASH_GRAPH", "1") == "1"
         begin = time.monotonic()
         before = torch.cuda.memory_allocated(self.device)
-        self.model = build_drafter(directory, self.device, target_worker.model_runner.model,
-                                   Path(server_args.model_path), keep, self.group, self.backend, calib)
+        if dense:
+            self.model = build_dense_drafter(directory, self.device, target_worker.model_runner.model,
+                                             Path(server_args.model_path), self.group)
+        else:
+            self.model = build_drafter(directory, self.device, target_worker.model_runner.model,
+                                       Path(server_args.model_path), keep, self.group, self.backend, calib)
         torch.cuda.synchronize(self.device)
         self.weight_bytes = torch.cuda.memory_allocated(self.device) - before
         self._weight_load_time = time.monotonic() - begin
@@ -303,14 +448,19 @@ class DFlashDraftWorker:
         self.draft_extend_attn_backend = None
         self.graph_seconds = 0.0
         self._prof = None
-        experts = [self.model.layers[i].mlp.experts for i in range(self.model.config.num_layers)]
+        if dense:
+            kept = [f"dense {self.model.config.dense_intermediate_size}"] * self.model.config.num_layers
+            local = [f"fp8 {len(self.model.fp8_modules)} linears"]
+        else:
+            experts = [self.model.layers[i].mlp.experts for i in range(self.model.config.num_layers)]
+            kept = [len(keep[str(i)]) for i in range(self.model.config.num_layers)]
+            local = [e.num_local if self.backend == "marlin" else e.num_experts for e in experts]
         logger.info(
             "DFlash drafter %s on attention-TP group %s (rank %d/%d, attention DP %d), %s experts: %d layers, experts "
             "kept %s (%s on this rank), weights %.2f GiB, state pool %d slots %.2f GiB (window %d, %s layout), "
             "lm_head %s, loaded in %.1f s; prefill tail %d, rejection sampling %s, verify width %d, compile %s",
             directory, list(self.group.ranks), self.group.rank_in_group, self.group.world_size, dp, self.backend,
-            self.model.config.num_layers, [len(keep[str(i)]) for i in range(self.model.config.num_layers)],
-            [e.num_local if self.backend == "marlin" else e.num_experts for e in experts],
+            self.model.config.num_layers, kept, local,
             self.weight_bytes / 2**30, self.pool.slots, self.pool.bytes() / 2**30, self.model.config.window, layout,
             type(self.model.lm_head).__name__, self._weight_load_time, self.prefill_tail, self.use_rejection_sampling,
             self.width, self.model.compile_mode,
