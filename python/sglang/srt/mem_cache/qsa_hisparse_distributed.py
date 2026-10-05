@@ -61,18 +61,44 @@ def host_admission_totals(records) -> tuple[int, int, int, int]:
     return kv, gdn, reserve, available
 
 
+def _memory_cgroups() -> list:
+    """[(cgroup v2 directory, its memory.max text)] that bound this process's memory.
+
+    In a pod with its own cgroup namespace (Kaggle, Runpod, Vast: where h25 was built) /sys/fs/cgroup is the pod's
+    cgroup and has memory.max: that one directory, as before. On a bare host (B200) /sys/fs/cgroup is the cgroup v2
+    root, which has no memory.max: this process's own cgroup from /proc/self/cgroup and every ancestor below the root,
+    any of which may hold the binding limit (none, for a process in the root cgroup)."""
+    root = Path("/sys/fs/cgroup")
+    try:
+        return [(root, (root / "memory.max").read_text().strip())]
+    except FileNotFoundError:
+        pass
+    entries = [line for line in Path("/proc/self/cgroup").read_text().splitlines() if line.startswith("0::")]
+    if len(entries) != 1:
+        raise RuntimeError(f"{root} has no memory.max and /proc/self/cgroup has no single cgroup v2 entry: {entries}")
+    relative = entries[0][len("0::"):].strip("/")
+    cgroups = []
+    cgroup = root / relative if relative else root
+    while cgroup != root:
+        cgroups.append((cgroup, (cgroup / "memory.max").read_text().strip()))
+        cgroup = cgroup.parent
+    return cgroups
+
+
 def host_memory_state() -> dict:
     """Respect the Pod's cgroup v2 limit when /proc describes a larger host."""
     import psutil
 
     proc_available = psutil.virtual_memory().available
     available = proc_available
-    cgroup = Path("/sys/fs/cgroup")
-    limit = (cgroup / "memory.max").read_text().strip()
-    used = int((cgroup / "memory.current").read_text())
-    cap = None if limit == "max" else int(limit)
-    if cap is not None:
-        headroom = cap - used
+    cap = used = tightest = None
+    for cgroup, limit in _memory_cgroups():
+        current = int((cgroup / "memory.current").read_text())
+        if used is None:
+            used = current  # the innermost cgroup's usage, reported when no cgroup has a limit
+        if limit == "max":
+            continue
+        headroom = int(limit) - current
         if os.environ.get("ARC_ADMISSION_RECLAIMABLE_FILE") == "1":
             # arc-forge (Vast only, opt-in): memory.current counts page cache. Inactive file pages are reclaimable
             # (here: the checkpoint read at load time), so count them back; a container cannot drop_caches.
@@ -80,7 +106,10 @@ def host_memory_state() -> dict:
                 key, value = line.split()
                 if key == "inactive_file":
                     headroom += int(value)
-        available = min(available, max(0, headroom))
+        if tightest is None or headroom < tightest:
+            tightest, cap, used = headroom, int(limit), current
+    if tightest is not None:
+        available = min(available, max(0, tightest))
     return dict(available_bytes=available, proc_available_bytes=proc_available,
                 cgroup_limit_bytes=cap, cgroup_current_bytes=used)
 
