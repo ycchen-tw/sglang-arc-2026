@@ -729,6 +729,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
                     self.cuda_graph_runner.execute(forward_batch)
                 )
+                # draft_probs is a view into the shared graph pool; the target verify replay
+                # reuses that memory before rejection sampling reads q, so take a copy here.
+                if draft_probs is not None:
+                    draft_probs = draft_probs.clone()
             else:
                 if (
                     not forward_batch.forward_mode.is_idle()
