@@ -103,7 +103,7 @@ class StatePool:
     def release(self, rid):
         slot = self.slot_of.pop(rid, None)
         if slot is not None:
-            self.pending_length[slot] = 0
+            self.pending_length[slot].fill_(0)  # fill_: `t[i] = 0` copies a CPU scalar, a stream sync
             self.free.append(slot)
 
     def live(self):
@@ -124,9 +124,9 @@ class StatePool:
         self.positions[s] = cache.positions[0]
         self.last_gr[s] = request.last_gr[0]
         self.last_position[s] = request.last_position[0]
-        self.pending_length[s] = 0
+        self.pending_length[s].fill_(0)
         self.pending_gr[s] = request.last_gr[0]
-        self.pending_tokens[s] = 0
+        self.pending_tokens[s].fill_(0)
 
     def read_request(self, rid) -> serving.DraftRequest:
         """The slot as a DraftRequest (for continuing a chunked prefill); refuses a pending commit."""
@@ -300,9 +300,9 @@ class RingStatePool(StatePool):
         pos = cache.positions[0]
         valid = pos >= 0
         col = torch.where(valid, pos % w, torch.full_like(pos, w))
-        self.positions[s] = -1
+        self.positions[s].fill_(-1)
         self.positions[s, col] = torch.where(valid, pos, torch.full_like(pos, -1))
-        self.positions[s, w] = -1
+        self.positions[s, w].fill_(-1)
         for i, layer in enumerate(cache.layers):
             self.key[i, s][:, col] = layer.key[0]
             self.value[i, s][:, col] = layer.value[0]
@@ -310,9 +310,9 @@ class RingStatePool(StatePool):
                 self.boundary[i, j, s] = layer.boundaries[j][0, -1:]
         self.last_gr[s] = request.last_gr[0]
         self.last_position[s] = request.last_position[0]
-        self.pending_length[s] = 0
+        self.pending_length[s].fill_(0)
         self.pending_gr[s] = request.last_gr[0]
-        self.pending_tokens[s] = 0
+        self.pending_tokens[s].fill_(0)
 
     def read_request(self, rid):
         s = self.slot_of[rid]

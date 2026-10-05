@@ -256,6 +256,11 @@ def _set_kv_buffer_prefix_valid_impl(
     )
 
 
+
+def _pinned_index(rows, device) -> torch.Tensor:
+    """arc: a host list of row ids as a device int64 index without a stream sync (pinned, non-blocking copy)."""
+    return torch.tensor(rows, dtype=torch.int64, pin_memory=True).to(device, non_blocking=True)
+
 class ReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
 
@@ -1571,9 +1576,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 idx for idx, fresh in zip(select_index, fresh_req_rows) if fresh
             ]
             if fresh_indices:
-                spec_write_pos[fresh_indices] = 0
-                self.mamba_pool.replayssm_cache_base[fresh_indices] = 0
-                self.mamba_pool.replayssm_is_flush[fresh_indices] = 0
+                # arc: a list index (and a scalar value) is a pageable H2D copy, i.e. a stream sync per admission
+                idx = _pinned_index(fresh_indices, spec_write_pos.device)
+                spec_write_pos.index_fill_(0, idx, 0)
+                self.mamba_pool.replayssm_cache_base.index_fill_(0, idx, 0)
+                self.mamba_pool.replayssm_is_flush.index_fill_(0, idx, 0)
 
         mamba_indices: list[torch.Tensor] = []
         mamba_ping_pong_track_buffers: list[torch.Tensor] = []
@@ -1592,7 +1599,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 # ignores ring contents and reads only the checkpoint state
                 # (the post-prefill state that prefill wrote into this slot).
                 if self.mamba_pool.replayssm_write_pos is not None:
-                    self.mamba_pool.replayssm_write_pos[req.kv.mamba_pool_idx] = 0
+                    self.mamba_pool.replayssm_write_pos.index_fill_(
+                        0, req.kv.mamba_pool_idx.reshape(1).to(torch.int64), 0
+                    )
             mamba_indices.append(req.kv.mamba_pool_idx)
             if self.enable_mamba_extra_buffer:
                 if req.kv.mamba_ping_pong_track_buffer is None:
@@ -1608,10 +1617,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
             )
         mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
-        self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
+        rows = _pinned_index(select_index, self.req_index_to_mamba_index_mapping.device)
+        self.req_index_to_mamba_index_mapping[rows] = mamba_index_tensor
         if self.enable_mamba_extra_buffer:
             ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers)
-            self.req_index_to_mamba_ping_pong_track_buffer_mapping[select_index] = (
+            self.req_index_to_mamba_ping_pong_track_buffer_mapping[rows] = (
                 ping_pong_tensor
             )
         return select_index

@@ -470,7 +470,7 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
             plan.full_blocks - h,
         )
         # h17: every complete prompt block is on host once this staging's D2H runs
-        self.host_done[r] = plan.full_blocks
+        self.host_done[r].fill_(plan.full_blocks)
         slab = self.req_to_device_buffer[r]
         src, dst = [], []
         from_prefill = plan.slab_from_prefill
@@ -519,7 +519,7 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         self.req_device_buffer_tokens[:, r, hot:] = -1
         self.lru_slots[:, r, :].copy_(self._lru_init)
         self.token_to_kv_pool_allocator.free_prefill_blocks(prefill_blocks)
-        self.mem_pool_device.mapping[logical_blocks] = 0
+        self.mem_pool_device.mapping.index_fill_(0, logical_blocks, 0)  # no CPU scalar copy (stream sync)
 
     def abort_staging_request(self, req: Req) -> None:
         self.consensus.agree("staging-abort", [req.rid, req.kv.req_pool_idx])
@@ -531,11 +531,11 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         r = req.kv.req_pool_idx
         prefill_blocks, logical_blocks = self._staging.pop(r)
         self.token_to_kv_pool_allocator.free_prefill_blocks(prefill_blocks)
-        self.mem_pool_device.mapping[logical_blocks] = 0
+        self.mem_pool_device.mapping.index_fill_(0, logical_blocks, 0)  # no CPU scalar copy (stream sync)
         if not self.session_resume:
             self.release_host_row(r, 0)
         self._skip_first_backup[r] = False
-        self.host_done[r] = 0
+        self.host_done[r].fill_(0)
         req.hisparse_staging = False
 
     # ------------------------------------------------------------ decode (scheduler side)
@@ -1099,13 +1099,13 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         prefill_held = held[in_prefill]
         if prefill_held.numel() > 0:
             self.token_to_kv_pool_allocator.free_prefill_blocks(prefill_held)
-        mapping[logical_blocks] = 0
+        mapping.index_fill_(0, logical_blocks, 0)
         if not self.session_resume:
             self.release_host_row(r, 0)
         self.req_device_buffer_tokens[:, r, :] = -1
         self.lru_slots[:, r, :].copy_(self._lru_init)
         self._skip_first_backup[r] = False
-        self.host_done[r] = 0
+        self.host_done[r].fill_(0)
 
     # ------------------------------------------------------------ session resume (M1b h07)
 
