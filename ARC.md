@@ -10,7 +10,7 @@
 
 | ref | 內容 |
 |---|---|
-| `main`（分支） | 所有平台共用的主線：上游 `v0.5.20` 加 0001–0032、HiSparse h01–h39（不含 h37）、h40–h43、DFlash（`speculative/arc_dflash/`）。新的修改都 commit 在這裡 |
+| `main`（分支） | 所有平台共用的主線：上游 `v0.5.20` 加 0001–0032、HiSparse h01–h39（不含 h37）、h40–h43、DFlash（`speculative/arc_dflash/`），以及 2026-10-05 的 B200 修正（`c70c0178`–`616f4b07`）。新的修改都 commit 在這裡 |
 | `v0.5.20`（tag） | 上游基底 `94602c9c`；升級上游就是把 `main` rebase 到新的上游 tag |
 | `deploy/g4-hs55-v8`（tag） | AGI-3 Kaggle hs55 v8（RTX PRO 6000）：v6 加上 h40–h43，tree `3dcbde80` |
 | `deploy/g4-hs55-v6`（tag） | 0001–0032 加上 h01–h09、h12–h22，tree `e93d999a` |
@@ -44,3 +44,8 @@
   - 只有一個 worker：drafter 跑在這張卡的 attention-TP 群組上。
   - routed experts 預設依 compute capability 選後端：sm_100／sm_120 用 CUTLASS W4A4；sm_89 用 Marlin W4A16，並在群組內做 EP。
   - lm_head：單卡用 `TargetHead`，群組大小大於 1 時用 `PairHead`。
+- **B200（sm_100）**（arc-forge `docs/research/sglang_fork_b200_20261005.md`）：
+  - DFlash 群組大於 1 時預設 `ARC_DFLASH_COMPILE=det`：各 rank 的 torch.compile 各自 autotune 會選到不同 kernel，提案就會分歧。
+  - NVFP4 KV 加 HiSparse 走 sm_100 的 trtllm-gen gather；上游對 hybrid GDN 只准 triton／trtllm_mha／fa4 這幾種 attention backend。
+  - 0004 的 distributed MTP top-1 不支援 attention DP，起服就 raise（`SGLANG_QWEN4_MTP_DISTRIBUTED_TOPK1=0`）。
+- **rejection sampling**：draft decode graph 的 `draft_probs` 在 verify 前 clone（`c70c0178`），所有平台都適用。
