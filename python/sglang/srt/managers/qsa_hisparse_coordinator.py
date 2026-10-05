@@ -522,7 +522,7 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         self.req_device_buffer_tokens[:, r, hot:] = -1
         self.lru_slots[:, r, :].copy_(self._lru_init)
         self.token_to_kv_pool_allocator.free_prefill_blocks(prefill_blocks)
-        self.mem_pool_device.mapping.index_fill_(0, logical_blocks, 0)  # no CPU scalar copy (stream sync)
+        self.mem_pool_device.mapping.index_fill_(0, logical_blocks.long(), 0)  # no CPU scalar copy (stream sync)
 
     def abort_staging_request(self, req: Req) -> None:
         self.consensus.agree("staging-abort", [req.rid, req.kv.req_pool_idx])
@@ -534,7 +534,7 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         r = req.kv.req_pool_idx
         prefill_blocks, logical_blocks = self._staging.pop(r)
         self.token_to_kv_pool_allocator.free_prefill_blocks(prefill_blocks)
-        self.mem_pool_device.mapping.index_fill_(0, logical_blocks, 0)  # no CPU scalar copy (stream sync)
+        self.mem_pool_device.mapping.index_fill_(0, logical_blocks.long(), 0)  # no CPU scalar copy (stream sync)
         if not self.session_resume:
             self.release_host_row(r, 0)
         self._skip_first_backup[r] = False
@@ -1102,7 +1102,7 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         prefill_held = held[in_prefill]
         if prefill_held.numel() > 0:
             self.token_to_kv_pool_allocator.free_prefill_blocks(prefill_held)
-        mapping.index_fill_(0, logical_blocks, 0)
+        mapping.index_fill_(0, logical_blocks.long(), 0)
         if not self.session_resume:
             self.release_host_row(r, 0)
         self.req_device_buffer_tokens[:, r, :] = -1
