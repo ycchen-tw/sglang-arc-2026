@@ -1076,10 +1076,12 @@ class QwenSparseAttnBackend(AttentionBackend):
             prefill_compressed_locs = self._prefill_compressed_locs(
                 token_slot_table, host_lengths
             )
-            mm_inputs = forward_batch.mm_inputs
-            if mm_inputs is None or all(m is None for m in mm_inputs):
-                # text only: extend positions are [prefix, seq) per request
-                max_position_cpu = max(host_lengths) - 1
+            # An upper bound is all the indexer needs (it only sizes the RoPE cos/sin cache): text extend positions
+            # are [prefix, seq) per request, and a Qwen-VL M-RoPE position never exceeds its token index (an image's
+            # (t, h, w) ids stay below base + h*w, and the text after it resumes at their max + 1), so seq - 1 bounds
+            # multimodal batches too. Without it the indexer reads positions.max() back per layer: a stream sync
+            # on every image extend (12 per prefill at c110, each draining the in-flight verify).
+            max_position_cpu = max(host_lengths) - 1
         hisparse = None
         if self.hisparse_coordinator is not None and decode_like:
             k = self._hisparse_rows_per_req(
