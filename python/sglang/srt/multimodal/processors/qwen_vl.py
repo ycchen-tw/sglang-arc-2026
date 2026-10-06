@@ -362,6 +362,14 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         self.model_type = hf_config.model_type
+        # ARC: these expand a video into timestamped frame groups (base_processor.splice_timestamped_media_blocks).
+        self.splices_timestamped_video_blocks = self.model_type in (
+            "qwen3_vl",
+            "qwen3_vl_moe",
+            "qwen3_5",
+            "qwen3_5_moe",
+            "qwen4_exp",
+        )
         self.uses_media_artifacts_without_cache = self.model_type in (
             "qwen3_vl",
             "qwen3_vl_moe",

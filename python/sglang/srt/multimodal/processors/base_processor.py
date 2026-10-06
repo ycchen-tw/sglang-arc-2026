@@ -209,6 +209,93 @@ def _tokenizer_of(processor):
     return processor.tokenizer if hasattr(processor, "tokenizer") else processor
 
 
+# ARC: a frame group's timestamp text ("<12.5 seconds>") sits between a video's outer and its group's own
+# <|vision_start|>, or between one group's <|vision_end|> and the next group's <|vision_start|>.
+_MAX_VIDEO_TIMESTAMP_TOKENS = 32
+
+
+def timestamped_media_blocks(ids, image_token_id, video_token_id, vision_start_id, vision_end_id):
+    """ARC: ``[(modality, start, end)]`` (inclusive, in order) of the media in an expanded Qwen3-VL-style prompt.
+
+    An image is its pad run. A video is ``<vs>``, then per frame group timestamp text, ``<vs>`` pads ``<ve>``,
+    then ``<ve>``; its block runs from the outer ``<vs>`` to the outer ``<ve>``. Anything else raises."""
+    n = len(ids)
+    blocks, video, i = [], None, 0
+    while i < n:
+        token = ids[i]
+        if token != image_token_id and token != video_token_id:
+            i += 1
+            continue
+        j = i
+        while j + 1 < n and ids[j + 1] == token:
+            j += 1
+        if token == image_token_id:
+            if video is not None:
+                raise ValueError(f"image pads at {i} inside the video that starts at {video}")
+            blocks.append(("image", i, j))
+        else:
+            if i < 1 or j + 1 >= n or ids[i - 1] != vision_start_id or ids[j + 1] != vision_end_id:
+                raise ValueError(f"video pads [{i}, {j}] are not wrapped in <|vision_start|> ... <|vision_end|>")
+            left = None
+            for k in range(i - 2, max(i - 2 - _MAX_VIDEO_TIMESTAMP_TOKENS, -1), -1):
+                if ids[k] in (vision_start_id, vision_end_id):
+                    left = k
+                    break
+            if left is None:
+                raise ValueError(f"no timestamp-delimited <|vision_start|>/<|vision_end|> before video pads at {i}")
+            if ids[left] == vision_start_id:  # the outer <vs>: a new video
+                if video is not None:
+                    raise ValueError(f"video at {left} starts before the one at {video} closed")
+                video = left
+            elif video is None:
+                raise ValueError(f"video frame group at {i} follows a <|vision_end|> outside any video")
+            if j + 2 < n and ids[j + 2] == vision_end_id:  # the outer <ve>: the video closes
+                blocks.append(("video", video, j + 2))
+                video = None
+        i = j + 1
+    if video is not None:
+        raise ValueError(f"the video at {video} never closes")
+    return blocks
+
+
+def splice_timestamped_media_blocks(client_ids, processor_ids, image_token_id, video_token_id, vision_start_id,
+                                    vision_end_id):
+    """ARC: the client's ids with each media placeholder replaced by the processor's expansion of it.
+
+    The client sends one ``<|image_pad|>`` per image and ``<|vision_start|><|video_pad|><|vision_end|>`` per video
+    (what the chat template renders); everything else is kept verbatim, so a non-canonical tokenization survives.
+    Expanded blocks are taken from ``processor_ids`` in order, per modality."""
+    blocks = timestamped_media_blocks(processor_ids, image_token_id, video_token_id, vision_start_id, vision_end_id)
+    images = [(a, b) for m, a, b in blocks if m == "image"]
+    videos = [(a, b) for m, a, b in blocks if m == "video"]
+    out, n_image, n_video, i = [], 0, 0, 0
+    while i < len(client_ids):
+        token = client_ids[i]
+        if token == image_token_id:
+            if n_image == len(images):
+                raise ValueError(f"the prompt has more image placeholders than the {len(images)} expanded images")
+            a, b = images[n_image]
+            out.extend(processor_ids[a:b + 1])
+            n_image += 1
+        elif token == video_token_id:
+            if not out or out[-1] != vision_start_id or i + 1 >= len(client_ids) or client_ids[i + 1] != vision_end_id:
+                raise ValueError(f"video placeholder at {i} is not <|vision_start|><|video_pad|><|vision_end|>")
+            if n_video == len(videos):
+                raise ValueError(f"the prompt has more video placeholders than the {len(videos)} expanded videos")
+            a, b = videos[n_video]
+            out.pop()
+            out.extend(processor_ids[a:b + 1])
+            n_video += 1
+            i += 1
+        else:
+            out.append(token)
+        i += 1
+    if (n_image, n_video) != (len(images), len(videos)):
+        raise ValueError(f"the prompt has {n_image} image / {n_video} video placeholders, the processor expanded "
+                         f"{len(images)} / {len(videos)}")
+    return out
+
+
 class BaseMultimodalProcessor(ABC):
     models = []
     gpu_image_decode = True  # Enable GPU decoding by default
@@ -219,6 +306,9 @@ class BaseMultimodalProcessor(ABC):
     # Set by processors that already build input_ids from the request's own
     # tokens, so the retokenize-avoidance rebuild below has nothing to add.
     preserve_processor_input_ids = False
+    # ARC: processors whose videos expand into timestamped frame groups (the Qwen3-VL format) also keep a
+    # pre-tokenized prompt's ids when it carries a video; see splice_timestamped_media_blocks.
+    splices_timestamped_video_blocks = False
     # None lets the worker count follow where preprocessing actually runs; a
     # model that measured its own optimum assigns a number instead. See
     # `_resolve_auto_mm_processor_worker_num`.
@@ -1884,6 +1974,31 @@ class BaseMultimodalProcessor(ABC):
                     logger.warning(
                         f"Due to {e}, falling back to decode+retokenize, which may change prompt length (token drift)."
                     )
+            # ARC: the same for a prompt with a video, where upstream keeps the processor's re-tokenized ids and a
+            # non-canonical prompt drifts silently. No fallback: a prompt the splice cannot map is an error.
+            elif (
+                envs.SGLANG_MM_AVOID_RETOKENIZE.get()
+                and not self.preserve_processor_input_ids
+                and self.splices_timestamped_video_blocks
+                and base_output.input_ids is not None
+                and input_ids is not None
+                and raw_videos
+                and not raw_audios
+            ):
+                assert isinstance(base_output.input_ids, list), (
+                    f"expected list[int] input_ids, got {type(base_output.input_ids)}"
+                )
+                input_ids = torch.tensor(
+                    splice_timestamped_media_blocks(
+                        base_output.input_ids,
+                        input_ids.flatten().tolist(),
+                        mm_tokens.image_token_id,
+                        mm_tokens.video_token_id,
+                        self.vision_start_token_id,
+                        self.vision_end_token_id,
+                    ),
+                    dtype=input_ids.dtype,
+                )
         else:
             ret = None
 
