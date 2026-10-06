@@ -71,6 +71,7 @@ from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
+    ArcMmRematerializeReq,
     BaseBatchReq,
     BaseReq,
     BatchEmbeddingOutput,
@@ -120,6 +121,7 @@ from sglang.srt.managers.utils import (
 from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
 )
+from sglang.srt.multimodal import arc_lazy_media
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import (
@@ -823,9 +825,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.metrics_collector.emit_startup_time(startup_time)
 
     def init_request_dispatcher(self):
+        self._arc_mm_resend_tasks = set()
         self._result_dispatcher = TypeBasedDispatcher(
             [
                 (AbortReq, self._handle_abort_req),
+                (ArcMmRematerializeReq, self._handle_arc_mm_rematerialize),
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
                 (
                     UpdateWeightFromDiskReqOutput,
@@ -3346,6 +3350,52 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def force_exit_handler(self):
         """Put some custom force exit logic here."""
         pass
+
+    def _handle_arc_mm_rematerialize(self, recv_obj: ArcMmRematerializeReq):
+        """arc lazy media: the scheduler handed the request back; resend it with those items materialized."""
+        state = self.rid_to_state.get(recv_obj.rid)
+        if state is None:
+            # finished or aborted by the client while the scheduler sent it back
+            logger.info(
+                "%s: rid=%s sent back but no longer tracked; dropped",
+                arc_lazy_media.ENV,
+                recv_obj.rid,
+            )
+            return
+        obj = state.obj
+        done = getattr(obj, arc_lazy_media.MATERIALIZE_ATTR, None) or frozenset()
+        if set(recv_obj.hashes) <= done:
+            # the frontend already sent these with their pixels: a bug, not a cache event; fail this request
+            self._arc_mm_fail(
+                obj.rid,
+                f"the scheduler asked again for {len(recv_obj.hashes)} media items already materialized",
+            )
+            return
+        setattr(obj, arc_lazy_media.MATERIALIZE_ATTR, done | frozenset(recv_obj.hashes))
+        task = asyncio.create_task(self._arc_mm_resend(obj))
+        self._arc_mm_resend_tasks.add(task)
+        task.add_done_callback(self._arc_mm_resend_tasks.discard)
+
+    async def _arc_mm_resend(self, obj):
+        try:
+            tokenized_obj = await self._tokenize_one_request(obj)
+            await self._send_one_request(tokenized_obj)
+        except Exception as e:
+            logger.exception("%s: resending rid=%s failed", arc_lazy_media.ENV, obj.rid)
+            self._arc_mm_fail(obj.rid, f"resending failed: {e!r}")
+
+    def _arc_mm_fail(self, rid: str, message: str):
+        logger.error("%s: rid=%s: %s", arc_lazy_media.ENV, rid, message)
+        self._handle_abort_req(
+            AbortReq(
+                rid=rid,
+                finished_reason={
+                    "type": "abort",
+                    "status_code": HTTPStatus.INTERNAL_SERVER_ERROR,
+                    "message": f"{arc_lazy_media.ENV}: {message}",
+                },
+            )
+        )
 
     def _handle_abort_req(self, recv_obj: AbortReq):
         if is_health_check_generate_req(recv_obj):

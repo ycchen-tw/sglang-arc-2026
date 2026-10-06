@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
+from sglang.srt.multimodal import arc_lazy_media
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.multimodal.transport.cuda_ipc import BORROW_CUDA_IPC_FEATURE_KEY
 from sglang.srt.runtime_context import get_parallel, get_schedule
@@ -332,7 +333,8 @@ class PerImageRequestInfo:
     items_offset: List[Tuple[int, int]]
     extend_prefix_len: int
     extend_seq_len: int
-    overlapping: List[Tuple[int, MultimodalDataItem, int, int]] = field(
+    # (index, item, the item's placeholder spans); one span per image, one per frame group for a video
+    overlapping: List[Tuple[int, MultimodalDataItem, List[Tuple[int, int]]]] = field(
         default_factory=list
     )
 
@@ -361,15 +363,15 @@ def _batch_encode_per_image_misses(
         chunk_end = chunk_start + req_info.extend_seq_len  # exclusive
         overlapping = []
         if req_info.extend_seq_len > 0:
-            for idx, (item, (start, end)) in enumerate(
-                zip(req_info.items, req_info.items_offset)
-            ):
-                if end >= chunk_start and start < chunk_end:
-                    overlapping.append((idx, item, start, end))
+            for idx, item in enumerate(req_info.items):
+                spans = [(int(a), int(b)) for a, b in item.offsets]
+                if any(end >= chunk_start and start < chunk_end for start, end in spans):
+                    overlapping.append((idx, item, spans))
         req_info.overlapping = overlapping
 
-        for _idx, item, start, end in overlapping:
-            expected_token_count = end - start + 1
+        for _idx, item, spans in overlapping:
+            start, end = spans[0][0], spans[-1][1]
+            expected_token_count = sum(b - a + 1 for a, b in spans)
             cache_key = (item.hash, expected_token_count)
             if cache_key in hash_to_embedding:
                 continue
@@ -398,6 +400,12 @@ def _batch_encode_per_image_misses(
         ordered_cache_keys = list(unique_misses.keys())
         miss_items = [unique_misses[key][0] for key in ordered_cache_keys]
         token_counts = [unique_misses[key][1] for key in ordered_cache_keys]
+        for item in miss_items:
+            if item.model_specific_data.get(arc_lazy_media.LAZY_KEY, False):
+                # the scheduler sends a request whose lazy items overlap its extend back to the frontend
+                raise RuntimeError(
+                    f"{arc_lazy_media.ENV}: lazy item {item.hash} (offsets {item.offsets[0]}..) reached the encoder"
+                )
 
         if not _can_skip_pre_embed_feature_move(data_embedding_func):
             _move_items_to_device(miss_items, device)
@@ -517,7 +525,7 @@ def _get_chunked_embedding_by_item(
 
 
 def _assemble_per_image_chunk(
-    overlapping: List[Tuple[int, MultimodalDataItem, int, int]],
+    overlapping: List[Tuple[int, MultimodalDataItem, List[Tuple[int, int]]]],
     hash_to_embedding: Dict[Tuple[Optional[int], int], torch.Tensor],
     extend_prefix_len: int,
     extend_seq_len: int,
@@ -533,14 +541,18 @@ def _assemble_per_image_chunk(
     chunk_end = extend_prefix_len + extend_seq_len  # exclusive
 
     chunk_slices = []
-    for _idx, item, start, end in overlapping:
-        cache_key = (item.hash, end - start + 1)
-        emb = hash_to_embedding[cache_key]  # shape: (end - start + 1, hidden)
-        overlap_start = max(start, chunk_start)
-        overlap_end = min(end, chunk_end - 1)  # inclusive
-        local_start = overlap_start - start
-        local_end = overlap_end - start + 1  # exclusive for slicing
-        chunk_slices.append(emb[local_start:local_end])
+    for _idx, item, spans in overlapping:
+        cache_key = (item.hash, sum(b - a + 1 for a, b in spans))
+        emb = hash_to_embedding[cache_key]  # one row per placeholder token of the item, spans in order
+        base = 0
+        for start, end in spans:
+            overlap_start = max(start, chunk_start)
+            overlap_end = min(end, chunk_end - 1)  # inclusive
+            if overlap_start <= overlap_end:
+                chunk_slices.append(
+                    emb[base + overlap_start - start : base + overlap_end - start + 1]
+                )
+            base += end - start + 1
 
     return torch.cat(chunk_slices, dim=0)
 
@@ -592,7 +604,12 @@ def _get_chunked_prefill_embedding(
             extend_seq_len=extend_seq_len,
         )
 
-        is_per_image = all(len(item.offsets) == 1 for item in embedding_items_per_req)
+        # arc lazy media: videos (one span per frame group) also go per item -- the multi-offset path below encodes
+        # all of a request's videos under one combined key, which misses whenever a video is added, and needs the
+        # pixels of every one of them
+        is_per_image = arc_lazy_media.enabled() or all(
+            len(item.offsets) == 1 for item in embedding_items_per_req
+        )
         if is_per_image:
             if _is_hip or _is_npu or _is_xpu:
                 # ROCm CI regressed with one large cross-request ViT batch; keep

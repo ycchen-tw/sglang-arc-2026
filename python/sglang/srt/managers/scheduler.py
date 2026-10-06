@@ -118,6 +118,7 @@ from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    ArcMmRematerializeReq,
     ActiveRanksOutput,
     AddExternalCorpusReqInput,
     AddExternalCorpusReqOutput,
@@ -284,6 +285,7 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
+from sglang.srt.multimodal import arc_lazy_media
 from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
@@ -463,6 +465,8 @@ class Scheduler(
         # Prefill tokens processed so far; used as the aging axis for the HRRN scheduling policy. Reqs snapshot this at waiting_queue entry.
         self.processed_tokens_counter: int = 0
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
+        # arc lazy media: requests handed back to the tokenizer to materialize lazy items
+        self.arc_lazy_sent_back_total: int = 0
         self.init_soft_watchdog()
 
         # Parse args
@@ -3310,6 +3314,36 @@ class Scheduler(
             return False
         return True
 
+    def _arc_lazy_send_back(self, sent_back) -> None:
+        """arc lazy media: hand waiting requests whose lazy items overlap their extend back to the tokenizer.
+
+        Nothing has been allocated for them past init_next_round_input (undone by the caller); they leave the queue
+        like a request aborted while waiting, and the tokenizer resends them with those items materialized."""
+        dropped = {id(req) for req, _ in sent_back}
+        self.waiting_queue = [x for x in self.waiting_queue if id(x) not in dropped]
+        for req, needed in sent_back:
+            self._release_aborted_request(req)
+            self.beam_coordinator.retire_group(req)
+            if req.kv.holds_mamba:
+                # the caller freed a slot init_next_round_input took; a session-held one has its own lifecycle
+                raise RuntimeError(
+                    f"{arc_lazy_media.ENV}: rid={req.rid} still holds a mamba slot; cannot send it back"
+                )
+            self.ipc_channels.send_to_tokenizer.send_output(
+                ArcMmRematerializeReq(rid=req.rid, hashes=needed), req
+            )
+            self.arc_lazy_sent_back_total += 1
+            logger.info(
+                "%s: sent rid=%s back to materialize %d of %d media items (prefix %d of %d tokens); %d sent back so far",
+                arc_lazy_media.ENV,
+                req.rid,
+                len(needed),
+                len(req.multimodal_inputs.mm_items),
+                len(req.prefix_indices),
+                len(req.origin_input_ids),
+                self.arc_lazy_sent_back_total,
+            )
+
     def _release_aborted_request(self, req: Req) -> None:
         """Drop the cache-side state an aborted request left behind."""
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
@@ -3955,6 +3989,7 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
+        arc_lazy_sent_back = []
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
@@ -4002,6 +4037,28 @@ class Scheduler(
                     req.host_hit_is_storage = False
 
             req.init_next_round_input(self.tree_cache)
+            if arc_lazy_media.enabled() and req.multimodal_inputs is not None:
+                needed = arc_lazy_media.items_to_materialize(
+                    req.multimodal_inputs, len(req.prefix_indices)
+                )
+                if needed:
+                    if req.output_ids or req.is_retracted:
+                        # its output has been streamed; resending it from the tokenizer would start it over
+                        raise RuntimeError(
+                            f"{arc_lazy_media.ENV}: retracted request {req.rid} needs lazy media items re-embedded "
+                            f"({len(needed)} items in its extend) (prefix {len(req.prefix_indices)}); run with {arc_lazy_media.ENV}=0 "
+                            "if retraction is expected"
+                        )
+                    # as for a request add_one_req rejects: init_next_round_input may have staged mamba state
+                    req.kv.mamba_cow_src_index = None
+                    req.kv.mamba_needs_clear = False
+                    if req.kv.holds_mamba and not getattr(req, "session", None):
+                        self.tree_cache.req_to_token_pool.mamba_allocator.free(
+                            req.kv.mamba_pool_idx.unsqueeze(-1)
+                        )
+                        req.kv.mamba_pool_idx = None
+                    arc_lazy_sent_back.append((req, needed))
+                    continue
             if self.enable_hicache_storage and (
                 self._prefetch_after_device_hit_loss(req)
             ):
@@ -4052,6 +4109,8 @@ class Scheduler(
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
+        if arc_lazy_sent_back:
+            self._arc_lazy_send_back(arc_lazy_sent_back)
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list

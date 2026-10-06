@@ -1,8 +1,11 @@
+import asyncio
+import copy
 import math
 import os
 import re
 import time
 from copy import deepcopy
+from array import array
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import Any, List, Optional, Union
@@ -37,7 +40,9 @@ from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeForConditionalGeneratio
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
 from sglang.srt.models.qwen4_exp import Qwen4ExpForConditionalGeneration
+from sglang.srt.multimodal import arc_lazy_media
 from sglang.srt.multimodal.cache import resolve_multimodal_item_hash
+from sglang.srt.multimodal.cache.identity import snapshot_media
 from sglang.srt.multimodal.media_artifacts.base import (
     MediaArtifactCacheMixin,
     MediaArtifactInput,
@@ -47,11 +52,13 @@ from sglang.srt.multimodal.processors.base_processor import (
 )
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
+    _tokenizer_of,
+    timestamped_media_blocks,
 )
 from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
-from sglang.srt.runtime_context import get_mm, get_parallel
+from sglang.srt.runtime_context import get_mm, get_parallel, get_serving
 from sglang.srt.utils import cpu_has_amx_support, is_cpu
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 from sglang.utils import logger
@@ -328,6 +335,9 @@ async def preprocess_video(
     return video, video_metadata
 
 
+_VIDEO_DATA_FROM_REQUEST = object()
+
+
 # Compatible with Qwen-VL & Qwen-Omni Series
 class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
     supports_transformers_backend = True
@@ -377,6 +387,29 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             hf_config = hf_config.thinker_config
 
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
+
+        self._arc_lazy_cache = None
+        if arc_lazy_media.enabled():
+            if not self.splices_timestamped_video_blocks:
+                raise ValueError(
+                    f"{arc_lazy_media.ENV}=1 supports the Qwen3-VL family only, got {self.model_type}"
+                )
+            if self.processor_fingerprint is None:
+                raise RuntimeError(f"{arc_lazy_media.ENV}=1 needs the processor fingerprint (h41)")
+            if int(get_serving().tokenizer_worker_num) > 1:
+                # each tokenizer worker would keep its own cache; correct (the scheduler sends back what it
+                # needs) but the bookkeeping assumes one
+                raise ValueError(f"{arc_lazy_media.ENV}=1 supports one tokenizer worker")
+            self._arc_lazy_cache = arc_lazy_media.MediaMetaCache(
+                arc_lazy_media.cache_entries(), arc_lazy_media.min_seen()
+            )
+            self._arc_lazy_stats = dict(requests=0, items=0, materialized=0, forced=0)
+            logger.info(
+                "%s: media carried by %d earlier request(s) are sent without pixels (at most %d remembered)",
+                arc_lazy_media.ENV,
+                self._arc_lazy_cache.min_seen,
+                self._arc_lazy_cache.max_entries,
+            )
 
         self.IM_START_TOKEN_ID = hf_config.vision_start_token_id
         self.IM_END_TOKEN_ID = hf_config.vision_end_token_id
@@ -1009,13 +1042,17 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         input_text,
         request_obj,
         *args,
+        video_data=_VIDEO_DATA_FROM_REQUEST,
         **kwargs,
     ):
         entry_time = time.perf_counter()
+        # arc lazy media processes a subset of the request's videos (the ones it has not seen)
+        if video_data is _VIDEO_DATA_FROM_REQUEST:
+            video_data = request_obj.video_data
         base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
-            video_data=request_obj.video_data,
+            video_data=video_data,
             audio_data=request_obj.audio_data,
             multimodal_tokens=self.mm_tokens,
         )
@@ -1110,7 +1147,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             mm_items,
             "video_grid_thw",
             Modality.VIDEO,
-            request_obj.video_data,
+            video_data,
         )
 
         mrope_result = self._get_precomputed_mrope_from_output(ret)
@@ -1174,6 +1211,247 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             mrope_position_delta=mrope_position_delta,
         )
 
+    # ------------------------------------------------------------------ arc lazy media (ARC_MM_LAZY_MEDIA=1)
+
+    def _arc_lazy_identities(self, sources):
+        """[(modality, source)] -> [(artifact key, item hash)]; runs on the io executor (reads / hashes the bytes)."""
+        identities = []
+        for modality, source in sources:
+            snapshot = snapshot_media(source)
+            key = self._artifact_key(snapshot.content_digest, source, modality=modality)
+            probe = MultimodalDataItem(modality=modality)
+            probe.set_hash(resolve_multimodal_item_hash(existing_hash=0, namespace=key))
+            identities.append((key, probe.hash))
+        return identities
+
+    def _arc_lazy_encode(self, prompt: str, processor=None) -> List[int]:
+        tokenizer = self._tokenizer if processor is None else _tokenizer_of(processor)
+        return tokenizer.encode(prompt)
+
+    async def _process_mm_data_lazy(self, image_data, input_text, request_obj, *args, **kwargs):
+        """Items seen before go without pixels; see arc_lazy_media."""
+        entry_time = time.perf_counter()
+        image_data = list(image_data or [])
+        video_data = list(request_obj.video_data or [])
+        if request_obj.audio_data:
+            raise ValueError(f"{arc_lazy_media.ENV}=1 does not handle audio")
+        if any(self._is_preprocessed_input(x) for x in image_data) or any(
+            isinstance(x, dict) for x in video_data
+        ):
+            raise ValueError(f"{arc_lazy_media.ENV}=1 does not handle preprocessed media")
+        loop = asyncio.get_running_loop()
+
+        image_id = self.mm_tokens.image_token_id
+        video_id = self.mm_tokens.video_token_id
+        vs_id, ve_id = self.vision_start_token_id, self.vision_end_token_id
+        if isinstance(input_text, str):
+            prompt = input_text
+            if get_mm().mm_literal_image_sentinel:
+                # what load_mm_data's regex split does to a legacy <image> sentinel
+                prompt = self.mm_tokens.image_token_regex.sub(
+                    self.mm_tokens.image_token, prompt
+                )
+            if self.mm_processor_executor is not None:
+                client_ids = await self.mm_processor_executor.run(
+                    self._arc_lazy_encode, prompt
+                )
+            else:
+                client_ids = self._arc_lazy_encode(prompt)
+        else:
+            client_ids = list(input_text)
+
+        order = arc_lazy_media.placeholder_sequence(client_ids, image_id, video_id)
+        if order.count("image") != len(image_data) or order.count("video") != len(
+            video_data
+        ):
+            raise ValueError(
+                f"{arc_lazy_media.ENV}: the prompt has {order.count('image')} image / "
+                f"{order.count('video')} video placeholders for {len(image_data)} images / "
+                f"{len(video_data)} videos"
+            )
+        sources, n_image, n_video = [], 0, 0
+        for modality in order:
+            if modality == "image":
+                sources.append((Modality.IMAGE, image_data[n_image]))
+                n_image += 1
+            else:
+                sources.append((Modality.VIDEO, video_data[n_video]))
+                n_video += 1
+        identities = await loop.run_in_executor(
+            self.io_executor, self._arc_lazy_identities, sources
+        )
+        identity_time = time.perf_counter()
+
+        materialize = getattr(request_obj, arc_lazy_media.MATERIALIZE_ATTR, None) or ()
+        cache = self._arc_lazy_cache
+        metas, misses = [], {}
+        for (modality, source), (key, item_hash) in zip(sources, identities):
+            meta = cache.lookup(key)
+            if item_hash in materialize:
+                meta = None
+            metas.append(meta)
+            if meta is None and key not in misses:
+                misses[key] = (modality, source, item_hash)
+
+        materialized = {}
+        if misses:
+            miss_list = list(misses.items())
+            mini_ids = []
+            for _, (modality, _, _) in miss_list:
+                pad = image_id if modality == Modality.IMAGE else video_id
+                mini_ids += [vs_id, pad, ve_id]
+            mini_prompt = self._tokenizer.decode(mini_ids)
+            out = await self._process_mm_data_uncached(
+                [src for _, (m, src, _) in miss_list if m == Modality.IMAGE],
+                mini_prompt,
+                request_obj,
+                video_data=[src for _, (m, src, _) in miss_list if m == Modality.VIDEO],
+            )
+            out_ids = list(out.input_ids)
+            blocks = timestamped_media_blocks(out_ids, image_id, video_id, vs_id, ve_id)
+            out_items = sorted(out.mm_items, key=lambda item: item.offsets[0][0])
+            if len(blocks) != len(miss_list) or len(out_items) != len(miss_list):
+                raise RuntimeError(
+                    f"{arc_lazy_media.ENV}: {len(miss_list)} media processed into {len(blocks)} blocks / "
+                    f"{len(out_items)} items"
+                )
+            for (key, (modality, _, item_hash)), (kind, a, b), item in zip(
+                miss_list, blocks, out_items
+            ):
+                if kind != modality.name.lower() or item.modality != modality:
+                    raise RuntimeError(
+                        f"{arc_lazy_media.ENV}: media {key} ({modality}) came back as {kind} / {item.modality}"
+                    )
+                pad = image_id if modality == Modality.IMAGE else video_id
+                block = array("i", out_ids[a : b + 1])
+                spans = arc_lazy_media.pad_runs(block, pad)
+                if spans != tuple((s - a, e - a) for s, e in item.offsets):
+                    raise RuntimeError(
+                        f"{arc_lazy_media.ENV}: media {key}: item offsets {item.offsets} are not the pad runs "
+                        f"of its block [{a}, {b}]"
+                    )
+                grid_key = "image_grid_thw" if modality == Modality.IMAGE else "video_grid_thw"
+                grid = self._as_grid_batch(item.model_specific_data.get(grid_key))
+                if grid is None or grid.shape[0] != 1:
+                    raise RuntimeError(
+                        f"{arc_lazy_media.ENV}: media {key}: expected one {grid_key} row, got {grid}"
+                    )
+                item.set_hash(item_hash)
+                new_meta = arc_lazy_media.MediaMeta(
+                    modality=kind,
+                    block=block,
+                    pad_spans=spans,
+                    grid_thw=tuple(int(x) for x in grid[0].tolist()),
+                    hash=item.hash,
+                )
+                cache.put(key, new_meta)
+                materialized[key] = (item, new_meta)
+            metas = [
+                materialized[key][1] if meta is None else meta
+                for meta, (key, _) in zip(metas, identities)
+            ]
+        process_time = time.perf_counter()
+
+        input_ids_list, starts = arc_lazy_media.splice_blocks(
+            client_ids, [meta.block for meta in metas], image_id, video_id, vs_id, ve_id
+        )
+        mm_items = []
+        for (modality, _), (key, _), meta, start in zip(sources, identities, metas, starts):
+            offsets = [(start + s, start + e) for s, e in meta.pad_spans]
+            if key in materialized:
+                source_item = materialized[key][0]
+                item = copy.copy(source_item)
+                item.model_specific_data = dict(source_item.model_specific_data)
+            else:
+                grid_key = "image_grid_thw" if modality == Modality.IMAGE else "video_grid_thw"
+                item = MultimodalDataItem(
+                    modality=modality,
+                    model_specific_data={
+                        grid_key: torch.tensor([meta.grid_thw], dtype=torch.long),
+                        arc_lazy_media.LAZY_KEY: True,
+                    },
+                )
+            item.offsets = offsets
+            item.set_hash(meta.hash)
+            mm_items.append(item)
+
+        input_ids = torch.tensor(input_ids_list, dtype=torch.long)
+        image_grid_thw = self._concat_mm_item_grid(mm_items, "image_grid_thw", Modality.IMAGE)
+        video_grid_thw = self._concat_mm_item_grid(mm_items, "video_grid_thw", Modality.VIDEO)
+        mrope_result = None
+        if video_grid_thw is None:
+            mrope_result = self._compute_image_only_mrope_positions_from_offsets(
+                input_len=input_ids.numel(),
+                mm_items=mm_items,
+                dtype=input_ids.dtype,
+                device=input_ids.device,
+            )
+        if mrope_result is None:
+            # second_per_grid_ts is not read for this model family (frame groups are separated by timestamp text)
+            mrope_result = MRotaryEmbedding.get_rope_index(
+                spatial_merge_size=self._spatial_merge_size,
+                image_token_id=image_id,
+                video_token_id=video_id,
+                vision_start_token_id=vs_id,
+                model_type=self.model_type,
+                tokens_per_second=self._tokens_per_second,
+                input_ids=input_ids.unsqueeze(0),
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                second_per_grid_ts=None,
+                use_audio_in_video=False,
+                audio_seqlens=None,
+                audio_token_id=getattr(self.hf_config, "audio_token_id", None),
+                audio_start_token_id=self.audio_start_token_id,
+                position_id_per_seconds=getattr(
+                    self.hf_config, "position_id_per_seconds", None
+                ),
+            )
+        mrope_positions, mrope_position_delta = mrope_result
+        if mrope_positions.ndim == 3:
+            mrope_positions = mrope_positions.squeeze(1)
+
+        stats = self._arc_lazy_stats
+        stats["requests"] += 1
+        stats["items"] += len(mm_items)
+        stats["materialized"] += sum(1 for item in mm_items if item.feature is not None)
+        stats["forced"] += len(materialize)
+        if materialize or stats["requests"] % 200 == 0:
+            logger.info(
+                "%s: requests=%d items=%d materialized=%d forced=%d cache=%d hits=%d misses=%d%s",
+                arc_lazy_media.ENV,
+                stats["requests"],
+                stats["items"],
+                stats["materialized"],
+                stats["forced"],
+                len(cache),
+                cache.hits,
+                cache.misses,
+                f" (rematerialized {len(materialize)} for rid={getattr(request_obj, 'rid', None)})"
+                if materialize
+                else "",
+            )
+        logger.debug(
+            f"[arc lazy media] items={len(mm_items)} processed={len(misses)} "
+            f"identity={(identity_time - entry_time) * 1000:.1f} ms "
+            f"process={(process_time - identity_time) * 1000:.1f} ms "
+            f"total={(time.perf_counter() - entry_time) * 1000:.1f} ms"
+        )
+        return MultimodalProcessorOutput(
+            input_ids=input_ids_list,
+            padded_input_ids=MultimodalProcessorOutput.build_padded_input_ids(
+                input_ids_list, mm_items
+            ),
+            mm_items=mm_items,
+            im_start_id=self.vision_start_token_id,
+            im_end_id=self.vision_end_token_id,
+            im_token_id=image_id,
+            video_token_id=video_id,
+            audio_token_id=self.mm_tokens.audio_token_id,
+            mrope_positions=mrope_positions,
+            mrope_position_delta=mrope_position_delta,
+        )
+
     def _set_content_addressed_image_hashes(self, image_data, mm_items) -> None:
         """ARC h41: give each image item the hash the artifact fast path gives the same picture.
 
@@ -1212,6 +1490,10 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
+        if self._arc_lazy_cache is not None and (image_data or request_obj.video_data):
+            return await self._process_mm_data_lazy(
+                image_data, input_text, request_obj, *args, **kwargs
+            )
         if (
             not image_data
             or request_obj.video_data

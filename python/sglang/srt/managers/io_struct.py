@@ -2063,6 +2063,13 @@ class AbortReq(BaseReq, kw_only=True):
             self.rid = ""
 
 
+class ArcMmRematerializeReq(BaseReq, kw_only=True):
+    """Scheduler-to-tokenizer (arc lazy media, ARC_MM_LAZY_MEDIA=1): the request was taken out of the waiting queue
+    because these lazy items (hashes) overlap its extend; process it again with them materialized and resend it."""
+
+    hashes: List[int]
+
+
 class EncoderDispatchErrorReq(BaseReq, kw_only=True):
     """Tokenizer-to-scheduler failure for one EPD encoder dispatch."""
 
