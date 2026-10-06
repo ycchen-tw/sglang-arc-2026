@@ -304,3 +304,39 @@ class Serving(msgspec.Struct):
     disable_tokenizer_batch_decode: A[
         bool, "Disable batch decoding when decoding multiple completions."
     ] = False
+
+    # -------------------------------------------------------------------------
+    # arc-forge TITO session ledger (arc-forge docs/plans/tito_session_ledger.md)
+    # -------------------------------------------------------------------------
+    session_replay: A[
+        bool,
+        "Keep, per request session_id, the exact token ids the model has seen and "
+        "sampled, and put the sampled ids back wherever the client re-rendered the "
+        "same text into a different tokenization (non-canonical BPE splits). The "
+        "model then always sees its own sampled ids.",
+    ] = False
+    session_ledger_dir: A[
+        Optional[str],
+        "Write the session ledger (token ids, media bytes, optional logprobs and "
+        "routed experts of every request) under this directory. Requires "
+        "--session-replay.",
+    ] = None
+    session_ledger_all: A[
+        bool,
+        "Also record requests without a session_id, one segment per request.",
+    ] = False
+    session_ledger_logprobs: A[
+        bool,
+        "Record the sampled tokens' logprobs in the ledger (forces return_logprob "
+        "on recorded requests; the client response is unchanged).",
+    ] = False
+    session_ledger_routing: A[
+        bool,
+        "Record the routed experts of every new token in the ledger. Requires "
+        "--enable-return-routed-experts.",
+    ] = False
+    session_ledger_max_bytes: A[
+        int,
+        "Memory budget of the in-memory session records (int32 ids); the least "
+        "recently used session is evicted beyond it.",
+    ] = 8 << 30

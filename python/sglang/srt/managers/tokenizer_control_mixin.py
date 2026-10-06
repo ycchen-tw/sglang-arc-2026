@@ -926,6 +926,8 @@ class TokenizerControlMixin:
         obj: CloseSessionReqInput,
         request: Optional[fastapi.Request] = None,
     ):
+        if self.session_ledger is not None:
+            self.session_ledger.close_session(obj.session_id)
         await self._async_dispatch_to_scheduler(obj)
 
     async def update_weight_version(

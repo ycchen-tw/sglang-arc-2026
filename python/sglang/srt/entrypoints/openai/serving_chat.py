@@ -72,6 +72,7 @@ from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
     cached_tokens_details_from_dict,
+    first_routed_experts,
     process_cached_tokens_details_from_ret,
     process_hidden_states_for_response,
     process_hidden_states_from_ret,
@@ -1790,6 +1791,7 @@ class OpenAIServingChat(OpenAIServingBase):
         cached_tokens = {}
         hidden_states = {}
         routed_experts = {}
+        routed_experts_meta = {}
         cached_tokens_details = {}
         spec_tokens_details = {}
         image_tokens = {}
@@ -1831,6 +1833,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
+                routed_experts_meta[index] = content["meta_info"].get(
+                    "routed_experts_meta", None
+                )
                 cached_tokens_details[index] = content["meta_info"].get(
                     "cached_tokens_details", None
                 )
@@ -1976,10 +1981,10 @@ class OpenAIServingChat(OpenAIServingBase):
                         )
                         yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
 
-            sglext_routed = None
+            sglext_routed, sglext_routed_meta = None, None
             if request.return_routed_experts and routed_experts:
-                sglext_routed = next(
-                    (v for v in routed_experts.values() if v is not None), None
+                sglext_routed, sglext_routed_meta = first_routed_experts(
+                    routed_experts, routed_experts_meta
                 )
 
             sglext_cached_tokens_details = None
@@ -2017,6 +2022,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
             sglext_full = SglExt(
                 routed_experts=sglext_routed,
+                routed_experts_meta=sglext_routed_meta,
                 cached_tokens_details=sglext_cached_tokens_details,
                 spec_tokens_details=sglext_spec_tokens_details,
                 input_ids=sglext_input_ids,
@@ -2146,8 +2152,8 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Build sglext at response level (from first ret_item, as these are per-request)
         first_ret = ret[0]
-        routed_experts = (
-            None
+        routed_experts, routed_experts_meta = (
+            (None, None)
             if request.return_meta_info
             else process_routed_experts_from_ret(first_ret, request)
         )
@@ -2182,6 +2188,7 @@ class OpenAIServingChat(OpenAIServingBase):
         ):
             response_sglext = SglExt(
                 routed_experts=routed_experts,
+                routed_experts_meta=routed_experts_meta,
                 cached_tokens_details=cached_tokens_details,
                 spec_tokens_details=spec_tokens_details,
                 input_ids=input_ids,

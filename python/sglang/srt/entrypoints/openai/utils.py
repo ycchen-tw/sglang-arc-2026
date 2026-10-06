@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 
@@ -112,11 +112,38 @@ def process_routed_experts_from_ret(
         ChatCompletionRequest,
         CompletionRequest,
     ],
-) -> Optional[str]:
-    """Process routed experts from a ret item in non-streaming response."""
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """Routed experts (base64) and their routed_experts_meta from a ret item in
+    a non-streaming response; (None, None) when not requested / absent."""
     if not getattr(request, "return_routed_experts", False):
-        return None
-    return ret_item["meta_info"].get("routed_experts", None)
+        return None, None
+    meta_info = ret_item["meta_info"]
+    return first_routed_experts(
+        {0: meta_info.get("routed_experts", None)},
+        {0: meta_info.get("routed_experts_meta", None)},
+    )
+
+
+def first_routed_experts(
+    routed_experts: Dict[int, Optional[str]],
+    routed_experts_meta: Dict[int, Optional[Dict[str, Any]]],
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """The first non-None routed experts (in insertion order) with the
+    routed_experts_meta of the same choice index.
+
+    The payload is int16 and only decodable with its meta, so the two are
+    returned together and a payload without meta is an error.
+    """
+    for index, value in routed_experts.items():
+        if value is None:
+            continue
+        meta = routed_experts_meta.get(index)
+        if meta is None:
+            raise RuntimeError(
+                f"routed_experts of choice {index} came without routed_experts_meta"
+            )
+        return value, meta
+    return None, None
 
 
 def cached_tokens_details_from_dict(

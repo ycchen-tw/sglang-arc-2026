@@ -117,7 +117,11 @@ class _ReadbackMixin:
         self.assertEqual(resp.status_code, 200)
         meta = resp.json()["meta_info"]
         self.assertIn("routed_experts", meta)
-        arr = np.frombuffer(pybase64.b64decode(meta["routed_experts"]), dtype=np.int32)
+        self.assertEqual(meta["routed_experts_meta"]["dtype"], "int16")
+        arr = np.frombuffer(
+            pybase64.b64decode(meta["routed_experts"]),
+            dtype=np.dtype(meta["routed_experts_meta"]["dtype"]),
+        )
         self.assertEqual(
             arr.size % (_NUM_LAYERS * _TOPK),
             0,

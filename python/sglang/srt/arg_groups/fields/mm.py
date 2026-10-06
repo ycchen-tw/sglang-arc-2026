@@ -9,6 +9,8 @@ how config is shaped at runtime.
 
 from __future__ import annotations
 
+import argparse
+
 import json
 from typing import (
     Any,
@@ -162,3 +164,14 @@ class Mm(msgspec.Struct):
         "Deprecated. Use --mm-feature-transport=cuda_ipc for bounded GPU-resident "
         "multimodal feature transport.",
     ] = False
+    mm_literal_image_sentinel: A[
+        bool,
+        Arg(
+            help="Qwen-VL processors: treat a literal `<image>` in the prompt text as "
+            "an image placeholder (the legacy /generate sentinel). Turn off "
+            "(--no-mm-literal-image-sentinel) for chat/Responses traffic, where "
+            "`<image>` is ordinary text a model or a tool wrote: there it miscounts "
+            "the images and every later request of the conversation fails.",
+            action=argparse.BooleanOptionalAction,
+        ),
+    ] = True

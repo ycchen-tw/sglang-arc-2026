@@ -62,12 +62,18 @@ class BaseDeviceCache:
 
 class BaseHostCache:
     def __init__(
-        self, num_tokens: int, num_layers: int, topk_size: int, name: str, device: str
+        self,
+        num_tokens: int,
+        num_layers: int,
+        topk_size: int,
+        name: str,
+        device: str,
+        dtype: torch.dtype = torch.int32,
     ):
         alloc = ALLOC_MEMORY_FUNCS[device]
         self.buffer = alloc(
             (num_tokens, num_layers, topk_size),
-            dtype=torch.int32,
+            dtype=dtype,
             device="cpu",
             pin_memory=True,
             allocator=HostTensorAllocator(),

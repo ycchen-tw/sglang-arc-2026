@@ -33,13 +33,16 @@ def _fake_fp8_block_scale_moe_out(
     tune_max_num_tokens: int = 8192,
     fp8_quantization_type: Optional[int] = None,
     activation_type: Optional[int] = None,
+    routing_replay_out: Optional[torch.Tensor] = None,
 ) -> None:
     return None
 
 
 @register_custom_op(
     fake_impl=_fake_fp8_block_scale_moe_out,
-    mutates_args=["output"],
+    # routing_replay_out is the routed-experts (R3) capture buffer: the routing
+    # kernel writes rows [0, num_tokens) of its int16 [rows, top_k] view.
+    mutates_args=["output", "routing_replay_out"],
 )
 def trtllm_fp8_block_scale_moe_out_wrapper(
     routing_logits: torch.Tensor,
@@ -69,6 +72,7 @@ def trtllm_fp8_block_scale_moe_out_wrapper(
     tune_max_num_tokens: int = 8192,
     fp8_quantization_type: Optional[int] = None,
     activation_type: Optional[int] = None,
+    routing_replay_out: Optional[torch.Tensor] = None,
 ) -> None:
     try:
         from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
@@ -114,6 +118,9 @@ def trtllm_fp8_block_scale_moe_out_wrapper(
         from flashinfer.fused_moe.core import ActivationType
 
         kwargs["activation_type"] = ActivationType(activation_type)
+
+    if routing_replay_out is not None:
+        kwargs["routing_replay_out"] = routing_replay_out
 
     trtllm_fp8_block_scale_moe(**kwargs)
 
@@ -255,13 +262,17 @@ def _fake_fp8_per_tensor_scale_moe(
     enable_pdl: Optional[bool] = None,
     tune_max_num_tokens: int = 8192,
     activation_type: Optional[int] = None,
+    routing_replay_out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return torch.empty(
         hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
     )
 
 
-@register_custom_op(fake_impl=_fake_fp8_per_tensor_scale_moe)
+@register_custom_op(
+    fake_impl=_fake_fp8_per_tensor_scale_moe,
+    mutates_args=["routing_replay_out"],
+)
 def trtllm_fp8_per_tensor_scale_moe_wrapper(
     routing_logits: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
@@ -284,6 +295,7 @@ def trtllm_fp8_per_tensor_scale_moe_wrapper(
     enable_pdl: Optional[bool] = None,
     tune_max_num_tokens: int = 8192,
     activation_type: Optional[int] = None,
+    routing_replay_out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # lazy import
     try:
@@ -321,5 +333,8 @@ def trtllm_fp8_per_tensor_scale_moe_wrapper(
         from flashinfer.fused_moe.core import ActivationType
 
         kwargs["activation_type"] = ActivationType(activation_type)
+
+    if routing_replay_out is not None:
+        kwargs["routing_replay_out"] = routing_replay_out
 
     return trtllm_fp8_per_tensor_scale_moe(**kwargs)

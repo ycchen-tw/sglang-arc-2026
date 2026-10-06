@@ -156,46 +156,46 @@ class SchedulerBatchResultProcessor:
         """Collect routed experts for a finished request.
 
         Returns immediately if `return_routed_experts` was not set on the
-        request, so non-opted-in reqs don't pay the host-gather cost.
+        request, so non-opted-in reqs don't pay the host-gather cost, and on
+        ranks that never ship outputs (only output ranks keep the host buffer).
 
         Honors the caller's absolute start so the response covers
-        `[start_len, seqlen - 1)`. The default start_len is 0, which returns
-        the full sequence.
-
-        Logs a soft warning if the resulting tensor's row count differs from
-        the expected `seqlen - 1 - start_len`, to catch silent regressions.
+        `[start, seqlen - 1)` with `start = min(routed_experts_start_len,
+        seqlen - 1)`; `req.routed_experts_meta` records dtype, shape and start
+        for `meta_info["routed_experts_meta"]`.
         """
         if not req.return_routed_experts:
             return
         capturer = get_global_experts_capturer()
         if capturer is None:
             return
-        start_len = req.routed_experts_start_len
+        sends_outputs = self.output_streamer.send_to_detokenizer.socket is not None
+        if capturer.is_output_rank != sends_outputs:
+            raise RuntimeError(
+                "routed-experts capturer and scheduler disagree on which rank "
+                f"ships outputs (capturer.is_output_rank={capturer.is_output_rank}, "
+                f"scheduler sends outputs={sends_outputs})"
+            )
+        if not capturer.is_output_rank:
+            return
         seqlen = len(req.origin_input_ids) + len(req.output_ids_through_stop)
+        start = capturer.effective_start(req.routed_experts_start_len, seqlen)
         req.routed_experts = capturer.get_topk(
             req_pool_idx=req.kv.req_pool_idx,
             seqlen=seqlen,
             req_to_token_pool=self.req_to_token_pool,
-            start_len=start_len,
+            start_len=start,
         )
-
-        expected_rows = max(0, seqlen - 1 - start_len)
-        if (
-            req.routed_experts is not None
-            and req.routed_experts.shape[0] != expected_rows
-        ):
-            logger.warning(
-                "routed_experts row-count mismatch for req %s: got %d, expected %d "
-                "(seqlen=%d, raw_seqlen=%d, cached_tokens=%d, start_len=%s). "
-                "This indicates a silent bug.",
-                req.rid,
-                req.routed_experts.shape[0],
-                expected_rows,
-                seqlen,
-                req.seqlen,
-                req.cached_tokens,
-                req.routed_experts_start_len,
+        expected_rows = max(0, seqlen - 1 - start)
+        if req.routed_experts.shape[0] != expected_rows:
+            raise RuntimeError(
+                f"routed_experts row-count mismatch for req {req.rid}: got "
+                f"{req.routed_experts.shape[0]}, expected {expected_rows} "
+                f"(seqlen={seqlen}, raw_seqlen={req.seqlen}, "
+                f"cached_tokens={req.cached_tokens}, start={start}, "
+                f"requested start_len={req.routed_experts_start_len})"
             )
+        req.routed_experts_meta = capturer.output_meta(req.routed_experts, start)
 
     def _maybe_collect_indexer_topk(self, req: Req):
         capturer = get_global_indexer_capturer()
@@ -391,6 +391,18 @@ class SchedulerBatchResultProcessor:
                     ):
                         req.kv.kv_committed_len += 1
                     if req.finished():
+                        # A request that finishes in its prefill step (max_new_tokens=1: /health_generate,
+                        # /health on an idle server, scoring) never reaches the decode path's hook below.
+                        # Without this the DFlash drafter keeps its draft-state slot until ARC_DFLASH_EVICT_CYCLES
+                        # decode cycles pass -- never on an idle server -- and max_running_requests + 16 such
+                        # requests exhaust the pool and kill the scheduler.
+                        if isinstance(self.draft_worker, BaseSpecWorker):
+                            self.draft_worker.note_request_finished(
+                                rid=req.rid,
+                                natural_stop=isinstance(
+                                    req.finished_reason, FINISH_MATCHED_TOKEN
+                                ),
+                            )
                         if sampling_mask_finish_reason is None:
                             self._maybe_collect_routed_experts(req)
                             self._maybe_collect_indexer_topk(req)

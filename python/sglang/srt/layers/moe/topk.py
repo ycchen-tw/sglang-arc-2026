@@ -238,6 +238,11 @@ class TopKConfig:
     # Draft-side MoE blocks set this False so they never write the target's
     # process-global routed-experts capture buffer.
     allow_routed_experts_capture: bool = True
+    # Decoder layer index. BYPASSED consumers (the logits-based FlashInfer
+    # TRT-LLM runners) need it to hand the routing kernel this layer's slice of
+    # the routed-experts capture buffer (routing_replay_out); None when the
+    # owning TopK was built without a layer_id.
+    layer_id: Optional[int] = None
     _correction_bias_dtype_cache: Optional[torch.Tensor] = field(
         default=None, init=False, repr=False, compare=False
     )
@@ -585,6 +590,7 @@ class TopK(BaseFusedOp):
             output_format=output_format,
             scoring_func=scoring_func,
             allow_routed_experts_capture=allow_routed_experts_capture,
+            layer_id=layer_id,
         )
 
     def _apply_waterfill(self, topk_output: TopKOutput, num_tokens: int) -> TopKOutput:

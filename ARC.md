@@ -49,6 +49,9 @@
   - NVFP4 KV 加 HiSparse 走 sm_100 的 trtllm-gen gather；上游對 hybrid GDN 只准 triton／trtllm_mha／fa4 這幾種 attention backend。
   - 0004 的 distributed MTP top-1 不支援 attention DP，起服就 raise（`SGLANG_QWEN4_MTP_DISTRIBUTED_TOPK1=0`）。
 - **rejection sampling**：draft decode graph 的 `draft_probs` 在 verify 前 clone（`c70c0178`），所有平台都適用。
+- **TITO session 帳本**（全部 opt-in，arc-forge `docs/plans/tito_session_ledger.md`）：`--session-replay` 讓 TokenizerManager 依 `session_id` 記下模型看過與取樣的精確 token，並把 client 重切的 id 換回取樣的 id；`--session-ledger-dir`（`-all`／`-logprobs`／`-routing`）落地。`--no-mm-literal-image-sentinel`：chat／Responses 流量裡字面 `<image>` 是文字。
+- **routed experts**：`flashinfer_trtllm` 改由 kernel 的 `routing_replay_out` 寫（以前回全零）；int16、只在送 output 的 rank 建 host buffer；`meta_info` 帶 `routed_experts_meta`（dtype／shape／start），**client 一律依它解碼**。
+- **DFlash**：只做 prefill 就結束的請求也釋放 draft state（`0d808d613`；以前閒置 server 上約 70 個 `max_new_tokens=1` 請求就會打掛 scheduler）。
 - **執行期 VRAM**（arc-forge `docs/research/g4_runtime_vram_headroom_20261005.md`；G4 c110、0.92 真實遊戲的裝置最少剩餘 0.84 → 3.19 GiB）：
   - PLE short conv 的 extend 批次不再補成 (請求數, 最長列, 通道)，改用 `kernels/ops/qwen4_ple_varlen.py`，和補齊版逐位相同；PLE forward 的中間值用完即釋放、殘差與 mask 改 in-place（逐位相同）。不分平台、沒有旗標。
   - Qwen3-VL vision：每次 ViT forward 最多 `ARC_VIT_MAX_PATCHES`（預設 16384）個 patch、MLP 每段最多 `ARC_VIT_MLP_ROWS`（預設 8192）列；設 `0` 回到一次算完。數學相同，不保證逐位。
