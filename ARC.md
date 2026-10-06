@@ -57,3 +57,8 @@
   - Qwen3-VL vision：每次 ViT forward 最多 `ARC_VIT_MAX_PATCHES`（預設 16384）個 patch、MLP 每段最多 `ARC_VIT_MLP_ROWS`（預設 8192）列；設 `0` 回到一次算完。數學相同，不保證逐位。
   - 影片解碼後的 frame 只在 `--mm-feature-transport` 為 `cuda_ipc`／`cuda_vmm` 時 pin；`cpu` 時 tokenizer process 不 pin，不再在 GPU 上多開一個 550 MiB 的 CUDA context。
   - DFlash 群組只有一個 rank 時，drafter graph 進 target 的 graph pool、在 target 的 capture stream 上 capture（`ARC_DFLASH_SHARED_GRAPH_POOL=0` 關閉）；L4 的 attention-TP pair 維持自己的 pool。
+- **dense DFlash drafter**（`exp/dense-dflash` 併入）：drafter export 的 config `ffn_type: dense_shared` 時，routed experts 換成一個 dense SwiGLU（block FP8），不帶 keep／calib（`ARC_DFLASH_KEEP`／`CALIB`／`MOE` 必須不設）；L4 pair 上 attention head 切分、dense FFN 複製。
+- **hs110（G4 c110、dense10240 DFlash K=8）的穩定性與速度**（arc-forge `docs/research/hs110_c110_dense10240_k8_20261006.md`）：
+  - `ARC_MM_RELEASE_AFTER_PREFILL=1`（opt-in，預設 0）：請求的 prefill 一完成就釋放多模態特徵（CPU 上的 fp32 pixels）。codex 每回合重送整段歷史的截圖，c110 下 scheduler host RAM 約 9.6 → 1.3 GiB/h。被 retract 的請求會報錯（特徵已無法重新 prefill），所以會 retract 的部署維持預設。
+  - `ARC_DFLASH_DRAFT_VOCAB=<{"ids": [...]}>`（單卡）：drafter head 只對這些 id 算 logits／top-k（`heads.SubsetHead`），只影響提案，輸出分布由 rejection sampling 保證；G4 c110 K=8 draft 16.3 → 12.6 ms、accept 不變。
+  - 數值不變的同步移除：`embed_mm_inputs` 的 placeholder id、HiSparse prefill→decode batch、mamba pool alloc 改 pinned non-blocking；CUDA tensor 的純量賦值改 `fill_`／`index_fill_`（DFlash state pool、HiSparse coordinator／pool）；QSA extend metadata 對多模態 batch 也給 host max-position 上界（M-RoPE 位置不超過 token 序號）。吞吐量不出差異（噪音內），留著是因為少了逐請求 stream sync。
