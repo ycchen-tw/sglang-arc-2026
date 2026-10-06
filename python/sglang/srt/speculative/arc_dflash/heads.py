@@ -10,6 +10,7 @@ which is all the proposal step (state_pool.fast_propose) reads.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import torch
@@ -45,6 +46,36 @@ class TargetHead(nn.Module):
     def topk(self, x, k: int):
         logits = self(x.reshape(-1, x.shape[-1])).view(*x.shape[:-1], -1)
         return logits.topk(k, -1)
+
+
+class SubsetHead(nn.Module):
+    """The target lm_head restricted to a fixed draft vocabulary (ARC_DFLASH_DRAFT_VOCAB, a JSON {"ids": [...]}):
+    the drafter's top-k candidates come from those rows only, mapped back to vocabulary ids. The draft head only
+    proposes -- rejection sampling still verifies against the target's full distribution, so the output does not
+    change; a target token outside the subset is never proposed (its position is rejected and resampled). The
+    hs110 Kaggle run's 110 codex rollouts (20.7M output tokens) used 22,802 distinct ids and the top 16,384 cover
+    99.92% of them, while the full head is a [rows, 248k] GEMM plus a top-k over it every draft step."""
+
+    def __init__(self, weight, ids: torch.Tensor):
+        super().__init__()
+        self.register_buffer("ids", ids, persistent=False)
+        self.register_buffer("sub", weight.index_select(0, ids).contiguous(), persistent=False)
+
+    def topk(self, x, k: int):
+        flat = x.reshape(-1, x.shape[-1])
+        values, local = F.linear(flat, self.sub).topk(k, -1)
+        return values.view(*x.shape[:-1], k), self.ids[local].view(*x.shape[:-1], k)
+
+
+def draft_vocab(vocab: int, device):
+    """ARC_DFLASH_DRAFT_VOCAB: path of {"ids": [...]} (unique ids in [0, vocab)), or None when unset."""
+    path = os.environ.get("ARC_DFLASH_DRAFT_VOCAB")
+    if not path:
+        return None
+    ids = json.loads(Path(path).read_text())["ids"]
+    if not ids or len(set(ids)) != len(ids) or min(ids) < 0 or max(ids) >= vocab:
+        raise ValueError(f"ARC_DFLASH_DRAFT_VOCAB {path}: ids must be unique and in [0, {vocab}) ({len(ids)} given)")
+    return torch.tensor(sorted(ids), dtype=torch.int64, device=device)
 
 
 class PairHead(nn.Module):
@@ -99,7 +130,10 @@ def build_head(target_model, model_dir: Path, device, vocab: int, hidden: int, g
             raise RuntimeError(f"full-vocabulary lm_head on an attention-TP group of {group.world_size}")
         if tuple(head.weight.shape) != (vocab, hidden):
             raise RuntimeError(f"target lm_head {tuple(head.weight.shape)} != [{vocab}, {hidden}]")
-        return TargetHead(head.weight)
+        ids = draft_vocab(vocab, head.weight.device)
+        return TargetHead(head.weight) if ids is None else SubsetHead(head.weight, ids)
+    if os.environ.get("ARC_DFLASH_DRAFT_VOCAB"):
+        raise RuntimeError("ARC_DFLASH_DRAFT_VOCAB is implemented for a full-vocabulary lm_head on one GPU only")
     rows = own[1] - own[0]
     parts = [(head.weight[:rows], own[0])]
     covered = [own]
