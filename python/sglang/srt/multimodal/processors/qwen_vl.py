@@ -60,6 +60,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
 )
 from sglang.srt.runtime_context import get_mm, get_parallel, get_serving
 from sglang.srt.utils import cpu_has_amx_support, is_cpu
+from sglang.srt.utils.common import VideoData
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 from sglang.utils import logger
 
@@ -1217,7 +1218,8 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         """[(modality, source)] -> [(artifact key, item hash)]; runs on the io executor (reads / hashes the bytes)."""
         identities = []
         for modality, source in sources:
-            snapshot = snapshot_media(source)
+            # a video arrives as VideoData (url + preprocess_kwargs); the kwargs go into the key via _artifact_key
+            snapshot = snapshot_media(source.url if isinstance(source, VideoData) else source)
             key = self._artifact_key(snapshot.content_digest, source, modality=modality)
             probe = MultimodalDataItem(modality=modality)
             probe.set_hash(resolve_multimodal_item_hash(existing_hash=0, namespace=key))
