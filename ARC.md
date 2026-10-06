@@ -42,3 +42,5 @@
   - 只有一個 worker：drafter 跑在這張卡的 attention-TP 群組上。
   - routed experts 預設依 compute capability 選後端：sm_100／sm_120 用 CUTLASS W4A4；sm_89 用 Marlin W4A16，並在群組內做 EP。
   - lm_head：單卡用 `TargetHead`，群組大小大於 1 時用 `PairHead`。
+- **PLE 表格式**（從 main 移植到 L4 樹）：
+  - `ARC_PLE_NVFP4=1`（opt-in，預設 0；只支援 `--ple-offload-backend pinned`＋FP8 PLE 表）：PLE 表在載入時逐 shard 於 GPU 量化成 NVFP4（e2m1＋每 16 個一個 e4m3 scale，沒有 global scale：來源已是 e4m3），每列 90 B 連續存放，host 47.7 → 26.8 GiB。gather 解碼成 bf16，相對 FP8 列 relRMSE 9.6%、cosine 0.9955；4090 上 gather 比 FP8 快 15%。所有列沒載滿就報錯。`models/arc_ple_nvfp4.py`。
