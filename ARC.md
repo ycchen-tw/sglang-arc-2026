@@ -51,6 +51,7 @@
 - **rejection sampling**：draft decode graph 的 `draft_probs` 在 verify 前 clone（`c70c0178`），所有平台都適用。
 - **TITO session 帳本**（全部 opt-in，arc-forge `docs/plans/tito_session_ledger.md`）：`--session-replay` 讓 TokenizerManager 依 `session_id` 記下模型看過與取樣的精確 token，並把 client 重切的 id 換回取樣的 id；`--session-ledger-dir`（`-all`／`-logprobs`／`-routing`）落地。`--no-mm-literal-image-sentinel`：chat／Responses 流量裡字面 `<image>` 是文字。
 - **routed experts**：`flashinfer_trtllm` 改由 kernel 的 `routing_replay_out` 寫（以前回全零）；int16、只在送 output 的 rank 建 host buffer；`meta_info` 帶 `routed_experts_meta`（dtype／shape／start），**client 一律依它解碼**。
+- **帶影片的 token-id 請求不再重切**：上游 `SGLANG_MM_AVOID_RETOKENIZE`（#26555）只在純圖片時保留 client 的 id，帶影片就用處理器decode 後重新 tokenize 的結果，非標準切法會無聲漂移。qwen3-vl／qwen3.5／qwen4_exp 現在一律保留 client 的 id，只把處理器展開的媒體區塊（影片＝帶時間戳的分組）拼進 placeholder（`base_processor.splice_timestamped_media_blocks`）；對不上就報錯，不退回重切。
 - **DFlash**：只做 prefill 就結束的請求也釋放 draft state（`0d808d613`；以前閒置 server 上約 70 個 `max_new_tokens=1` 請求就會打掛 scheduler）。
 - **執行期 VRAM**（arc-forge `docs/research/g4_runtime_vram_headroom_20261005.md`；G4 c110、0.92 真實遊戲的裝置最少剩餘 0.84 → 3.19 GiB）：
   - PLE short conv 的 extend 批次不再補成 (請求數, 最長列, 通道)，改用 `kernels/ops/qwen4_ple_varlen.py`，和補齊版逐位相同；PLE forward 的中間值用完即釋放、殘差與 mask 改 in-place（逐位相同）。不分平台、沒有旗標。
