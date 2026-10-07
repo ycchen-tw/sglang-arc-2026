@@ -663,8 +663,14 @@ class _GenerationStreamAccumulator:
             else:
                 self.output_hidden_states.append(None)
         if self.return_routed_experts:
+            # A payload travels with its dtype/shape/start meta; {"error": ...}
+            # (rows refused at collection) travels without one.
             if req.return_routed_experts and (
-                (req.routed_experts is None) != (req.routed_experts_meta is None)
+                (req.routed_experts is not None)
+                != (
+                    req.routed_experts_meta is not None
+                    and "error" not in req.routed_experts_meta
+                )
             ):
                 raise RuntimeError(
                     f"req {req.rid}: routed_experts and routed_experts_meta must "

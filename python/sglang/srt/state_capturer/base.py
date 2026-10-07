@@ -69,6 +69,7 @@ class BaseHostCache:
         name: str,
         device: str,
         dtype: torch.dtype = torch.int32,
+        fill_value: int = 0,
     ):
         alloc = ALLOC_MEMORY_FUNCS[device]
         self.buffer = alloc(
@@ -78,7 +79,7 @@ class BaseHostCache:
             pin_memory=True,
             allocator=HostTensorAllocator(),
         )
-        self.buffer.zero_()
+        self.buffer.fill_(fill_value)
         self.num_tokens = num_tokens
         self.num_layers = num_layers
         self.topk_size = topk_size

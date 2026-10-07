@@ -41,10 +41,18 @@ logger = logging.getLogger(__name__)
 ROUTED_EXPERTS_DTYPE = torch.int16
 ROUTED_EXPERTS_DTYPE_NAME = "int16"
 
-# A real top-k row holds top_k *distinct* ids, so a row that is all zeros was
-# never written by any capture site. The first forwards that carry tokens are
-# scanned for such rows; the check is a one-time guard against a backend that
-# silently skips the capture, not a per-step cost.
+# A routing row no forward wrote. The host buffer starts at it, and every target
+# forward resets its device rows to it before the MoE layers run
+# (on_forward_begin), so a token a capture site skipped reads back as -1 -- not
+# as expert 0, and not as the previous occupant of its KV slot. Expert ids are
+# >= 0.
+ROUTING_UNWRITTEN = -1
+
+# A real top-k row holds top_k *distinct* ids, so a row that holds the sentinel
+# or is all zeros was never written by any capture site. The first forwards that
+# carry tokens are scanned for such rows; the check is a one-time guard against
+# a backend that silently skips the capture, not a per-step cost. Per request,
+# invalid_rows() checks every finished request's rows.
 _NEVER_WRITTEN_ROW_CHECK_FORWARDS = 32
 
 _EXPERT_COUNT_KEYS = (
@@ -204,8 +212,9 @@ class RoutedExpertsCapturer:
         # routing_replay_out) at every power-of-two bucket up to
         # next_power_of_2(num_tokens); the buffer must cover the top bucket.
         self.device_rows = next_power_of_2(max_batch_size)
-        self.device_buffer = torch.zeros(
+        self.device_buffer = torch.full(
             (num_layers, self.device_rows, self.device_topk_size),
+            ROUTING_UNWRITTEN,
             dtype=ROUTED_EXPERTS_DTYPE,
             device=device,
         )
@@ -217,6 +226,7 @@ class RoutedExpertsCapturer:
                 name="routed_experts",
                 device=device,
                 dtype=ROUTED_EXPERTS_DTYPE,
+                fill_value=ROUTING_UNWRITTEN,
             )
             if is_output_rank
             else None
@@ -305,6 +315,25 @@ class RoutedExpertsCapturer:
 
     # ----------------------------------------------------------------- readback
 
+    def on_forward_begin(self, forward_batch: ForwardBatch) -> None:
+        """Reset this forward's device rows to ROUTING_UNWRITTEN before the MoE
+        layers run (output ranks only: nothing reads the others' rows).
+
+        One memset of ``L * n * K`` int16 on the current (forward) stream, outside
+        any CUDA graph; the previous forward's rows were already copied out by
+        its on_forward_end, earlier on the same stream. A split prefill resets
+        only before its first split, so the later splits' layers are kept.
+        """
+        if self.host_cache is None or forward_batch.split_index != 0:
+            return
+        if is_dp_attention_enabled():
+            # This rank reads a slice of the DP-gathered batch whose offset is
+            # only known after the forward: reset every row.
+            self.device_buffer.fill_(ROUTING_UNWRITTEN)
+        else:
+            num_tokens = forward_batch.out_cache_loc.shape[0]
+            self.device_buffer[:, :num_tokens].fill_(ROUTING_UNWRITTEN)
+
     def _get_local_slice(
         self,
         forward_batch: ForwardBatch,
@@ -366,21 +395,69 @@ class RoutedExpertsCapturer:
         return None
 
     def check_rows_written(self, topk_cpu: torch.Tensor) -> None:
-        """Raise if a recorded layer left a token's row all zeros (never written)."""
+        """Raise if a recorded layer left a token's row unwritten (the
+        ROUTING_UNWRITTEN sentinel, or all zeros)."""
         if self._row_checks_left <= 0 or topk_cpu.shape[0] == 0:
             return
         self._row_checks_left -= 1
         layers = sorted(self.layers_recorded)
-        never_written = (topk_cpu[:, layers, :] == 0).all(dim=-1)
+        rows = topk_cpu[:, layers, :]
+        never_written = (rows == ROUTING_UNWRITTEN).any(dim=-1) | (rows == 0).all(
+            dim=-1
+        )
         if bool(never_written.any()):
             token, layer_pos = never_written.nonzero()[0].tolist()
             raise RuntimeError(
                 "--enable-return-routed-experts: routed experts of token row "
-                f"{token}, layer {layers[layer_pos]} were never written (all "
-                f"{self.topk_size} ids are 0; {int(never_written.sum())} such "
-                "(token, layer) rows in this forward). The MoE kernel accepted "
-                "the capture buffer but did not fill it."
+                f"{token}, layer {layers[layer_pos]} were never written (the "
+                f"{ROUTING_UNWRITTEN} sentinel or all {self.topk_size} ids 0; "
+                f"{int(never_written.sum())} such (token, layer) rows in this "
+                "forward). The MoE kernel accepted the capture buffer but did not "
+                "fill it."
             )
+
+    def invalid_rows(self, rows: torch.Tensor) -> Optional[str]:
+        """Why a finished request's gathered rows ``[n, L, K]`` are not its
+        routing, or None.
+
+        Over the recorded layers (a layer no capture site runs in keeps the
+        sentinel by design): a negative id is ROUTING_UNWRITTEN -- no forward
+        wrote that row since its KV slot was allocated as host memory or reset
+        as device rows -- and a row whose first two ids are both 0 is not a
+        top-k of distinct ids (the all-zero row a capture that wrote nothing
+        leaves). The common case is two vectorized passes over the rows, ~15% of
+        the gather itself (20k tokens x 48 layers x top-10: 1.3 ms vs 8.4 ms).
+        A per-request problem, so the caller drops this request's routing; it
+        does not stop the server.
+        """
+        if rows.shape[0] == 0:
+            return None
+        if len(self.layers_recorded) != self.num_layers:
+            layers = sorted(self.layers_recorded)
+            rows = rows[:, layers]
+        else:
+            layers = list(range(self.num_layers))
+        two_zeros = (
+            (rows[..., 0] == 0) & (rows[..., 1] == 0)
+            if self.topk_size > 1
+            else torch.zeros(rows.shape[:2], dtype=torch.bool)
+        )
+        if not bool(rows.min() < 0) and not bool(two_zeros.any()):
+            return None
+        unwritten = (rows < 0).any(dim=-1)
+        zero = (rows == 0).all(dim=-1) if self.topk_size > 1 else two_zeros
+        bad = unwritten | zero
+        if not bool(bad.any()):
+            # two zero ids but not all: a duplicate, which the consumer's own
+            # top-k validation reports.
+            return None
+        token, layer_pos = bad.nonzero()[0].tolist()
+        return (
+            f"invalid_rows: {int(unwritten.sum())} unwritten ({ROUTING_UNWRITTEN}) "
+            f"and {int(zero.sum())} all-zero (token, layer) rows of "
+            f"{rows.shape[0]}x{len(layers)}; first at row {token}, layer "
+            f"{layers[layer_pos]}"
+        )
 
     @staticmethod
     def effective_start(start_len: int, seqlen: int) -> int:

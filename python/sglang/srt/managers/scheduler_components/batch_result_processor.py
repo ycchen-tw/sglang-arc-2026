@@ -164,6 +164,12 @@ class SchedulerBatchResultProcessor:
         `[start, seqlen - 1)` with `start = min(routed_experts_start_len,
         seqlen - 1)`; `req.routed_experts_meta` records dtype, shape and start
         for `meta_info["routed_experts_meta"]`.
+
+        Rows the capturer finds invalid (unwritten sentinel, all-zero) are this
+        request's problem, not the server's: the request keeps no routing and
+        `req.routed_experts_meta` is `{"error": ...}`
+        (`meta_info["routed_experts_error"]`). A row-count mismatch means the
+        server's own bookkeeping is wrong and still raises.
         """
         if not req.return_routed_experts:
             return
@@ -196,6 +202,14 @@ class SchedulerBatchResultProcessor:
                 f"cached_tokens={req.cached_tokens}, start={start}, "
                 f"requested start_len={req.routed_experts_start_len})"
             )
+        if (reason := capturer.invalid_rows(req.routed_experts)) is not None:
+            logger.error(
+                f"routed experts of req {req.rid} dropped (rows from start={start}, "
+                f"seqlen={seqlen}, cached_tokens={req.cached_tokens}): {reason}"
+            )
+            req.routed_experts = None
+            req.routed_experts_meta = {"error": reason}
+            return
         req.routed_experts_meta = capturer.output_meta(req.routed_experts, start)
 
     def _maybe_collect_indexer_topk(self, req: Req):

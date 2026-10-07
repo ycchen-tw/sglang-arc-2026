@@ -780,6 +780,10 @@ class SessionLedger:
                        if k2 in meta_info} or None,
               "replay": {"spans": p.replay.spans, "skip": p.replay.skip, "lcp0": p.replay.lcp0},
               "media": media, "logprobs": None, "routing": None}
+        ev["weight_versions"], why = _weight_versions(meta_info, len(gen))
+        if why is not None:
+            self.counters["weight_versions_error"] += 1
+            ev["weight_versions_error"] = why
         if self.logprobs:
             vals = [float(v) for v in state.output_token_logprobs_val]
             if len(vals) != len(gen):
@@ -789,12 +793,19 @@ class SessionLedger:
                 ev["logprobs"] = _b64_f32(vals)
         routing_bytes = None
         if self.routing:
-            routing_bytes, info = _routing_bytes(meta_info, p.routing_start, len(p.key) + len(gen) - 1 - p.routing_start)
-            if routing_bytes is None:
-                self.counters["routing_missing"] += 1
-                ev["routing_error"] = info
+            server_error = meta_info.get("routed_experts_error")
+            if server_error is not None:
+                # the scheduler refused the rows (unwritten sentinel / all-zero)
+                self.counters["routing_invalid"] += 1
+                ev["routing_error"] = server_error
             else:
-                ev["routing"] = info
+                routing_bytes, info = _routing_bytes(meta_info, p.routing_start,
+                                                     len(p.key) + len(gen) - 1 - p.routing_start)
+                if routing_bytes is None:
+                    self.counters["routing_missing"] += 1
+                    ev["routing_error"] = info
+                else:
+                    ev["routing"] = info
         self.writer.put(ev, p.media_blobs, routing_bytes)
 
     # ------------------------------------------------------------------ sessions
@@ -886,6 +897,27 @@ def _routing_bytes(meta_info: dict, routing_start: int, n_expected: int):
                       f"{len(raw)} bytes for {shape} {dtype}")
     return raw, {"file": None, "offset": None, "nbytes": len(raw), "start": start, "n_tokens": shape[0],
                  "shape": shape, "dtype": dtype}
+
+
+def _weight_versions(meta_info: dict, n_gen: int):
+    """(spans, None) or (None, why): the weight version each generated token was sampled with.
+
+    ``meta_info["weight_versions"]`` (the scheduler's per-request spans) as
+    ``[{"version": str, "start": int, "end": int}, ...]``: half-open, in gen coordinates, tiling
+    ``[0, len(gen))`` in order (one span unless a weight update happened while the request ran)."""
+    spans = meta_info.get("weight_versions")
+    if not spans:
+        return None, f"meta_info weight_versions is {spans!r}"
+    out, pos = [], 0
+    for s in spans:
+        version, start, end = s["version"], s["start"], s["end"]
+        if not isinstance(version, str) or start != pos or end < start:
+            return None, f"weight_versions {spans} do not tile [0, {n_gen})"
+        out.append({"version": version, "start": int(start), "end": int(end)})
+        pos = end
+    if pos != n_gen:
+        return None, f"weight_versions {spans} do not tile [0, {n_gen})"
+    return out, None
 
 
 MODEL_FILES = ("config.json", "generation_config.json", "tokenizer.json", "tokenizer_config.json",

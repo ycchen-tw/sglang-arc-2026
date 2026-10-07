@@ -2568,6 +2568,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
                     meta_info["routed_experts"] = val
                     meta_info["routed_experts_meta"] = routed_meta
+                elif (
+                    recv_obj.routed_experts_meta is not None
+                    and (routed_meta := recv_obj.routed_experts_meta[i]) is not None
+                ):
+                    # The scheduler refused this request's rows (unwritten or
+                    # all-zero): no payload, the reason instead.
+                    meta_info["routed_experts_error"] = routed_meta["error"]
             if getattr(recv_obj, "indexer_topk", None):
                 val = recv_obj.indexer_topk[i]
                 if val is not None:
@@ -2712,6 +2719,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if state.ledger_routing:  # recorded; the client did not ask for it
                         meta_info.pop("routed_experts", None)
                         meta_info.pop("routed_experts_meta", None)
+                        meta_info.pop("routed_experts_error", None)
                 if self.enable_metrics:
                     scheduler_time_stats = (
                         recv_obj.time_stats[i]
