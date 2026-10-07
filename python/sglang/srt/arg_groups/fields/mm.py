@@ -175,3 +175,9 @@ class Mm(msgspec.Struct):
             action=argparse.BooleanOptionalAction,
         ),
     ] = True
+    ple_mm_placeholder_ids: A[
+        bool,
+        "Qwen4 (Qwen3.8-Flash-Next): the PLE n-gram embedding reads <|image_pad|> / "
+        "<|video_pad|> at media positions, as HF and vLLM do. Off (upstream "
+        "behaviour): it reads the radix pad hash clamped to vocab_size - 1 there.",
+    ] = False

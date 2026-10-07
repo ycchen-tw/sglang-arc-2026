@@ -386,6 +386,25 @@ def _scatter_mm_embedding(
     dest.index_copy_(0, rows[:num_src_rows], src)
 
 
+def write_mm_media_token_ids_(
+    input_ids: torch.Tensor,
+    modalities: List[Modality],
+    masks: List[Optional[torch.Tensor]],
+    media_token_ids: Dict[Modality, int],
+) -> None:
+    """arc: in place, each modality's media positions (its [num_tokens, 1] mask from get_embedding_and_mask, None when
+    the extend holds none of its items) := that modality's placeholder token id. The cache-facing pad values live in
+    the requests' host ids; this device tensor is only read by the model."""
+    for modality, mask in zip(modalities, masks, strict=True):
+        if mask is None:
+            continue
+        if modality not in media_token_ids:
+            raise NotImplementedError(f"no media token id for {modality}")
+        if mask.shape != (input_ids.shape[0], 1):
+            raise RuntimeError(f"media mask {tuple(mask.shape)} for input_ids {tuple(input_ids.shape)}")
+        input_ids.masked_fill_(mask.view(-1), media_token_ids[modality])
+
+
 def embed_mm_inputs(
     mm_inputs_list: List[MultimodalInputs],
     extend_prefix_lens: List[int],
@@ -414,6 +433,7 @@ def embed_mm_inputs(
     other_info = {}
     if mm_inputs_list is None:
         return None
+    original_input_ids = input_ids
 
     # 1. Calculate the multimodal data which exists in input_ids, with the help of pad_values
     # we assume that multimodal data are represented with its pad_values in input_ids
@@ -485,6 +505,14 @@ def embed_mm_inputs(
 
     # 3. Get input embeddings
     vocab_size = input_embedding.num_embeddings
+    # arc: the clamp below is harmless only for the token embedding, which the media embeddings overwrite. A model
+    # that reads input_ids again after this routine (Qwen4's PLE hashes this very tensor, forward_batch.input_ids)
+    # declares mm_media_token_ids, and its media positions get the modality's placeholder token, as in HF and vLLM.
+    media_token_ids = getattr(multimodal_model, "mm_media_token_ids", None)
+    if media_token_ids is not None:
+        if input_ids is not original_input_ids:
+            raise NotImplementedError("mm_media_token_ids with input_ids rewritten by EVS pruning")
+        write_mm_media_token_ids_(input_ids, modalities, masks, media_token_ids)
     # Important: clamp after getting original multimodal regions
     # Clamp input ids. This is because the input_ids for the multimodal tokens are
     # filled with the hash values of the multimodal for the prefix matching in the radix attention.
@@ -564,6 +592,11 @@ def _embed_mm_inputs_with_split(
             **embed_kwargs,
         )
 
+    if getattr(multimodal_model, "mm_media_token_ids", None) is not None:
+        # arc: the groups below embed copies of input_ids, and forward_batch.input_ids would keep the pad hashes.
+        raise NotImplementedError(
+            "mm_media_token_ids with a batch mixing precomputed and encoded media"
+        )
     all_seq_lens = forward_batch.extend_seq_lens_cpu
     mm_batch_indices = [
         i for i, mm in enumerate(forward_batch.mm_inputs) if mm is not None

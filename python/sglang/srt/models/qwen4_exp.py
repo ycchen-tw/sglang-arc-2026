@@ -49,6 +49,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -68,7 +69,7 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_prefetcher,
     make_ple_file_rss_trimmer,
 )
-from sglang.srt.runtime_context import get_parallel, get_stream
+from sglang.srt.runtime_context import get_mm, get_parallel, get_stream
 from sglang.srt.utils import logger
 
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
@@ -1876,7 +1877,8 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
         input_deepstack_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         self.last_hc_hidden_states = None
-        # mm routine passes input_ids=None; PLE needs the real ids.
+        # mm routine passes input_ids=None; PLE needs the real ids. Its media positions hold
+        # vocab_size - 1, or <|image_pad|> / <|video_pad|> with --ple-mm-placeholder-ids.
         if input_ids is None:
             input_ids = forward_batch.input_ids
         model_output = super().forward(
@@ -1909,6 +1911,17 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         language_model_cls=Qwen4ExpVLModel,
     ) -> None:
         super().__init__(config, quant_config, prefix, language_model_cls)
+        # PLE hashes the ids at media positions too: HF and vLLM feed it the placeholder tokens. With
+        # --ple-mm-placeholder-ids the mm embed routine writes these there instead of clamping the radix pad
+        # hash to vocab_size - 1 (upstream behaviour, the default).
+        self.mm_media_token_ids = (
+            {
+                Modality.IMAGE: config.image_token_id,
+                Modality.VIDEO: config.video_token_id,
+            }
+            if get_mm().ple_mm_placeholder_ids
+            else None
+        )
         rope_config = getattr(self.config, "rope_parameters", None) or getattr(
             self.config, "rope_scaling", {}
         )
