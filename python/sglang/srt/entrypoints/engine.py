@@ -1492,16 +1492,22 @@ class Engine(EngineScoreMixin, EngineBase):
         self,
         model_path: str,
         load_format: Optional[str] = None,
+        keep_identity: bool = False,
+        weight_version: Optional[str] = None,
+        flush_cache: bool = True,
     ):
         """Update the weights from disk inplace without re-launching the engine.
 
         This method allows updating the model weights from disk without restarting
         the engine. It can be used to load a different model or update weights with
-        new training.
+        new training. ``keep_identity``: see UpdateWeightFromDiskReqInput.
         """
         obj = UpdateWeightFromDiskReqInput(
             model_path=model_path,
             load_format=load_format,
+            keep_identity=keep_identity,
+            weight_version=weight_version,
+            flush_cache=flush_cache,
         )
 
         return self.loop.run_until_complete(

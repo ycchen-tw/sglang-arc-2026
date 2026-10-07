@@ -683,6 +683,11 @@ async def health_generate(request: Request) -> Response:
     if _global_state.tokenizer_manager.server_status == ServerStatus.Starting:
         return Response(status_code=503)
 
+    if _global_state.tokenizer_manager.weights_poisoned is not None:
+        # A keep_identity update failed partway: generate is refused until a
+        # later update succeeds (/model_info says why).
+        return Response(status_code=503)
+
     # Let an external E2E driver establish a balanced DP batch before health traffic.
     if envs.SGLANG_DIAG_BYPASS_HEALTH_GENERATE.get() and request.url.path in (
         "/health",
@@ -772,6 +777,11 @@ async def model_info():
         "weight_version": _global_state.tokenizer_manager.config_value(
             "weight_version"
         ),
+        # arc-forge keep_identity: the directory the weights were last loaded
+        # from (a keep_identity update moves this, not model_path), and why they
+        # cannot be trusted (null when they can).
+        "weights_source": _global_state.tokenizer_manager.weights_source,
+        "weights_poisoned": _global_state.tokenizer_manager.weights_poisoned,
         "load_format": _global_state.tokenizer_manager.config_value("load_format"),
         "reasoning_parser": _global_state.tokenizer_manager.config_value(
             "reasoning_parser"
@@ -1286,6 +1296,7 @@ async def update_weights_from_disk(
         "success": success,
         "message": message,
         "num_paused_requests": num_paused_requests,
+        "weights_poisoned": _global_state.tokenizer_manager.weights_poisoned,
     }
     if success:
         return ORJSONResponse(

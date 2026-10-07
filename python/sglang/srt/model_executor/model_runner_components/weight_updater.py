@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import dataclasses
 import gc
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
@@ -219,6 +221,84 @@ class WeightUpdater:
 
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
+
+    def update_weights_from_disk_keep_identity(
+        self: WeightUpdater,
+        model_path: str,
+        load_format: Optional[str],
+        recapture_cuda_graph: bool = False,
+    ) -> tuple[bool, str, bool]:
+        """Load the checkpoint at ``model_path`` (any subset of the model's
+        tensors, e.g. merged LoRA projections) into the serving model in place,
+        keeping the server's identity: ``model_config.model_path``, the
+        runner's load config and the process record stay the launch values.
+
+        No rollback: the default path's "rollback" reloads from
+        ``model_config.model_path``, which it has just pointed at this very
+        directory. A failure after loading started is reported, and the caller
+        marks the weights poisoned.
+
+        Returns ``(success, message, weights_touched)``; ``weights_touched`` is
+        False only when the update failed before any tensor could be written.
+        """
+        if self.get_model_runner().is_draft_worker:
+            raise RuntimeError(
+                "keep_identity weight updates are target-only; the scheduler "
+                "refuses them under speculative decoding"
+            )
+        self._assert_weight_cache_inactive("update_weights_from_disk")
+        error = _unsupported_derived_weight_cache_error()
+        if error is not None:
+            return False, error, False
+        if not os.path.isdir(model_path):
+            # A non-directory would be taken for a hub repo id and downloaded.
+            return False, f"keep_identity: {model_path} is not a directory.", False
+
+        logger.info(
+            f"Update engine weights from disk (keep identity) begin: {model_path}. "
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id, empty_cache=False):.2f} GB"
+        )
+        loader = get_model_loader(LoadConfig(load_format=load_format), self.model_config)
+        if not isinstance(loader, DefaultModelLoader):
+            return False, f"Failed to get model loader: {loader}.", False
+        model = self.get_model()
+        source = dataclasses.replace(
+            DefaultModelLoader.Source.init_new(self.model_config, model),
+            model_or_path=model_path,
+        )
+        with set_default_torch_dtype(self.model_config.dtype):
+            try:
+                weights = loader._get_weights_iterator(source)
+            except Exception as e:
+                return False, f"Failed to get weights iterator for {model_path}: {e}.", False
+            try:
+                loader.load_weights_and_postprocess(
+                    model, weights, torch.device(self.device)
+                )
+            except Exception as e:
+                logger.exception(
+                    "keep_identity weight update from %s failed after loading started",
+                    model_path,
+                )
+                return (
+                    False,
+                    f"Failed to update weights from {model_path} after loading "
+                    f"started (no rollback): {e!r}.",
+                    True,
+                )
+
+        if recapture_cuda_graph and (
+            self.device == "cuda"
+            or self.device == "musa"
+            or (
+                current_platform.is_out_of_tree()
+                and current_platform.support_cuda_graph()
+            )
+        ):
+            self.recapture_cuda_graph()
+
+        logger.info("Update weights (keep identity) end.")
+        return True, f"Succeeded to update model weights from {model_path}.", True
 
     def update_weights_from_distributed(
         self: WeightUpdater,

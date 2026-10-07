@@ -81,6 +81,8 @@ class TestModelInfoSerialization(CustomTestCase):
             ),
             model_path="dummy",
             served_model_name="dummy",
+            weights_source="dummy",
+            weights_poisoned=None,
             server_args=server_args,
             is_generation=True,
             config_value=values.__getitem__,
