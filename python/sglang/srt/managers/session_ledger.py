@@ -348,6 +348,11 @@ class _Writer:
         self.rt_f = open(os.path.join(root, f"routing.{self.rt_idx}.bin"), "ab")
         self.media_written: set = set(n for n in os.listdir(os.path.join(root, "media")))
         self.bytes_written = 0
+        # event lines queued (dropped puts excluded; the writer's own lossy markers included) and event lines
+        # flushed to events.*.jsonl after their media and routing: both monotonic, written <= enqueued, equal once
+        # the writer has drained
+        self.enqueued_events = 0
+        self.written_events = 0
         self.lossy = 0
         self.lossy_unreported = 0
         self.error: Optional[str] = None
@@ -357,21 +362,33 @@ class _Writer:
         self.thread = threading.Thread(target=self._run, name="session-ledger-writer", daemon=True)
         self.thread.start()
 
+    def _enqueue(self, job: tuple, block: bool) -> None:
+        # counted before the put, so that written_events never runs ahead of enqueued_events
+        self.enqueued_events += 1
+        try:
+            if block:
+                self.q.put(job)
+            else:
+                self.q.put_nowait(job)
+        except BaseException:
+            self.enqueued_events -= 1
+            raise
+
     def put(self, event: dict, media: Sequence[Tuple[str, bytes]] = (), routing: Optional[bytes] = None) -> None:
         if self.error is not None:
             raise RuntimeError(f"session ledger writer died: {self.error}")
         if self.blocking:
             if self.lossy_unreported:
-                self.q.put(({"ev": "lossy", "t": time.time(), "dropped": self.lossy_unreported}, (), None))
+                self._enqueue(({"ev": "lossy", "t": time.time(), "dropped": self.lossy_unreported}, (), None), True)
                 self.lossy_unreported = 0
-            self.q.put((event, media, routing))
+            self._enqueue((event, media, routing), True)
             return
         try:
             if self.lossy_unreported:
                 # the drop itself goes on disk as soon as there is room again
-                self.q.put_nowait(({"ev": "lossy", "t": time.time(), "dropped": self.lossy_unreported}, (), None))
+                self._enqueue(({"ev": "lossy", "t": time.time(), "dropped": self.lossy_unreported}, (), None), False)
                 self.lossy_unreported = 0
-            self.q.put_nowait((event, media, routing))
+            self._enqueue((event, media, routing), False)
         except queue.Full:
             self.lossy += 1
             self.lossy_unreported += 1
@@ -430,6 +447,7 @@ class _Writer:
         self.ev_f.write(line)
         self.ev_f.flush()
         self.bytes_written += len(line)
+        self.written_events += 1
 
 
 # ----------------------------------------------------------------------------- ledger
@@ -861,6 +879,8 @@ class SessionLedger:
                 "pending": len(self.pending), "bytes": self.bytes, "max_bytes": self.max_bytes,
                 "queue": self.writer.depth() if self.writer else 0,
                 "written_bytes": self.writer.bytes_written if self.writer else 0,
+                "enqueued_events": self.writer.enqueued_events if self.writer else 0,
+                "written_events": self.writer.written_events if self.writer else 0,
                 "lossy": self.writer.lossy if self.writer else 0,
                 "writer_error": self.writer.error if self.writer else None,
                 "logprobs": self.logprobs, "routing": self.routing, "all": self.record_all,
