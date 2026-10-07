@@ -315,6 +315,13 @@ class Serving(msgspec.Struct):
         "same text into a different tokenization (non-canonical BPE splits). The "
         "model then always sees its own sampled ids.",
     ] = False
+    session_replay_empty_think: A[
+        bool,
+        "With --session-replay: a previous assistant turn whose thinking the model "
+        "left empty in a non-canonical way (<think>\\n</think>\\n\\n, or <think>\\n "
+        "straight into the answer) also counts as the same message when the client "
+        "renders it as <think>\\n\\n</think>\\n\\n; the model gets its sampled ids back.",
+    ] = False
     session_ledger_dir: A[
         Optional[str],
         "Write the session ledger (token ids, media bytes, optional logprobs and "

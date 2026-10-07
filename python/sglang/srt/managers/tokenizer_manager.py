@@ -558,6 +558,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         serving = get_serving()
         self.session_ledger = None
         if not serving.session_replay:
+            if serving.session_replay_empty_think:
+                raise ValueError("--session-replay-empty-think needs --session-replay")
             if (
                 serving.session_ledger_dir is not None
                 or serving.session_ledger_all
@@ -591,6 +593,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             tokenizer_worker_num=serving.tokenizer_worker_num,
             server_meta=server_meta(self.server_args),
             port=self.server_args.port,
+            empty_think=serving.session_replay_empty_think,
         )
 
     def _session_ledger_intake(self, obj, tokenized_obj) -> None:
