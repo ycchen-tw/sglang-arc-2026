@@ -778,9 +778,10 @@ async def model_info():
             "weight_version"
         ),
         # arc-forge keep_identity: the directory the weights were last loaded
-        # from (a keep_identity update moves this, not model_path), and why they
-        # cannot be trusted (null when they can).
+        # from (a keep_identity update moves this, not model_path), whether they
+        # are poisoned, and why (null when they are not).
         "weights_source": _global_state.tokenizer_manager.weights_source,
+        "poisoned": _global_state.tokenizer_manager.weights_poisoned is not None,
         "weights_poisoned": _global_state.tokenizer_manager.weights_poisoned,
         "load_format": _global_state.tokenizer_manager.config_value("load_format"),
         "reasoning_parser": _global_state.tokenizer_manager.config_value(

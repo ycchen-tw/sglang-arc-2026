@@ -99,6 +99,10 @@ class TestModelInfoSerialization(CustomTestCase):
             reset_context()
 
         self.assertEqual(payload["load_format"], f"{__name__}._CustomModelLoader")
+        # arc-forge keep_identity readback
+        self.assertEqual(payload["weights_source"], "dummy")
+        self.assertIs(payload["poisoned"], False)
+        self.assertIsNone(payload["weights_poisoned"])
         json.dumps(payload)
 
 
