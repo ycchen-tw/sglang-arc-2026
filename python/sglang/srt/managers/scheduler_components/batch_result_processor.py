@@ -88,8 +88,8 @@ logger = logging.getLogger(__name__)
 # them until the request finishes. A codex turn re-sends its whole history, every old screenshot included
 # (~10 MB of fp32 pixels each), so at c110 the live requests' CPU features grew ~1 GiB per 5 min (G4 probe,
 # 110 -> 165 items for 110 requests) and host RAM ran out on Kaggle. Opt-in (ARC_MM_RELEASE_AFTER_PREFILL=1, the
-# hs110 G4/Kaggle deployment): a retracted request that would need the features again refuses loudly
-# (Req.reset_for_retract), so lines that retract (tight L4 KV) keep upstream behaviour by default.
+# hs110 G4/Kaggle deployment): a retracted request waits out of the queue while the tokenizer processes its media
+# again (Scheduler._arc_mm_park_for_refill).
 _ARC_MM_RELEASE = os.environ.get("ARC_MM_RELEASE_AFTER_PREFILL", "0")
 if _ARC_MM_RELEASE not in ("0", "1"):
     raise ValueError(f"ARC_MM_RELEASE_AFTER_PREFILL must be 0 or 1, got {_ARC_MM_RELEASE!r}")

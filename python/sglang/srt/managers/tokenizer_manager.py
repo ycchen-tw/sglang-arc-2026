@@ -3364,6 +3364,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return
         obj = state.obj
         done = getattr(obj, arc_lazy_media.MATERIALIZE_ATTR, None) or frozenset()
+        if recv_obj.refill:
+            # a retracted request: its items may have been materialized before and released at prefill end
+            setattr(obj, arc_lazy_media.MATERIALIZE_ATTR, done | frozenset(recv_obj.hashes))
+            task = asyncio.create_task(self._arc_mm_refill(obj))
+            self._arc_mm_resend_tasks.add(task)
+            task.add_done_callback(self._arc_mm_resend_tasks.discard)
+            return
         if set(recv_obj.hashes) <= done:
             # the frontend already sent these with their pixels: a bug, not a cache event; fail this request
             self._arc_mm_fail(
@@ -3383,6 +3390,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         except Exception as e:
             logger.exception("%s: resending rid=%s failed", arc_lazy_media.ENV, obj.rid)
             self._arc_mm_fail(obj.rid, f"resending failed: {e!r}")
+
+    async def _arc_mm_refill(self, obj):
+        try:
+            tokenized_obj = await self._tokenize_one_request(obj)
+            tokenized_obj.arc_mm_refill = True
+            await self._send_one_request(tokenized_obj)
+        except Exception as e:
+            logger.exception("arc mm refill: rid=%s failed", obj.rid)
+            # the scheduler holds the request parked: abort it there, which finishes it here with this reason
+            state = self.rid_to_state.get(obj.rid)
+            if state is not None:
+                state.abort_sent = True
+            self._dispatch_to_scheduler(
+                AbortReq(
+                    rid=obj.rid,
+                    finished_reason={
+                        "type": "abort",
+                        "status_code": HTTPStatus.INTERNAL_SERVER_ERROR,
+                        "message": f"arc mm refill of a retracted request failed: {e!r}",
+                    },
+                )
+            )
 
     def _arc_mm_fail(self, rid: str, message: str):
         logger.error("%s: rid=%s: %s", arc_lazy_media.ENV, rid, message)

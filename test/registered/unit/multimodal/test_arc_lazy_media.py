@@ -24,6 +24,7 @@ from sglang.srt.multimodal.arc_lazy_media import (  # noqa: E402
     LAZY_KEY,
     MediaMeta,
     MediaMetaCache,
+    featureless_hashes,
     items_to_materialize,
     pad_runs,
     splice_blocks,
@@ -114,6 +115,18 @@ def test_items_to_materialize():
     assert items_to_materialize(inputs, 22) == [last.hash, new.hash]
     assert items_to_materialize(inputs, 0) == [old.hash, last.hash, new.hash]
     assert items_to_materialize(_Inputs([new]), 0) == []
+
+
+def test_featureless_hashes():
+    # a retracted request gets back every item without a feature: lazy ones and ones released at prefill end
+    lazy = _item(11, [(2, 5)], lazy=True)
+    released = _item(12, [(8, 11)], lazy=False)
+    released.feature = None
+    kept = _item(13, [(20, 23)], lazy=False)
+    assert kept.feature is not None
+    assert featureless_hashes(_Inputs([lazy, released, kept])) == [lazy.hash, released.hash]
+    assert featureless_hashes(_Inputs([kept])) == []
+    assert featureless_hashes(None) == []
 
 
 def _rows(item_index, n):

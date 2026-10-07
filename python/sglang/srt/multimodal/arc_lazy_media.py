@@ -202,6 +202,20 @@ def item_needs_feature(item, prefix_len: int) -> bool:
     return any(end >= prefix_len for _, end in item.offsets)
 
 
+def featureless_hashes(mm_inputs) -> List[int]:
+    """Hashes of the items that carry no feature: lazy ones, and with ARC_MM_RELEASE_AFTER_PREFILL=1 every item of a
+    request whose prefill completed. A retracted request is prefilled again from scratch and needs them back."""
+    if mm_inputs is None:
+        return []
+    hashes = []
+    for item in mm_inputs.mm_items:
+        if item is None or item.feature is not None or item.precomputed_embeddings is not None:
+            continue
+        if item.hash not in hashes:
+            hashes.append(item.hash)
+    return hashes
+
+
 def items_to_materialize(mm_inputs, prefix_len: int) -> List[int]:
     """If a prefill starting at ``prefix_len`` would have to embed a lazy item (no feature): the hashes of every item
     it would embed, lazy or not -- the resent request is processed afresh, and an item that was new (sent with its

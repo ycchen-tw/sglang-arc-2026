@@ -1078,6 +1078,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[str] = None
 
+    # arc: the media features of a retracted request parked in the scheduler (ArcMmRematerializeReq refill=True),
+    # not a new request
+    arc_mm_refill: bool = False
+
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
 
@@ -2065,9 +2069,14 @@ class AbortReq(BaseReq, kw_only=True):
 
 class ArcMmRematerializeReq(BaseReq, kw_only=True):
     """Scheduler-to-tokenizer (arc lazy media, ARC_MM_LAZY_MEDIA=1): the request was taken out of the waiting queue
-    because these lazy items (hashes) overlap its extend; process it again with them materialized and resend it."""
+    because these lazy items (hashes) overlap its extend; process it again with them materialized and resend it.
+
+    refill=True (a retracted request, lazy media or ARC_MM_RELEASE_AFTER_PREFILL): the scheduler keeps the request and
+    its output so far; process it again with these items materialized and send it back with arc_mm_refill=True, from
+    which the scheduler takes only these items' features."""
 
     hashes: List[int]
+    refill: bool = False
 
 
 class EncoderDispatchErrorReq(BaseReq, kw_only=True):
