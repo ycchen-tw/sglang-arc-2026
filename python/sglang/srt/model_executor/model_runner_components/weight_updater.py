@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import dataclasses
 import gc
+import json
 import logging
 import os
+import struct
+import types
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
 import torch
@@ -52,6 +56,119 @@ def _unsupported_derived_weight_cache_error() -> Optional[str]:
             "split would keep serving the old weights."
         )
     return None
+
+
+_SAFETENSORS_DTYPES = {
+    "F64": torch.float64,
+    "F32": torch.float32,
+    "F16": torch.float16,
+    "BF16": torch.bfloat16,
+    "F8_E4M3": torch.float8_e4m3fn,
+    "F8_E5M2": torch.float8_e5m2,
+    "I64": torch.int64,
+    "I32": torch.int32,
+    "I16": torch.int16,
+    "I8": torch.int8,
+    "U8": torch.uint8,
+    "BOOL": torch.bool,
+}
+
+
+def _safetensors_tensors(path: str) -> List[Tuple[str, torch.Tensor]]:
+    """``(name, meta tensor)`` of every tensor a safetensors file holds, from
+    its header alone (no tensor data is read)."""
+    with open(path, "rb") as f:
+        (header_len,) = struct.unpack("<Q", f.read(8))
+        header = json.loads(f.read(header_len))
+    header.pop("__metadata__", None)
+    out = []
+    for name, info in header.items():
+        if info["dtype"] not in _SAFETENSORS_DTYPES:
+            raise ValueError(f"{path}: {name} has dtype {info['dtype']}")
+        out.append(
+            (
+                name,
+                torch.empty(
+                    info["shape"],
+                    dtype=_SAFETENSORS_DTYPES[info["dtype"]],
+                    device="meta",
+                ),
+            )
+        )
+    return out
+
+
+class _DryRunModel:
+    """The model as its own ``load_weights`` sees it, with nothing to write
+    into: every parameter is a recorder whose ``weight_loader`` notes the call,
+    buffers are meta tensors, and there are no submodules (so no model-specific
+    side path -- PLE shards, fused-weight finalization -- runs). Everything else
+    (config, layer range, helper methods, rebound to this proxy) is the model's.
+    """
+
+    def __init__(self, model: torch.nn.Module, record: Callable[[str], None]):
+        self._model = model
+        self._params = {
+            name: SimpleNamespace(
+                weight_loader=lambda *args, _name=name, **kwargs: record(_name)
+            )
+            for name, _ in model.named_parameters(remove_duplicate=False)
+        }
+        self._buffers = {
+            name: torch.empty_like(buf, device="meta")
+            for name, buf in model.named_buffers()
+        }
+
+    def named_parameters(self, *args, **kwargs):
+        return iter(self._params.items())
+
+    def named_buffers(self, *args, **kwargs):
+        return iter(self._buffers.items())
+
+    def named_modules(self, *args, **kwargs):
+        return iter(())
+
+    def modules(self):
+        return iter(())
+
+    def __getattr__(self, name: str):
+        attr = getattr(self._model, name)
+        if isinstance(attr, types.MethodType) and attr.__self__ is self._model:
+            return types.MethodType(attr.__func__, self)
+        return attr
+
+
+def keep_identity_load_plan(
+    model: torch.nn.Module, weight_files: List[str]
+) -> Tuple[int, int, List[str]]:
+    """Run the model's own ``load_weights`` over the delta's tensor names and
+    shapes (meta tensors, recorder parameters: nothing is written) and return
+    ``(tensors, weight_loader calls, names that reached no parameter)``.
+
+    A name the loader skips -- an MTP or vision weight, a layer outside this
+    rank's range, a misspelled or renamed key, a ``*_scale`` -- reaches no
+    weight_loader here, exactly as it would be dropped silently in the real
+    load. A name that takes a path writing outside a weight_loader (PLE shards,
+    buffers) is reported as unmapped too: keep_identity does not verify those.
+    """
+    current: List[Optional[str]] = [None]
+    calls = {}
+
+    def record(param_name: str) -> None:
+        calls[current[0]].append(param_name)
+
+    def tensors():
+        for path in weight_files:
+            for name, tensor in _safetensors_tensors(path):
+                if name in calls:
+                    raise ValueError(f"{name} appears twice in {weight_files}")
+                current[0] = name
+                calls[name] = []
+                yield name, tensor
+
+    type(model).load_weights(_DryRunModel(model, record), tensors())
+    unmapped = [name for name, hit in calls.items() if not hit]
+    return len(calls), sum(len(hit) for hit in calls.values()), unmapped
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -266,15 +383,63 @@ class WeightUpdater:
             DefaultModelLoader.Source.init_new(self.model_config, model),
             model_or_path=model_path,
         )
+        try:
+            hf_folder, files, use_safetensors = loader._prepare_weights(
+                source.model_or_path,
+                source.revision,
+                source.fall_back_to_pt,
+                source.allow_patterns_overrides,
+            )
+        except Exception as e:
+            return False, f"Failed to find weights in {model_path}: {e}.", False
+        if not use_safetensors:
+            return False, f"keep_identity: {model_path} has no safetensors.", False
+        # Every tensor of the delta must reach a parameter: the loader drops
+        # unknown names silently, and a delta that half-applies is worse than
+        # one refused.
+        try:
+            n_tensors, n_writes, unmapped = keep_identity_load_plan(model, files)
+        except Exception as e:
+            return (
+                False,
+                f"keep_identity: the names of {model_path} could not be checked "
+                f"against the model's loader: {e!r}. Nothing was loaded.",
+                False,
+            )
+        if unmapped:
+            return (
+                False,
+                f"keep_identity: {len(unmapped)} of {n_tensors} tensors in "
+                f"{model_path} map onto no model parameter (e.g. {unmapped[:5]}). "
+                "Nothing was loaded.",
+                False,
+            )
+        consumed = [0]
+
+        def counted(weights):
+            for item in weights:
+                consumed[0] += 1
+                yield item
+
         with set_default_torch_dtype(self.model_config.dtype):
             try:
-                weights = loader._get_weights_iterator(source)
+                weights = loader._get_weights_iterator(
+                    source,
+                    resolved_source=DefaultModelLoader.ResolvedSource(
+                        source, hf_folder, tuple(files), use_safetensors
+                    ),
+                )
             except Exception as e:
                 return False, f"Failed to get weights iterator for {model_path}: {e}.", False
             try:
                 loader.load_weights_and_postprocess(
-                    model, weights, torch.device(self.device)
+                    model, counted(weights), torch.device(self.device)
                 )
+                if consumed[0] != n_tensors:
+                    raise RuntimeError(
+                        f"the load consumed {consumed[0]} tensors, the plan has "
+                        f"{n_tensors}"
+                    )
             except Exception as e:
                 logger.exception(
                     "keep_identity weight update from %s failed after loading started",
@@ -297,8 +462,12 @@ class WeightUpdater:
         ):
             self.recapture_cuda_graph()
 
-        logger.info("Update weights (keep identity) end.")
-        return True, f"Succeeded to update model weights from {model_path}.", True
+        message = (
+            f"Succeeded to update model weights from {model_path}: {n_tensors} "
+            f"tensors, {n_writes} weight_loader writes."
+        )
+        logger.info("Update weights (keep identity) end. %s", message)
+        return True, message, True
 
     def update_weights_from_distributed(
         self: WeightUpdater,

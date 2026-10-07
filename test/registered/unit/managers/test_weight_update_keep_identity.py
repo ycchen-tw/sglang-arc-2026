@@ -2,12 +2,13 @@
 
 The scheduler side (refuse / poison / succeed, every decision agreed over the TP
 group, the fence around the write, no assert on a failed flush), the model
-runner side (identity kept, no rollback) and the TokenizerManager side (served
+runner side (identity kept, no rollback, every delta name mapped onto a
+parameter before anything is written) and the TokenizerManager side (served
 name kept, weights_source, the poisoned gate on generate).
 """
 
 import asyncio
-import dataclasses
+import itertools
 import os
 import tempfile
 import unittest
@@ -15,6 +16,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+from safetensors.torch import load_file, save_file
 
 from sglang.srt.managers.io_struct import (
     GenerateReqInput,
@@ -32,6 +34,8 @@ from sglang.srt.model_executor.model_runner_components import (
     weight_updater as runner_wu,
 )
 from sglang.srt.model_loader.loader import DefaultModelLoader
+from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.qwen4_exp import Qwen4ExpForConditionalGeneration
 from sglang.srt.utils.aio_rwlock import RWLock
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -244,24 +248,68 @@ class SchedulerDefaultPathTest(CustomTestCase):
         self.assertEqual(len(syncs), 2)
 
 
-class _Loader(DefaultModelLoader):
-    """A DefaultModelLoader whose disk side is scripted."""
+def _write_delta(directory, tensors):
+    os.makedirs(directory, exist_ok=True)
+    save_file(tensors, os.path.join(directory, "model.safetensors"))
 
-    def __init__(self, fail_iter=False, fail_load=False):
+
+class _ToyModel(torch.nn.Module):
+    """q/k/v stack onto one parameter through its weight_loader; o_proj takes the
+    default loader; an unknown name is dropped silently, as Qwen4-Exp's loader
+    drops a name it cannot place."""
+
+    def __init__(self):
+        super().__init__()
+        self.qkv_proj = torch.nn.Parameter(torch.zeros(6, 2), requires_grad=False)
+        self.o_proj = torch.nn.Parameter(torch.zeros(2, 2), requires_grad=False)
+        self.qkv_proj.weight_loader = self._stacked
+
+    @staticmethod
+    def _stacked(param, loaded_weight, shard_id):
+        param.data[shard_id : shard_id + 2].copy_(loaded_weight)
+
+    def load_weights(self, weights):
+        params = dict(self.named_parameters(remove_duplicate=False))
+        for name, weight in weights:
+            for shard, offset in (("q_proj", 0), ("k_proj", 2), ("v_proj", 4)):
+                if name.startswith(shard):
+                    param = params["qkv_proj"]
+                    param.weight_loader(param, weight, offset)
+                    break
+            else:
+                name = name.removesuffix(".weight")
+                if name in params:
+                    param = params[name]
+                    getattr(param, "weight_loader", default_weight_loader)(
+                        param, weight
+                    )
+
+
+class _Loader(DefaultModelLoader):
+    """A DefaultModelLoader over one local safetensors file, without the
+    process-global load config."""
+
+    def __init__(self, fail_load=False, consume=None):
         self.sources = []
         self.loads = 0
-        self.fail_iter = fail_iter
         self.fail_load = fail_load
+        self.consume = consume
 
-    def _get_weights_iterator(self, source, **kwargs):
-        self.sources.append(source)
-        if self.fail_iter:
-            raise RuntimeError("no weights")
-        return iter([("w", torch.zeros(1))])
+    def _prepare_weights(self, model_or_path, revision, fall_back_to_pt, overrides):
+        path = os.path.join(model_or_path, "model.safetensors")
+        if not os.path.isfile(path):
+            raise RuntimeError(f"Cannot find any model weights with `{model_or_path}`")
+        return model_or_path, [path], True
+
+    def _get_weights_iterator(self, source, *, resolved_source=None, **kwargs):
+        self.sources.append((source, resolved_source))
+        return iter(load_file(resolved_source.weight_files[0]).items())
 
     def load_weights_and_postprocess(self, model, weights, target_device):
         self.loads += 1
-        list(weights)
+        if self.consume is not None:
+            weights = itertools.islice(weights, self.consume)
+        model.load_weights(weights)
         if self.fail_load:
             raise RuntimeError("shape mismatch")
 
@@ -271,7 +319,13 @@ class RunnerKeepIdentityTest(CustomTestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.delta = os.path.join(self.tmp.name, "v000003")
-        os.mkdir(self.delta)
+        self.tensors = {
+            "q_proj.weight": torch.full((2, 2), 1.0),
+            "k_proj.weight": torch.full((2, 2), 2.0),
+            "v_proj.weight": torch.full((2, 2), 3.0),
+            "o_proj.weight": torch.full((2, 2), 4.0),
+        }
+        _write_delta(self.delta, self.tensors)
         for name, value in (
             ("get_model", lambda: SimpleNamespace(weight_cache_mode="off")),
             ("_unsupported_derived_weight_cache_error", lambda: None),
@@ -286,6 +340,7 @@ class RunnerKeepIdentityTest(CustomTestCase):
             model_path="/base", revision=None, dtype=torch.float32
         )
         self.loader = loader
+        self.model = _ToyModel()
         self.fields_updated = []
         patcher = patch.object(runner_wu, "get_model_loader", lambda *a: loader)
         patcher.start()
@@ -296,23 +351,56 @@ class RunnerKeepIdentityTest(CustomTestCase):
             gpu_id=0,
             model_config=self.model_config,
             custom_weight_loaders={},
-            get_model=lambda: torch.nn.Linear(1, 1),
+            get_model=lambda: self.model,
             update_model_fields=lambda *a, **k: self.fields_updated.append(k),
             recapture_cuda_graph=lambda: None,
             get_model_runner=lambda: SimpleNamespace(is_draft_worker=draft),
         )
 
-    def test_identity_is_kept(self):
+    def _untouched(self):
+        return all(not bool(p.any()) for p in self.model.parameters())
+
+    def test_identity_is_kept_and_every_tensor_written(self):
         """The delta is read through a source override; model_path and the runner record stay."""
         updater = self._updater(_Loader())
         ok, message, touched = updater.update_weights_from_disk_keep_identity(
             self.delta, None
         )
         self.assertTrue(ok and touched, message)
+        self.assertIn("4 tensors, 4 weight_loader writes", message)
         self.assertEqual(self.model_config.model_path, "/base")
         self.assertEqual(self.fields_updated, [])
-        (source,) = self.loader.sources
+        ((source, resolved),) = self.loader.sources
         self.assertEqual(source.model_or_path, self.delta)
+        self.assertEqual(
+            resolved.weight_files, (os.path.join(self.delta, "model.safetensors"),)
+        )
+        self.assertTrue(
+            torch.equal(self.model.qkv_proj[4:], self.tensors["v_proj.weight"])
+        )
+        self.assertTrue(torch.equal(self.model.o_proj, self.tensors["o_proj.weight"]))
+
+    def test_a_name_no_parameter_takes_is_refused_before_any_write(self):
+        """The loader would drop it silently and report success; keep_identity refuses the whole delta."""
+        _write_delta(self.delta, {**self.tensors, "o_prj.weight": torch.ones(2, 2)})
+        updater = self._updater(_Loader())
+        ok, message, touched = updater.update_weights_from_disk_keep_identity(
+            self.delta, None
+        )
+        self.assertFalse(ok or touched)
+        self.assertIn("1 of 5 tensors", message)
+        self.assertIn("o_prj.weight", message)
+        self.assertEqual(self.loader.loads, 0)
+        self.assertTrue(self._untouched())
+
+    def test_a_load_that_consumes_less_than_planned_is_touched(self):
+        updater = self._updater(_Loader(consume=2))
+        ok, message, touched = updater.update_weights_from_disk_keep_identity(
+            self.delta, None
+        )
+        self.assertFalse(ok)
+        self.assertTrue(touched)
+        self.assertIn("consumed 2 tensors, the plan has 4", message)
 
     def test_no_rollback_after_a_failed_load(self):
         """The default path reloads from the delta it just pointed model_path at; this must not."""
@@ -327,19 +415,113 @@ class RunnerKeepIdentityTest(CustomTestCase):
         self.assertEqual(self.model_config.model_path, "/base")
 
     def test_failures_before_any_write_are_untouched(self):
-        updater = self._updater(_Loader(fail_iter=True))
-        ok, _, touched = updater.update_weights_from_disk_keep_identity(self.delta, None)
+        empty = os.path.join(self.tmp.name, "empty")
+        os.mkdir(empty)
+        updater = self._updater(_Loader())
+        ok, message, touched = updater.update_weights_from_disk_keep_identity(
+            empty, None
+        )
         self.assertFalse(ok or touched)
+        self.assertIn("Cannot find any model weights", message)
         ok, message, touched = updater.update_weights_from_disk_keep_identity(
             os.path.join(self.tmp.name, "missing"), None
         )
         self.assertFalse(ok or touched)
         self.assertIn("not a directory", message)
+        self.assertEqual(self.loader.loads, 0)
+        self.assertTrue(self._untouched())
 
     def test_draft_runner_raises(self):
         updater = self._updater(_Loader(), draft=True)
         with self.assertRaises(RuntimeError):
             updater.update_weights_from_disk_keep_identity(self.delta, None)
+
+
+class _TinyQwen4Exp(Qwen4ExpForConditionalGeneration):
+    """Qwen4-Exp's own load_weights over a handful of named parameters, each
+    with a weight_loader that must never run during a plan."""
+
+    def __init__(self, param_names):
+        torch.nn.Module.__init__(self)
+        self.config = SimpleNamespace(
+            num_experts=None,
+            tie_word_embeddings=False,
+            text_config=SimpleNamespace(split_ngram_parts=512),
+            encoder_only=False,
+        )
+        self.language_model_only = True
+        self.pp_group = SimpleNamespace(is_last_rank=True)
+        self.model = SimpleNamespace(start_layer=0, end_layer=4)  # the layer-range properties read it
+        self._fake = {}
+        for name in param_names:
+            param = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
+            param.weight_loader = self._never
+            self._fake[name] = param
+
+    @staticmethod
+    def _never(*args, **kwargs):
+        raise AssertionError("a plan wrote a parameter")
+
+    def named_parameters(self, *args, **kwargs):
+        return iter(self._fake.items())
+
+    def named_buffers(self, *args, **kwargs):
+        return iter(())
+
+
+class LoadPlanTest(CustomTestCase):
+    """keep_identity_load_plan against the real Qwen4-Exp loader (checkpoint
+    names: model.language_model.layers.N.{self_attn,linear_attn}.*)."""
+
+    PARAMS = [
+        "model.layers.0.linear_attn.in_proj_qkvz.weight",
+        "model.layers.0.linear_attn.in_proj_ba.weight",
+        "model.layers.0.linear_attn.out_proj.weight",
+        "model.layers.3.qkv_proj.weight",
+        "model.layers.3.o_proj.weight",
+    ]
+    DELTA = [
+        "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+        "model.language_model.layers.0.linear_attn.in_proj_z.weight",
+        "model.language_model.layers.0.linear_attn.in_proj_b.weight",
+        "model.language_model.layers.0.linear_attn.in_proj_a.weight",
+        "model.language_model.layers.0.linear_attn.out_proj.weight",
+        "model.language_model.layers.3.self_attn.q_proj.weight",
+        "model.language_model.layers.3.self_attn.k_proj.weight",
+        "model.language_model.layers.3.self_attn.v_proj.weight",
+        "model.language_model.layers.3.self_attn.o_proj.weight",
+    ]
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _plan(self, names):
+        path = os.path.join(self.tmp.name, "model.safetensors")
+        save_file({n: torch.zeros(2, 2, dtype=torch.bfloat16) for n in names}, path)
+        return runner_wu.keep_identity_load_plan(_TinyQwen4Exp(self.PARAMS), [path])
+
+    def test_a_merged_lora_delta_maps_completely(self):
+        self.assertEqual(self._plan(self.DELTA), (9, 9, []))
+
+    def test_names_the_loader_would_drop(self):
+        for bad in (
+            "model.language_model.layers.3.self_attn.q_prj.weight",  # misspelled
+            "model.language_model.layers.7.self_attn.q_proj.weight",  # outside the layer range
+            "model.language_model.layers.2.self_attn.q_proj.weight",  # no such parameter
+            "mtp.layers.0.self_attn.q_proj.weight",  # MTP: the target loader skips it
+            "model.visual.blocks.0.attn.qkv.weight",  # vision tower, language-only model
+        ):
+            self.assertEqual(self._plan(self.DELTA + [bad]), (10, 9, [bad]), bad)
+
+    def test_header_is_read_without_tensor_data(self):
+        path = os.path.join(self.tmp.name, "model.safetensors")
+        save_file({"a": torch.ones(3, 5, dtype=torch.bfloat16)}, path)
+        ((name, tensor),) = runner_wu._safetensors_tensors(path)
+        self.assertEqual(
+            (name, tuple(tensor.shape), tensor.dtype), ("a", (3, 5), torch.bfloat16)
+        )
+        self.assertTrue(tensor.is_meta)
 
 
 class TokenizerManagerKeepIdentityTest(CustomTestCase):
