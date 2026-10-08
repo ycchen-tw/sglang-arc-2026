@@ -156,6 +156,17 @@ class GroupedConv(nn.Module):
 STRICT_SYNC = os.environ.get("MTP3_STRICT_SYNC") == "1"
 
 
+# ARC_DFLASH_REFRESH_ASYNC=1 (opt-in, default 0; the worker requires ARC_DFLASH_EXACT_PREFILL=1): the prefill refresh
+# (refresh, DraftRequest.refresh_committed, StatePool.read_request) checks its positions and pending commits with
+# `require` instead of torch.equal / any() / int(), and the worker reads window cursors from a host mirror and parked
+# slots from a snapshot taken at park time (worker.py). Each of those reads synchronized the forward stream: the first
+# one waited for the target's whole extend forward, the rest launched the refresh from an empty GPU queue.
+ASYNC_REFRESH = os.environ.get("ARC_DFLASH_REFRESH_ASYNC", "0")
+if ASYNC_REFRESH not in ("0", "1"):
+    raise ValueError(f"ARC_DFLASH_REFRESH_ASYNC must be 0 or 1, got {ASYNC_REFRESH!r}")
+ASYNC_REFRESH = ASYNC_REFRESH == "1"
+
+
 def require(condition, message):
     """Assert a 0-dim boolean tensor without a device->host round trip."""
     if STRICT_SYNC:
@@ -585,12 +596,19 @@ class MTP3(nn.Module):
         if tokens.shape != positions.shape or tokens.shape[1] == 0:
             raise ValueError("refresh needs nonempty aligned tokens and positions")
         expected = positions[:, :1] + torch.arange(positions.shape[1], device=positions.device)
-        if not torch.equal(positions, expected):
-            raise ValueError("refresh positions must be consecutive")
-        if (positions < 1).any():
-            raise ValueError("position 0 has no predecessor GR; the draft context starts at position 1")
-        if prefix is not None and not torch.equal(positions[:, 0], prefix.positions[:, -1] + 1):
-            raise ValueError("refresh must append each committed position exactly once")
+        if ASYNC_REFRESH:
+            require((positions == expected).all(), "refresh positions must be consecutive")
+            require((positions >= 1).all(), "position 0 has no predecessor GR; the draft context starts at position 1")
+            if prefix is not None:
+                require((positions[:, 0] == prefix.positions[:, -1] + 1).all(),
+                        "refresh must append each committed position exactly once")
+        else:
+            if not torch.equal(positions, expected):
+                raise ValueError("refresh positions must be consecutive")
+            if (positions < 1).any():
+                raise ValueError("position 0 has no predecessor GR; the draft context starts at position 1")
+            if prefix is not None and not torch.equal(positions[:, 0], prefix.positions[:, -1] + 1):
+                raise ValueError("refresh must append each committed position exactly once")
         # Deliberately the class function, not `self(...)`: serving replaces the
         # instance's `forward` with a compiled one specialized on shape, and a
         # prefill chunk is as long as the prompt leaves it. Compiling those is

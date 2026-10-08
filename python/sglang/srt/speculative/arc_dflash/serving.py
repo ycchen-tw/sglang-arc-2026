@@ -16,7 +16,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
-from .model import CleanCache, LayerCache, canonical, require, row_of_block
+from .model import ASYNC_REFRESH, CleanCache, LayerCache, canonical, require, row_of_block
 from .sampling import propose_path
 
 
@@ -186,7 +186,9 @@ class DraftRequest:
         """
         if gr is None or gr.shape[1] != committed_tokens.shape[1] + 1:
             raise ValueError("need one predecessor GR per committed token plus the new cursor GR")
-        if not torch.equal(positions[:, 0], self.last_position + 1):
+        if ASYNC_REFRESH:
+            require((positions[:, 0] == self.last_position + 1).all(), "commit must follow the current cursor")
+        elif not torch.equal(positions[:, 0], self.last_position + 1):
             raise ValueError("commit must follow the current cursor")
         if self.pending is not None:
             raise RuntimeError("refresh_committed cannot run with a commit still pending")

@@ -53,7 +53,9 @@ tail with the true predecessor GR). Only a chunk whose history never reached the
 finished request of a session whose whole prompt reached the drafter keeps its slot (parked, given back oldest first
 when a slot is needed; a request ended between prompt chunks is released), and the session's next request takes the
 window over when its ids equal the parked request's on every position the window has read; it then appends only
-what lies past the window.
+what lies past the window. ARC_DFLASH_REFRESH_ASYNC=1 (opt-in, needs EXACT_PREFILL) runs that refresh without a host
+read of device state: the windows' cursors come from a host mirror kept by prefill (`window_end`, dropped once the
+request decodes), a parked slot's from a snapshot copied at park time, and the position checks are device asserts.
 """
 
 from __future__ import annotations
@@ -73,7 +75,7 @@ from torch import nn
 
 from . import drafter_dir, fast_drafter, serving
 from .heads import TargetEmbedding, build_head
-from .model import MTP3, CleanCache, Config, LayerCache
+from .model import ASYNC_REFRESH, MTP3, CleanCache, Config, LayerCache
 from .state_pool import RingStatePool, StatePool
 
 logger = logging.getLogger(__name__)
@@ -430,6 +432,10 @@ class DFlashDraftWorker:
         self.session_park = _env_flag("ARC_DFLASH_SESSION_PARK")
         if self.session_park and not self.exact_prefill:
             raise ValueError("ARC_DFLASH_SESSION_PARK=1 needs ARC_DFLASH_EXACT_PREFILL=1")
+        if ASYNC_REFRESH and not self.exact_prefill:
+            raise ValueError("ARC_DFLASH_REFRESH_ASYNC=1 needs ARC_DFLASH_EXACT_PREFILL=1")
+        # the stream every forward (prefill refresh, decode step) runs on; park snapshots are queued on it
+        self.forward_stream = target_worker.model_runner.forward_stream
         self.evict_cycles = _env_int("ARC_DFLASH_EVICT_CYCLES", 512)
         self.use_graphs = os.environ.get("ARC_DFLASH_GRAPH", "1") == "1"
         begin = time.monotonic()
@@ -523,9 +529,13 @@ class DFlashDraftWorker:
         # rid -> Req, SESSION_PARK only: session requests whose last prefill chunk completed their prompt, the ones a
         # finish parks (a request decodes only from here)
         self.live_reqs = {}
-        self.parked = collections.OrderedDict()  # session id -> (slot, ids of the request that parked it), oldest first
+        # session id -> (slot, ids of the request that parked it, REFRESH_ASYNC's StatePool.snapshot or None), oldest first
+        self.parked = collections.OrderedDict()
         self.adopted = set()  # rids holding a parked window: it may already cover the start of their next chunk
         self.carry = {}  # rid -> (position, GR) of the last row of a chunk that lies wholly before the prompt's tail
+        # ARC_DFLASH_REFRESH_ASYNC: rid -> the cursor prefill left in the request's window (no pending commit), until
+        # the request decodes; _window_cursor reads it instead of the device
+        self.window_end = {}
         self.state_stats = collections.Counter()
 
     # ---- EagleDraftWorker surface used by EAGLEWorkerV2 / the scheduler ----------------------------------------
@@ -613,6 +623,7 @@ class DFlashDraftWorker:
         self.live_reqs.pop(rid, None)
         self.adopted.discard(rid)
         self.carry.pop(rid, None)
+        self.window_end.pop(rid, None)
 
     def clear_cache_pool(self):
         for rid in list(self.pool.slot_of):
@@ -630,7 +641,8 @@ class DFlashDraftWorker:
         if old is not None:
             self.pool.free_slot(old[0])
             self.state_stats["park_replaced"] += 1
-        self.parked[req.session_id] = (slot, _ids(req))
+        snapshot = self.pool.snapshot(slot, self.forward_stream) if ASYNC_REFRESH else None
+        self.parked[req.session_id] = (slot, _ids(req), snapshot)
         self.state_stats["park"] += 1
 
     def _make_room(self, rid):
@@ -694,6 +706,9 @@ class DFlashDraftWorker:
                 f"!= [{ids.numel()}, {c.hc_count * c.hidden_size}]"
             )
         gr = target_hidden_states.view(-1, c.hc_count, c.hidden_size)
+        if ASYNC_REFRESH and self.forward_stream is not None and torch.cuda.current_stream() != self.forward_stream:
+            raise RuntimeError("ARC_DFLASH_REFRESH_ASYNC: the prefill refresh runs off the forward stream, which the "
+                               "park snapshots are ordered on")
         offset = 0
         begin = time.perf_counter()
         for req, length, start in zip(batch.reqs, batch.extend_lens, batch.prefix_lens, strict=True):
@@ -782,6 +797,8 @@ class DFlashDraftWorker:
         if total == 1:  # a one-token prompt (/health): as the legacy path
             self._make_room(rid)
             self.pool.write_request(rid, self._blank_state(gr[None, 0].clone(), start))
+            if ASYNC_REFRESH:
+                self.window_end[rid] = start
             return
         tail = max(1, total - self.receptive)  # position 0 has no predecessor GR
         cursor = self._window_cursor(rid, start)
@@ -791,6 +808,8 @@ class DFlashDraftWorker:
             skip = cursor + 1 - start  # start .. cursor are in the window already
             if skip < n:
                 self._append(rid, tokens[skip:], gr[skip:], start + skip)
+            if ASYNC_REFRESH:
+                self.window_end[rid] = max(cursor, end - 1)
             return
         if cursor is not None:  # an adopted window older than the tail: the result does not depend on it
             self.state_stats["park_stale"] += 1
@@ -823,6 +842,8 @@ class DFlashDraftWorker:
         self.pool.write_request(rid, serving.DraftRequest(
             serving.decode_cache(cache, self.model.config.window), gr[None, -1].clone(), positions[:, -1].clone()
         ))
+        if ASYNC_REFRESH:
+            self.window_end[rid] = end - 1
 
     def _window_cursor(self, rid, start):
         """Where the request's window ends, if a chunk at `start` continues it; any other window is dropped (a
@@ -830,7 +851,10 @@ class DFlashDraftWorker:
         slot = self.pool.slot_of.get(rid)
         if slot is None:
             return None
-        last, pending = torch.stack((self.pool.last_position[slot], self.pool.pending_length[slot])).tolist()
+        if rid in self.window_end:  # REFRESH_ASYNC: prefill wrote this window and the request has not decoded since
+            last, pending = self.window_end[rid], 0
+        else:  # a window decode moved on (a retracted request), or the synchronous refresh
+            last, pending = torch.stack((self.pool.last_position[slot], self.pool.pending_length[slot])).tolist()
         if pending == 0 and (last + 1 == start or (rid in self.adopted and start <= last + 1)):
             return last
         self._forget(rid)
@@ -856,8 +880,8 @@ class DFlashDraftWorker:
         if parked is None:
             self.state_stats["park_none" if req.session_id is not None else "no_session"] += 1
             return None
-        slot, parked_ids = parked
-        cursor = self.pool.settle(slot)
+        slot, parked_ids, snapshot = parked
+        cursor = self.pool.settle(slot, snapshot)
         ids = _ids(req)
         if cursor < 1:
             why = "blank"  # a one-token prompt's placeholder window
@@ -1042,5 +1066,7 @@ class DFlashDraftWorker:
         tokens = verify.draft_token.view(bs, k).to(torch.long)
         positions = batch.seq_lens.view(bs, 1).to(torch.long) + torch.arange(k, device=self.device)
         slots = self._slots([req.rid for req in batch.reqs])
+        for req in batch.reqs:  # the commit below moves these windows' cursors: the prefill mirror is stale
+            self.window_end.pop(req.rid, None)
         predecessors = torch.cat((self.pool.last_gr[slots][:, None], gr), 1)
         self.pool.defer_commit(slots, tokens, predecessors, positions, batch_result.accept_lens.to(torch.long))
