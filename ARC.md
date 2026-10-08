@@ -84,7 +84,7 @@
   - `ARC_DFLASH_REFRESH_ASYNC=1`（需 `ARC_DFLASH_EXACT_PREFILL=1`，否則起服 raise）：prefill refresh 的 position 檢查改成 device assert（`require`），window 的 cursor 由 prefill 寫的 host 鏡像提供（請求 decode 後丟棄），停車 slot 的 (cursor, pending, window end) 在停車時於 forward stream 複製到 pinned memory，`settle` 讀那份。refresh 不在 forward stream 上會 raise。G4：refresh 每批 GPU −4.2 ms（−17%）、CPU −10 ms（按請求數×token 分 bin 對齊）。
   - `ARC_RS_FUSED_SOFTMAX=1`（需 `ARC_DFLASH_SPARSE_Q=1`，否則 raise）：verify 直接從 target logits 做 sparse-q rejection sampling（`reject_sampling.chain_speculative_sampling_sparse_q_from_logits`），先逐列算 div_rn(logit, T) 的 online max／sum，讀到 target 機率時才算 exp(·−M)/S，不寫出 [bs×K, vocab] 的 softmax；有 top-k／top-p 的 batch 走原路徑。精度比 torch FP32 更接近 float64；2,200 次共用亂數的判定只有 4 次不同（亂數落在邊界上）；400k 次 Monte Carlo 分布檢驗通過。kernel K=4 1.95 → 0.64 ms、K=8 3.71 → 0.93 ms；G4 decode cycle −1.3～−1.6 ms（−1.7～−2.0%），accept 長度不變。
   - 三項全開（對同一棵樹全關，按請求數×token 分 bin）：target 每批 GPU −2.5 ms、refresh −5.7 ms（−24%），decode 每輪 −1.0～−1.4 ms；gen tok/s +1.4%（第 5–16 分鐘 3,196 對 3,153，小於 run 間噪音，看分項）。
-- **RL extend 的 host 同步移除**（branch `exp/b200-perf-extend`，2026-10-08；兩個旗標都是 opt-in，沒設時行為逐位不變；GPU 只驗過和 Qwen4-Exp 的 prefill CUDA graph（`ARC_QWEN4_EXP_PREFILL_BCG=1`，下一個 commit）同開的 TP1 NVFP4，對 eager 基準逐位相同（`runs/qwen38fn_b200_perf/20261008-bcg-r3-tp1-B2`）；不開 BCG 的 eager 路徑與 TP2 還沒上 GPU）：
+- **RL extend 的 host 同步移除**（branch `exp/b200-perf-extend`，2026-10-08；兩個旗標都是 opt-in，沒設時行為逐位不變；GPU 只驗過和 `ARC_QWEN4_EXP_PREFILL_BCG=1` 同開的 TP1 NVFP4，對 eager 基準逐位相同，見下一項的 GPU 驗證結果；不開 BCG 的 eager 路徑與 TP2 還沒上 GPU）：
   - `ARC_MAMBA_TRACK_HOST=1`
     - 作用範圍：`extra_buffer` 下 plain EXTEND 的 mamba radix track。
     - 原本的問題：計算 track plan 時要從 device 把資料讀回 host，而這些讀取會同步 stream。這些讀取包括：
@@ -100,9 +100,29 @@
       - backend 用這兩份鏡像加上 `extend_{seq,prefix}_lens_cpu`，在 host 上算出所有列的選擇（`layers/attention/mamba/track_host.py`），一次 pinned 上傳。slot id 在 device 上用整數索引 `gather`。
       - 值、dtype、device 都和舊路徑相同。
     - 只有 plain EXTEND 走新路徑，decode、verify、draft-extend、mixed 都照舊。
-    - 會 raise 的情況：plain EXTEND 帶了 track mask 卻沒有鏡像，或鏡像長度對不上。已知會碰到的有 DP attention 的 `convert_decode_to_extend`。prefill CUDA graph 的 capture batch 與 replay batch 現在都帶鏡像（runner 從 capture batch 的靜態 slot 讀出、replay batch 從 live batch 帶過來），不再 raise。
+    - 會 raise 的情況：plain EXTEND 帶了 track mask 卻沒有鏡像，或鏡像長度對不上。已知會碰到的有 DP attention 的 `convert_decode_to_extend`。prefill CUDA graph 的 capture batch 與 replay batch 現在都帶鏡像（見下一項的 runner 改動），不再 raise。
     - `check` 模式：每個 extend 同時跑舊路徑，dtype、shape、device、值任何一項不同就 raise。這個模式本身會同步，只用來驗證。每比對 100 個 extend 印一行 `ARC_MAMBA_TRACK_HOST=check: all comparisons matched so far: {...}`，列出比對過的 extend、列數、checkpoint plan、slot gather 次數，用來確認這條路徑真的有跑到。另外，check 模式會把被拿掉的同步加回來，所以拿掉同步後才可能出現的 race 在這個模式下看不到，要另外用 `=1` 跑一輪驗證。
     - 測試在 `test/registered/unit/layers/test_mamba_track_host.py`，涵蓋兩件事：
       - 用隨機 batch 對舊路徑逐值比對，GDN 與 Mamba2 都有。
       - device tensor 放在 meta 上，任何 host 讀取都會 raise。舊路徑當陽性對照，確實會 raise。
   - `ARC_MROPE_EXTEND_PINNED=1`：`_compute_mrope_positions_extend` 拼出 3×token 的 int64 positions 後，先 pin 再 non_blocking 上傳，數值相同。原本從 pageable 記憶體上傳時，driver 要經 staging buffer 複製，大小超過 staging buffer 就會等 stream。
+- **Qwen4-Exp 純文字 extend 的 prefill CUDA graph**（branch `exp/b200-perf-extend`，2026-10-08；opt-in，沒設時行為不變；TP1 NVFP4 已在 GPU 上對 eager 逐位驗過，結果見本項最後；TP2 FP8 還沒）：
+  - `ARC_QWEN4_EXP_PREFILL_BCG=1`：讓 breakable（BCG）prefill runner capture Qwen4-Exp 的 transformer body（`models/qwen4_exp_prefill_bcg.py`）。
+    - capture 的部分：HC mix／combine、所有投影與 norm、RoPE、MoE（routed experts 經 `routing_replay_out` 寫靜態 buffer）、attention TP 的 all-reduce。
+    - 留 eager 的部分（BCG 斷點，replay 時從 forward context 讀當次的 batch）：
+      - GDN 核心：沿用 `RadixLinearAttention` 既有的斷點（和 Qwen3.5 相同）。
+      - QSA attention 核心：沿用 `RadixAttention` 既有的斷點，餵 `topk_indices`。
+      - QSA indexer：每個 QSA 層一個斷點。它的壓縮寫入、compressed key gather、row chunk 都依 host 上的批次長度決定，不能 capture。結果寫進 captured segment 配好的 int32 [bucket, topk 寬]，padding 列填 -1。BCG 下 indexer 不在 alt stream 上重疊。
+      - PLE：PLE 層一個斷點，裡面依當次 batch 做 prepare、跑 PLE 層、commit N-gram 歷史，輸出寫進 captured buffer。原本 commit 在最後一層之後；中間沒有任何東西讀寫 N-gram 歷史，所以模型只有一個 PLE 層時兩者等價（多於一層會 raise）。BCG 下 PLE embedding 的 prefetch 關掉（它的 buffer 依當次 token 數配置，replay 時會一直配新的）。
+    - body 在 BCG 下回傳 (hidden, hc_hidden)，runner replay 後交給 `Qwen4ExpVLModel.unpack_breakable_body_output`，所以 `logits_output.hidden_states`（DFlash drafter 讀的 GR）是 replay 出來的 HC stream。
+    - 帶媒體的 batch 一律走 eager（`can_run_graph`）。
+    - 會 raise 的情況：沒設旗標卻在 BCG 下跑 Qwen4-Exp（例如明確指定 `--cuda-graph-backend-prefill breakable`）、draft worker（native MTP 的 draft prefill 沒驗證）、DP attention、PP、QSA HiSparse、SPEC 不是 none 也不是 DFlash drafter。
+    - 開旗標時 Qwen4-Exp 加進 multimodal BCG allowlist，其他相容性規則照常適用；bucket 用 `--cuda-graph-bs-prefill` 或 `--cuda-graph-max-bs-prefill` 控制。
+  - runner 的通用改動（所有模型、不看旗標；數值不變）：replay batch 帶上 `req_pool_indices_cpu` 與 mamba track 鏡像（之前 QSA 的 prefix extend 在 replay 內會 `.tolist()`）；capture batch 的 track 鏡像從它的靜態 slot 讀出來，`ARC_MAMBA_TRACK_HOST` 因此可以和 prefill CUDA graph 一起開。
+  - CPU 測試 `test/registered/unit/models/test_qwen4_exp_prefill_bcg.py`：PLE 斷點對 eager 的三步（prepare、層、commit）在 bucket padding 下輸出與 N-gram 歷史逐位相同；indexer 斷點的列數、padding 與各種不符會 raise；VL body 的回傳契約與 unpack；runner 的 unpack、鏡像、媒體 batch 退回 eager。
+  - GPU 驗證 `scripts/arc/qwen4_exp_prefill_bcg_check.py`：同一份 build、同樣旗標的兩台 server 先後起（A 不開、B 開 `ARC_QWEN4_EXP_PREFILL_BCG=1`），兩邊都要開三個確定性旗標 `ARC_QSA_TOPK_EXACT=1 SGLANG_FLASHINFER_MOE_FUSED_FINALIZE=0 ARC_HC_MIX_DETERMINISTIC=1`，要比 routing 再加 `--enable-return-routed-experts`。先把 A 起兩次（A1、A2）互比當對照，必須逐位相同才有資格比 A 對 B。`collect` 送 exact bucket、會 padding 的長度、兩條同批、padding 隔離（iso：同一個 prompt 單獨送〔replay 補 padding row〕對比旁邊配一條補滿 bucket 的 filler 請求，各自之後再送 prompt+256 的 follow-up，接在 cached KV 與 extend 尾端 track 的 mamba state 上）、10k cached prefix 上 extend 1024（exact bucket）與 800（padding）的 case，記下每個 prompt token 的 logprob 與 top-5、16 個 greedy token 與 logprob、cached_tokens、routed experts；`compare` 要求每個 extend 都落在 exact bucket 的 case（exact、prefix、iso fill 與其 64 對齊的 follow-up）逐位相同（padding 與同批 case 只報差異：eager 跑在 M=n、graph 跑在 M=bucket，GEMM 可能選不同 tile）；`isolation` 在 graph server 上要求 iso 的 pad 對 fill：prompt 的 routed experts 與整個 follow-up 逐位相同，padding row 漏進真實 row、KV 或 GDN state 都會在這裡現形（prompt 自己的 logprob 走 eager LM head、M 不同，只報）；`log` 印 prefill capture 的時間與記憶體、KV 大小、prefill batch 走 graph 的比例與前 40 個 batch 的組成。
+  - GPU 驗證結果（2026-10-08，`scripts/arc/qwen4_exp_prefill_bcg_validate.sh` s1–s3，`RUN=r3`，arm 目錄 `runs/qwen38fn_b200_perf/20261008-bcg-r3-tp1-*`）：
+    - TP1 NVFP4、SPEC=none、18 個 bucket（16…4096）：capture 8.6–9.0 s，prefill graph 佔 2.41 GB（可用 25.58→23.17 GB）。一輪 collect 的 27 個 prefill batch 裡 25 個走 graph；走 eager 的兩個是 VLM warmup（帶圖，走媒體退回）和 8192 token 的 chunk（超過最大 bucket）。
+    - A1 對 A2（重啟＋換卡的對照）、A1 對 B1、A1 對 B2（B1 再加 `ARC_MAMBA_TRACK_HOST=1 ARC_MROPE_EXTEND_PINNED=1`）：每個 gate case 都逐位相同（prompt 與 output logprob、top-5、16 個 greedy token、48 層 routed experts、cached_tokens）。B1、B2 的 isolation 四組（17/722/1088/3328）全部逐位相同。
+    - pad case 的 A/B 差（max |Δlp| 1.7–2.8，routing 從第 0 層就分岔）是 eager 自己隨 M 變的量：A1 裡同一個 prompt 跑在 M=n 與 M=bucket，17/722/1088 差 1.8–2.9，3328 與 4096 則逐位相同。serving 本來就不是 batch-invariant，這個差不是 BCG 造成的。
+    - `ARC_MAMBA_TRACK_HOST=1` 本身不印 log；它和 BCG 旗標經同一個 `ARM_ENV` 進 unit，而 BCG 旗標確實生效（有 capture，batch 顯示 `cuda graph: True`）。

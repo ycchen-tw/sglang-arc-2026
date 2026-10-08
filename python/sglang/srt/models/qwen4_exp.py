@@ -56,8 +56,15 @@ from sglang.srt.model_executor.forward_context import (
     get_req_to_token_pool,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    get_tc_piecewise_forward_context,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models import arc_ple_nvfp4
+from sglang.srt.models import arc_ple_nvfp4, qwen4_exp_prefill_bcg
 from sglang.srt.models.qwen3_5 import (
     Qwen3_5AttentionDecoderLayer,
     Qwen3_5ForCausalLM,
@@ -130,6 +137,13 @@ class _PLEBatch(msgspec.Struct, frozen=True):
     valid_tokens: torch.Tensor
     state_indices: torch.Tensor
     ngram_context: Optional[torch.Tensor]
+    ngram_eos_token_id: Optional[int]
+
+
+class _PLEBreakableArgs(msgspec.Struct, frozen=True):
+    """ARC_QWEN4_EXP_PREFILL_BCG: what the PLE break needs besides the live batch."""
+
+    ngram_size: Optional[int]
     ngram_eos_token_id: Optional[int]
 
 
@@ -378,6 +392,90 @@ def _ple_track_targets(
         return None
 
     return dst, aligned[:rows].clamp(min=0).minimum(batch.lengths)
+
+
+def _bcg_forward_batch(where: str) -> ForwardBatch:
+    """The live (replay) ForwardBatch an eager break reads; its captured args are the capture's."""
+    context = get_tc_piecewise_forward_context()
+    if context is None or context.forward_batch is None:
+        raise RuntimeError(
+            f"Qwen4-Exp {where} break ran outside the prefill CUDA graph forward context"
+        )
+    return context.forward_batch
+
+
+def _ple_with_output_impl(
+    ple: "Qwen4ExpPLELayer",
+    ple_query: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    ngram_size: Optional[int],
+    ngram_eos_token_id: Optional[int],
+) -> None:
+    """ARC_QWEN4_EXP_PREFILL_BCG: the PLE layer as one eager break.
+
+    Prepares the batch from the live ForwardBatch (its input_ids are the static slot the captured
+    body reads, its lengths the scheduler's), runs the layer and commits the N-gram history, then
+    writes the bucket-sized output into ``out`` (a buffer of the captured segment). The eager
+    forward commits after the last decoder layer; nothing between the (single) PLE layer and that
+    point reads or writes the N-gram history, so committing here is the same state.
+    """
+    forward_batch = _bcg_forward_batch("PLE")
+    batch = _prepare_ple_batch(
+        forward_batch.input_ids,
+        forward_batch,
+        ngram_size=ngram_size,
+        ngram_eos_token_id=ngram_eos_token_id,
+    )
+    if batch is None:
+        raise RuntimeError("Qwen4-Exp PLE break got an idle forward")
+    result = ple(ple_query, forward_batch, batch)
+    if result.shape != out.shape or result.dtype != out.dtype:
+        raise RuntimeError(
+            "Qwen4-Exp PLE break: layer output "
+            f"{tuple(result.shape)} {result.dtype} != captured buffer "
+            f"{tuple(out.shape)} {out.dtype}"
+        )
+    out.copy_(result)
+    _commit_ple_batch(batch, forward_batch)
+
+
+_bcg_ple_with_output = eager_on_graph(True)(_ple_with_output_impl)
+
+
+def _qsa_topk_with_output_impl(
+    layer: "Qwen4ExpAttentionDecoderLayer",
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """ARC_QWEN4_EXP_PREFILL_BCG: the QSA indexer as one eager break.
+
+    The indexer sizes its compression writes, compressed-key gather and row chunks from the live
+    batch, so it cannot be captured. Its top-k rows (the real tokens) go into ``out`` (bucket rows,
+    allocated by the captured segment); padding rows get -1. The attention break that follows reads
+    only the real rows.
+    """
+    forward_batch = _bcg_forward_batch("QSA indexer")
+    topk = layer._compute_qsa_topk_indices(hidden_states, positions, forward_batch)
+    rows = topk.shape[0]
+    if (
+        rows != forward_batch.global_num_token_non_padded_cpu
+        or rows > out.shape[0]
+        or topk.shape[1:] != out.shape[1:]
+        or topk.dtype != out.dtype
+    ):
+        raise RuntimeError(
+            "Qwen4-Exp QSA indexer break: top-k "
+            f"{tuple(topk.shape)} {topk.dtype} for "
+            f"{forward_batch.global_num_token_non_padded_cpu} real tokens does not fit the "
+            f"captured buffer {tuple(out.shape)} {out.dtype}"
+        )
+    out[:rows].copy_(topk)
+    out[rows:].fill_(-1)
+
+
+_bcg_qsa_topk_with_output = eager_on_graph(True)(_qsa_topk_with_output_impl)
 
 
 def _pad_token_rows(x: torch.Tensor, total_tokens: int) -> torch.Tensor:
@@ -1536,6 +1634,7 @@ class Qwen4ExpLayerExtensionMixin:
         forward_batch: ForwardBatch,
         *,
         ple_batch: Optional[_PLEBatch],
+        ple_breakable: Optional["_PLEBreakableArgs"] = None,
     ):
         hc_dim = self.hc_count * self.hidden_size
         if hidden_states.shape[-1] != hc_dim:
@@ -1545,7 +1644,23 @@ class Qwen4ExpLayerExtensionMixin:
             )
 
         if self.ple is not None:
-            if ple_batch is None:
+            if ple_breakable is not None:
+                # ARC_QWEN4_EXP_PREFILL_BCG: prepare + layer + commit in one eager break.
+                if ple_batch is not None:
+                    raise RuntimeError("a breakable PLE forward got an eager PLE batch")
+                ple_query = (
+                    hidden_states if residual is None else hidden_states + residual
+                )
+                ple_out = torch.empty_like(ple_query)
+                _bcg_ple_with_output(
+                    self.ple,
+                    ple_query,
+                    ple_out,
+                    ngram_size=ple_breakable.ngram_size,
+                    ngram_eos_token_id=ple_breakable.ngram_eos_token_id,
+                )
+                hidden_states = hidden_states + ple_out
+            elif ple_batch is None:
                 if not _get_ple_forward_mode(forward_batch).is_idle():
                     raise RuntimeError(
                         "non-idle Qwen4 PLE forward is missing its batch"
@@ -1692,6 +1807,7 @@ class Qwen4ExpLinearDecoderLayer(
             residual,
             forward_batch,
             ple_batch=kwargs.get("ple_batch"),
+            ple_breakable=kwargs.get("ple_breakable"),
         )
 
         if not forward_batch.forward_mode.is_idle():
@@ -1778,8 +1894,12 @@ class Qwen4ExpAttentionDecoderLayer(
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        # ARC_QWEN4_EXP_PREFILL_BCG: the indexer is an eager break (it reads the live batch's
+        # host plan), so it runs on the replay stream, not overlapped on alt_stream.
+        breakable_indexer = self.is_qsa and is_in_breakable_cuda_graph()
         overlap_indexer = (
             self.is_qsa
+            and not breakable_indexer
             and self.alt_stream is not None
             and get_is_capture_mode()
             and hidden_states.shape[0] < _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD
@@ -1797,7 +1917,18 @@ class Qwen4ExpAttentionDecoderLayer(
             forward_batch=forward_batch,
         )
 
-        if overlap_indexer:
+        if breakable_indexer:
+            qwen4_exp_prefill_bcg.require_enabled("QSA indexer")
+            topk_indices = hidden_states.new_empty(
+                (
+                    hidden_states.shape[0],
+                    self.indexer.token_topk + self.indexer.compress_ratio - 1,
+                ),
+                dtype=torch.int32,
+            )
+            _bcg_qsa_topk_with_output(self, hidden_states, positions, topk_indices)
+            attention_kwargs["topk_indices"] = topk_indices
+        elif overlap_indexer:
             with torch.cuda.stream(self.alt_stream):
                 topk_indices = self._compute_qsa_topk_indices(
                     hidden_states, positions, forward_batch
@@ -1837,6 +1968,7 @@ class Qwen4ExpAttentionDecoderLayer(
             residual,
             forward_batch,
             ple_batch=kwargs.get("ple_batch"),
+            ple_breakable=kwargs.get("ple_breakable"),
         )
 
         if not forward_batch.forward_mode.is_idle():
@@ -1882,6 +2014,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
         self.has_ple = bool(config.ple_layer_ids)
+        self.num_ple_layers = len(set(config.ple_layer_ids))
         self.ple_ngram_size = int(config.ngram_size) if self.has_ple else None
         self.ple_ngram_eos_token_id = (
             int(config.eos_token_id) if self.ple_ngram_size is not None else None
@@ -1910,21 +2043,41 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         else:
             hidden_states = self.embed_tokens(input_ids)
 
-        ple_batch = (
-            _prepare_ple_batch(
-                input_ids,
-                forward_batch,
-                ngram_size=self.ple_ngram_size,
-                ngram_eos_token_id=self.ple_ngram_eos_token_id,
+        # ARC_QWEN4_EXP_PREFILL_BCG: under the breakable prefill graph the PLE batch is prepared,
+        # consumed and committed inside the PLE layer's eager break (from the live batch), and the
+        # embedding prefetch stays off (its buffers are keyed by the live token count).
+        breakable = is_in_breakable_cuda_graph()
+        ple_breakable = None
+        if breakable:
+            qwen4_exp_prefill_bcg.require_enabled("Qwen4ExpModel.forward")
+            if self.has_ple:
+                if self.num_ple_layers != 1:
+                    raise NotImplementedError(
+                        f"{qwen4_exp_prefill_bcg.ENV}=1 commits the N-gram history right after "
+                        f"the PLE layer, which is exact for one PLE layer; this model has "
+                        f"{self.num_ple_layers}"
+                    )
+                ple_breakable = _PLEBreakableArgs(
+                    ngram_size=self.ple_ngram_size,
+                    ngram_eos_token_id=self.ple_ngram_eos_token_id,
+                )
+            ple_batch = None
+        else:
+            ple_batch = (
+                _prepare_ple_batch(
+                    input_ids,
+                    forward_batch,
+                    ngram_size=self.ple_ngram_size,
+                    ngram_eos_token_id=self.ple_ngram_eos_token_id,
+                )
+                if self.has_ple
+                else None
             )
-            if self.has_ple
-            else None
-        )
         residual = None
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
-            if i + 1 < self.end_layer:
+            if not breakable and i + 1 < self.end_layer:
                 next_ple = getattr(self.layers[i + 1], "ple", None)
                 if next_ple is not None:
                     next_ple.start_prefetch(ple_batch, forward_batch)
@@ -1935,6 +2088,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                     residual=residual,
                     forward_batch=forward_batch,
                     ple_batch=ple_batch,
+                    ple_breakable=ple_breakable,
                     captured_last_layer_outputs=(
                         aux_hidden_states
                         if getattr(layer, "_is_layer_to_capture", False)
@@ -1942,7 +2096,8 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                     ),
                 )
 
-        _commit_ple_batch(ple_batch, forward_batch)
+        if not breakable:
+            _commit_ple_batch(ple_batch, forward_batch)
 
         hc_hidden_states = hidden_states
         hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
@@ -1988,10 +2143,34 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
             forward_batch=forward_batch,
             inputs_embeds=input_embeds,
         )
+        if is_in_breakable_cuda_graph():
+            # ARC_QWEN4_EXP_PREFILL_BCG: the prefill runner is capturing this body. Return both
+            # streams so the HC stream is a captured output too; at replay the runner hands the
+            # stored pair to unpack_breakable_body_output.
+            if not isinstance(model_output, tuple) or len(model_output) != 2:
+                raise RuntimeError(
+                    "a breakable Qwen4-Exp body must return (hidden, hc_hidden)"
+                )
+            return model_output
         if isinstance(model_output, tuple):
             hidden_states, self.last_hc_hidden_states = model_output
             return hidden_states
         return model_output
+
+    def unpack_breakable_body_output(self, model_output) -> torch.Tensor:
+        """ARC_QWEN4_EXP_PREFILL_BCG: what forward() does with a non-idle body's output, for the
+        (hidden, hc_hidden) pair the breakable prefill graph replayed."""
+        if (
+            not isinstance(model_output, tuple)
+            or len(model_output) != 2
+            or not all(torch.is_tensor(t) for t in model_output)
+        ):
+            raise RuntimeError(
+                "breakable Qwen4-Exp replay output must be (hidden, hc_hidden), got "
+                f"{type(model_output).__name__}"
+            )
+        hidden_states, self.last_hc_hidden_states = model_output
+        return hidden_states
 
 
 class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
