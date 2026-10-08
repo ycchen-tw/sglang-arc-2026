@@ -4,7 +4,8 @@ One GPU (G4): the target's lm_head is the whole vocabulary, `TargetHead`. Attent
 TP4 target, attention DP2, pairs): the target's lm_head is vocab-sharded over all TP ranks, so each rank adds the
 rows of its counterparts in the other DP groups (read from the target checkpoint), takes the top-k of what it holds,
 and the group merges by all-gather: `PairHead`. Both expose topk(x, k) -> (values, ids) over the full vocabulary,
-which is all the proposal step (state_pool.fast_propose) reads.
+which is all the proposal step (state_pool.fast_propose) reads. ARC_DFLASH_DRAFT_VOCAB restricts either to a fixed
+id list (`SubsetHead`, `SubsetPairHead`).
 """
 
 from __future__ import annotations
@@ -105,6 +106,41 @@ class PairHead(nn.Module):
         return top.view(*x.shape[:-1], k), i.gather(-1, pick).view(*x.shape[:-1], k)
 
 
+class SubsetPairHead(nn.Module):
+    """PairHead over a fixed draft vocabulary (ARC_DFLASH_DRAFT_VOCAB): each rank keeps the listed rows of the
+    vocabulary it holds (build_head checked that the group holds every id exactly once), takes their top-k, and the
+    group merges by all-gather exactly as PairHead does. Proposals only, as SubsetHead: the target still verifies
+    against its full distribution. On L4 (dp-lm-head pairs) the full head is a [rows, 124k] BF16 GEMM per rank,
+    ~2.9 ms of each draft step at C48 (e1 trace)."""
+
+    MIN_ROWS = 64  # every rank must hold at least the draft top-k
+
+    def __init__(self, parts, ids: torch.Tensor, vocab: int, group):
+        super().__init__()
+        weights, maps = [], []
+        for w, first in parts:
+            sel = ids[(ids >= first) & (ids < first + w.shape[0])]
+            if sel.numel():
+                weights.append(w.index_select(0, sel - first))
+                maps.append(sel)
+        rows = sum(m.numel() for m in maps)
+        if rows < self.MIN_ROWS:
+            raise RuntimeError(f"ARC_DFLASH_DRAFT_VOCAB: this rank holds {rows} of the {ids.numel()} draft ids "
+                               f"(< {self.MIN_ROWS}); the list does not span the group's vocabulary shards")
+        self.register_buffer("sub", torch.cat(weights).contiguous(), persistent=False)
+        self.register_buffer("map", torch.cat(maps), persistent=False)
+        self.vocab, self.group = vocab, group
+
+    def topk(self, x, k: int):
+        flat = x.reshape(-1, x.shape[-1])
+        v, local = F.linear(flat, self.sub).topk(k, -1)
+        i = self.map[local]
+        if self.group.world_size > 1:
+            v, i = self.group.all_gather(v.contiguous(), dim=-1), self.group.all_gather(i.contiguous(), dim=-1)
+        top, pick = v.topk(k, -1)
+        return top.view(*x.shape[:-1], k), i.gather(-1, pick).view(*x.shape[:-1], k)
+
+
 def vocab_shard(vocab: int, rank: int, size: int) -> tuple[int, int]:
     """[start, end) of the original vocabulary on TP rank `rank` (VocabParallelEmbedding with page 64 padding)."""
     padded = -(-vocab // 64) * 64
@@ -115,7 +151,8 @@ def vocab_shard(vocab: int, rank: int, size: int) -> tuple[int, int]:
 
 
 def build_head(target_model, model_dir: Path, device, vocab: int, hidden: int, group):
-    """TargetHead when this rank's target lm_head is the whole vocabulary, else the group's PairHead."""
+    """TargetHead when this rank's target lm_head is the whole vocabulary, else the group's PairHead (SubsetHead /
+    SubsetPairHead under ARC_DFLASH_DRAFT_VOCAB)."""
     from safetensors import safe_open
 
     from sglang.srt.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
@@ -132,8 +169,6 @@ def build_head(target_model, model_dir: Path, device, vocab: int, hidden: int, g
             raise RuntimeError(f"target lm_head {tuple(head.weight.shape)} != [{vocab}, {hidden}]")
         ids = draft_vocab(vocab, head.weight.device)
         return TargetHead(head.weight) if ids is None else SubsetHead(head.weight, ids)
-    if os.environ.get("ARC_DFLASH_DRAFT_VOCAB"):
-        raise RuntimeError("ARC_DFLASH_DRAFT_VOCAB is implemented for a full-vocabulary lm_head on one GPU only")
     rows = own[1] - own[0]
     parts = [(head.weight[:rows], own[0])]
     covered = [own]
@@ -165,4 +200,5 @@ def build_head(target_model, model_dir: Path, device, vocab: int, hidden: int, g
         edge = end
     if edge != vocab:
         raise RuntimeError(f"lm_head spans {spans} stop at {edge}, vocab {vocab}")
-    return PairHead(parts, vocab, group)
+    ids = draft_vocab(vocab, device)
+    return PairHead(parts, vocab, group) if ids is None else SubsetPairHead(parts, ids, vocab, group)
