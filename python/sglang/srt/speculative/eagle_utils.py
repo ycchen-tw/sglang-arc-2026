@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from enum import IntEnum
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -46,6 +47,14 @@ _is_npu = is_npu()
 _is_musa = is_musa()
 _is_xpu = is_xpu()
 _is_cpu = is_cpu()
+# arc-forge: ARC_RS_FUSED_SOFTMAX=1 (opt-in, default 0) runs rejection sampling with a sparse draft q (DFlash
+# ARC_DFLASH_SPARSE_Q=1) straight from the target logits (reject_sampling.chain_speculative_sampling_sparse_q_from_logits):
+# softmax(logits / T) over [bs x K, vocab] is not materialized. Batches that renormalize with top-k / top-p keep the
+# dense path; the flag without a sparse q raises.
+_ARC_RS_FUSED_SOFTMAX = os.environ.get("ARC_RS_FUSED_SOFTMAX", "0")
+if _ARC_RS_FUSED_SOFTMAX not in ("0", "1"):
+    raise ValueError(f"ARC_RS_FUSED_SOFTMAX must be 0 or 1, got {_ARC_RS_FUSED_SOFTMAX!r}")
+_ARC_RS_FUSED_SOFTMAX = _ARC_RS_FUSED_SOFTMAX == "1"
 
 logger = logging.getLogger(__name__)
 
@@ -875,15 +884,25 @@ def eagle_sample(
             else tree_speculative_sampling_target_only
         )
 
-        expanded_temperature = torch.repeat_interleave(
-            sampling_info.temperatures, verify_input.draft_token_num, dim=0
-        )  # (bs * num_draft_tokens, 1)
+        fused_softmax = _ARC_RS_FUSED_SOFTMAX and not (
+            sampling_info.need_top_k_sampling or sampling_info.need_top_p_sampling
+        )
+        if _ARC_RS_FUSED_SOFTMAX and verify_input.draft_probs_sparse is None:
+            raise ValueError("ARC_RS_FUSED_SOFTMAX=1 runs the sparse-q chain: it needs ARC_DFLASH_SPARSE_Q=1")
+        expanded_temperature = None
+        if fused_softmax:
+            # read by chain_speculative_sampling_sparse_q_from_logits below; nothing [bs * K, vocab] is written
+            target_probs = next_token_logits.reshape(bs, verify_input.draft_token_num, -1)
+        else:
+            expanded_temperature = torch.repeat_interleave(
+                sampling_info.temperatures, verify_input.draft_token_num, dim=0
+            )  # (bs * num_draft_tokens, 1)
 
-        target_probs = F.softmax(
-            next_token_logits / expanded_temperature, dim=-1
-        )  # (bs * num_draft_tokens, vocab_size)
-        maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
-        if sampling_info.need_top_k_sampling:
+            target_probs = F.softmax(
+                next_token_logits / expanded_temperature, dim=-1
+            )  # (bs * num_draft_tokens, vocab_size)
+            maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
+        if not fused_softmax and sampling_info.need_top_k_sampling:
             target_probs = top_k_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(
@@ -891,7 +910,7 @@ def eagle_sample(
                 ),
             )  # (bs * num_draft_tokens, vocab_size)
             maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
-        if sampling_info.need_top_p_sampling:
+        if not fused_softmax and sampling_info.need_top_p_sampling:
             target_probs = top_p_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(
@@ -940,7 +959,25 @@ def eagle_sample(
             candidates=candidates,
             device=device,
         )
-        if draft_probs_sparse is not None:
+        if fused_softmax:
+            from sglang.kernels.ops.speculative.reject_sampling import (
+                chain_speculative_sampling_sparse_q_from_logits,
+            )
+
+            chain_speculative_sampling_sparse_q_from_logits(
+                predicts=predict,  # mutable
+                accept_index=accept_index,  # mutable
+                accept_token_num=num_correct_drafts,  # mutable
+                candidates=candidates,
+                retrive_index=verify_input.retrieve_index,
+                uniform_samples=coins,
+                uniform_samples_for_final_sampling=coins_for_final_sampling,
+                logits=target_probs,
+                temperatures=sampling_info.temperatures,
+                draft_ids=draft_probs_sparse.ids,
+                draft_q=draft_probs_sparse.probs,
+            )
+        elif draft_probs_sparse is not None:
             from sglang.kernels.ops.speculative.reject_sampling import (
                 chain_speculative_sampling_sparse_q_triton,
             )
