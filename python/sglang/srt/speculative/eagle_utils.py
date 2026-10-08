@@ -900,21 +900,38 @@ def eagle_sample(
             )
             maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
-        draft_probs = (
-            verify_input.draft_probs
-            if use_rejection_sampling
-            else torch.zeros_like(target_probs)
-        )
-        # Defense-in-depth behind the spec_hook startup allowlist: validate
-        # the actual kernel inputs before the Triton kernel.
-        if use_rejection_sampling and (
-            draft_probs is None or draft_probs.shape[-1] != target_probs.shape[-1]
-        ):
-            raise ValueError(
-                "Rejection sampling requires a target-vocab draft proposal "
-                "distribution; the current speculative algorithm/draft worker "
-                "does not produce one (draft_probs missing or vocab-mismatched)."
+        draft_probs_sparse = verify_input.draft_probs_sparse
+        if draft_probs_sparse is not None:
+            # arc (DFlash ARC_DFLASH_SPARSE_Q=1): q as each proposal row's
+            # support, read in place by the sparse-q chain kernel. There is no
+            # dense q here to fall back on, and none is built.
+            if not use_rejection_sampling or verify_input.draft_probs is not None or _is_npu:
+                raise ValueError(
+                    "draft_probs_sparse is the q of --speculative-use-rejection-sampling "
+                    "on CUDA and excludes a dense draft_probs."
+                )
+            if draft_probs_sparse.vocab_size != target_probs.shape[-1]:
+                raise ValueError(
+                    f"sparse draft q over a {draft_probs_sparse.vocab_size}-token vocab "
+                    f"for target probs over {target_probs.shape[-1]}."
+                )
+            draft_probs = None
+        else:
+            draft_probs = (
+                verify_input.draft_probs
+                if use_rejection_sampling
+                else torch.zeros_like(target_probs)
             )
+            # Defense-in-depth behind the spec_hook startup allowlist: validate
+            # the actual kernel inputs before the Triton kernel.
+            if use_rejection_sampling and (
+                draft_probs is None or draft_probs.shape[-1] != target_probs.shape[-1]
+            ):
+                raise ValueError(
+                    "Rejection sampling requires a target-vocab draft proposal "
+                    "distribution; the current speculative algorithm/draft worker "
+                    "does not produce one (draft_probs missing or vocab-mismatched)."
+                )
 
         coins, coins_for_final_sampling = _verify_coins(
             sampling_info=sampling_info,
@@ -923,27 +940,46 @@ def eagle_sample(
             candidates=candidates,
             device=device,
         )
-        sampling_fn(
-            predicts=predict,  # mutable
-            accept_index=accept_index,  # mutable
-            accept_token_num=num_correct_drafts,  # mutable
-            candidates=candidates,
-            # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
-            retrive_index=verify_input.retrieve_index,
-            retrive_next_token=verify_input.retrieve_next_token,
-            retrive_next_sibling=verify_input.retrieve_next_sibling,
-            uniform_samples=coins,
-            uniform_samples_for_final_sampling=coins_for_final_sampling,
-            target_probs=target_probs,
-            draft_probs=draft_probs,
-            threshold_single=get_spec().speculative_accept_threshold_single,
-            threshold_acc=get_spec().speculative_accept_threshold_acc,
-            deterministic=True,
-        )
+        if draft_probs_sparse is not None:
+            from sglang.kernels.ops.speculative.reject_sampling import (
+                chain_speculative_sampling_sparse_q_triton,
+            )
+
+            chain_speculative_sampling_sparse_q_triton(
+                predicts=predict,  # mutable
+                accept_index=accept_index,  # mutable
+                accept_token_num=num_correct_drafts,  # mutable
+                candidates=candidates,
+                retrive_index=verify_input.retrieve_index,
+                uniform_samples=coins,
+                uniform_samples_for_final_sampling=coins_for_final_sampling,
+                target_probs=target_probs,
+                draft_ids=draft_probs_sparse.ids,
+                draft_q=draft_probs_sparse.probs,
+            )
+        else:
+            sampling_fn(
+                predicts=predict,  # mutable
+                accept_index=accept_index,  # mutable
+                accept_token_num=num_correct_drafts,  # mutable
+                candidates=candidates,
+                # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
+                retrive_index=verify_input.retrieve_index,
+                retrive_next_token=verify_input.retrieve_next_token,
+                retrive_next_sibling=verify_input.retrieve_next_sibling,
+                uniform_samples=coins,
+                uniform_samples_for_final_sampling=coins_for_final_sampling,
+                target_probs=target_probs,
+                draft_probs=draft_probs,
+                threshold_single=get_spec().speculative_accept_threshold_single,
+                threshold_acc=get_spec().speculative_accept_threshold_acc,
+                deterministic=True,
+            )
         del (
             expanded_temperature,
             target_probs,
             draft_probs,
+            draft_probs_sparse,
             coins,
             coins_for_final_sampling,
         )

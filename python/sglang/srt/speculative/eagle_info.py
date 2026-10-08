@@ -12,6 +12,22 @@ from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class SparseDraftProbs:
+    """arc (DFlash, ARC_DFLASH_SPARSE_Q=1): the proposal q of a topk=1 chain as each proposal row's support.
+
+    q is zero off the support, so this carries exactly the distribution the dense `draft_probs` would, at
+    support / vocab of its size; the verify kernel reads it in place (no dense expansion anywhere).
+    ids:   (bs, num_steps, support) int64, target-vocab ids, unique within a row
+    probs: (bs, num_steps, support) float32, q at those ids
+    vocab_size: the producer's vocabulary, checked against the target's
+    """
+
+    ids: torch.Tensor
+    probs: torch.Tensor
+    vocab_size: int
+
+
 @dataclass
 class EagleVerifyInput(SpecInput):
     draft_token: torch.Tensor
@@ -30,6 +46,8 @@ class EagleVerifyInput(SpecInput):
     # Stacked per-step draft proposal distribution q, shape (bs, num_steps,
     # vocab); only set under rejection sampling. Consumed by the verify kernel.
     draft_probs: torch.Tensor = None
+    # arc: the same q as SparseDraftProbs (DFlash ARC_DFLASH_SPARSE_Q=1); at most one of the two is set.
+    draft_probs_sparse: Optional[SparseDraftProbs] = None
 
     # Shape info for padding
     num_tokens_per_req: int = -1  # -1 auto-fills from draft_token_num.

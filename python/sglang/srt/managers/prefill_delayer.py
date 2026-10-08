@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.arc_extend_telemetry import get_extend_telemetry
 from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
@@ -394,11 +395,15 @@ class PrefillDelayerSinglePassExecutor:
         if not self._called:
             self.negotiate_should_allow_prefill(local_prefillable=False)
 
+        delayer = self._prefill_delayer
         _record_single_pass_result(
             actual_execution=actual_prefill_bs > 0,
             output=self._result,
-            metrics_collector=self._prefill_delayer._metrics_collector,
-            debug_log_enabled=self._prefill_delayer._debug_log_enabled,
+            metrics_collector=delayer._metrics_collector,
+            debug_log_enabled=delayer._debug_log_enabled,
+            queue_max_delay_ms=(
+                delayer._max_delay_ms if delayer._queue_trigger_enabled else None
+            ),
         )
         return actual_prefill_bs or self._attempted_prefill_bs
 
@@ -459,7 +464,18 @@ def _record_single_pass_result(
     metrics_collector: Optional["SchedulerMetricsCollector"],
     *,
     debug_log_enabled: bool,
+    queue_max_delay_ms: Optional[float] = None,
 ) -> None:
+    telemetry = get_extend_telemetry()  # arc-forge S0 (ARC_EXTEND_TELEMETRY), None when off
+    if telemetry is not None:
+        telemetry.observe_delayer(
+            output_allow=output.output_allow,
+            output_reason=output.output_reason,
+            input_estimation=output.input_estimation,
+            actual_execution=actual_execution,
+            wait_seconds=output.wait_seconds,
+            queue_max_delay_ms=queue_max_delay_ms,
+        )
     if debug_log_enabled:
         if output.output_allow and (output.output_reason == "wait_timeout"):
             logger.info(

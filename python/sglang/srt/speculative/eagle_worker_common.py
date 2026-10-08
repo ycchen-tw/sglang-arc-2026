@@ -15,7 +15,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+from sglang.srt.speculative.eagle_info import (
+    EagleDraftInput,
+    EagleVerifyInput,
+    SparseDraftProbs,
+)
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
     build_tree_kernel_efficient,
@@ -327,13 +331,18 @@ def build_eagle_verify_input(
     num_draft_tokens: int,
     tree_mask_mode: TreeMaskMode,
     device: str,
+    draft_probs_sparse: Optional[SparseDraftProbs] = None,
 ) -> EagleVerifyInput:
     """Shared draft() tail: idle input, tree-mask build, EagleVerifyInput assembly.
 
     ``draft_probs`` is the caller's source of draft distributions (single-layer
     eagle: this round's draft_forward output; multi-layer eagle: the ones the
-    draft input carried).
+    draft input carried). ``draft_probs_sparse`` (arc DFlash
+    ARC_DFLASH_SPARSE_Q=1) is the same q as each row's support; at most one of
+    the two is given.
     """
+    if draft_probs is not None and draft_probs_sparse is not None:
+        raise ValueError("draft q is either dense draft_probs or draft_probs_sparse, not both")
     if batch.forward_mode.is_idle():
         return EagleVerifyInput.create_idle_input(
             topk,
@@ -400,6 +409,7 @@ def build_eagle_verify_input(
         seq_lens_sum=None,
         seq_lens_cpu=None,
         draft_probs=draft_probs,
+        draft_probs_sparse=draft_probs_sparse,
     )
 
 

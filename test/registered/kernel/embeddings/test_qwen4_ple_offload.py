@@ -263,6 +263,100 @@ def test_qwen4_ple_file_backend_fp8_table():
         torch.testing.assert_close(filed(ids), expected, rtol=0, atol=0)
 
 
+def _fp8_rows(n, d, seed=0):
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    rows = torch.randn((n, d), generator=g, device="cuda") * 64
+    rows[1, :16] = 0  # an all-zero block
+    rows[2, 16:32] = 0.05  # a block whose scale is subnormal in e4m3
+    return rows.clamp(-448, 448).to(torch.float8_e4m3fn)
+
+
+@pytest.mark.parametrize("vocab_start", [0, 4])
+def test_qwen4_ple_nvfp4_gather_matches_reference(monkeypatch, vocab_start):
+    from sglang.srt.models import arc_ple_nvfp4
+
+    monkeypatch.setenv("ARC_PLE_NVFP4", "1")
+    monkeypatch.setattr(arc_ple_nvfp4, "CHUNK_ROWS", 3)  # several chunks per load
+    embedding_dim = 160
+    offloaded = Qwen4ExpPinnedHostEmbedding(
+        _make_source_embedding(
+            dtype=torch.float8_e4m3fn,
+            embedding_dim=embedding_dim,
+            vocab_start=vocab_start,
+            vocab_end=8,
+            org_vocab_size=8,
+            tp_size=1 if vocab_start == 0 else 2,
+        )
+    )
+    assert offloaded.weight.dtype == torch.uint8
+    assert offloaded.weight.shape == (8 - vocab_start, 90)  # 80 code + 10 scale bytes
+    assert offloaded.weight.is_pinned()
+    rows = _fp8_rows(8, embedding_dim)
+    # two checkpoint shards, as the Qwen4-Exp loader hands them over
+    offloaded.load_rows(rows[:5], 0)
+    offloaded.load_rows(rows[5:], 5)
+    offloaded.finish_nvfp4_load()
+    assert offloaded.nvfp4_subnormal_blocks == (1 if vocab_start <= 2 else 0)
+
+    packed, scales, _ = arc_ple_nvfp4.quantize_rows(rows)
+    reference = arc_ple_nvfp4.dequantize_rows(packed, scales).to(torch.bfloat16)
+    ids = torch.tensor([[0, 7, 3], [4, 1, 2], [-1, 8, 6]], device="cuda")
+    expected = torch.zeros((*ids.shape, embedding_dim), dtype=torch.bfloat16, device="cuda")
+    for i in range(ids.shape[0]):
+        for j in range(ids.shape[1]):
+            k = int(ids[i, j])
+            if vocab_start <= k < 8:
+                expected[i, j] = reference[k]
+    out = torch.full_like(expected, torch.nan)  # tp_size 2 would allocate symmetric memory
+    torch.testing.assert_close(offloaded.gather(ids, out=out), expected, rtol=0, atol=0)
+    assert torch.all(reference[1, :16] == 0)
+    stored = offloaded.weight.cuda()
+    torch.testing.assert_close(
+        stored, arc_ple_nvfp4.pack_rows(packed, scales)[vocab_start:], rtol=0, atol=0
+    )
+
+    # 4-bit rounding error only: ~9.5 % relative RMS on gaussian rows
+    f = rows.float()
+    rel = (arc_ple_nvfp4.dequantize_rows(packed, scales) - f).norm() / f.norm()
+    assert 0.05 < float(rel) < 0.11
+
+
+def test_qwen4_ple_nvfp4_dequantize_codes():
+    from sglang.srt.models import arc_ple_nvfp4
+
+    grid = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device="cuda")
+    row = torch.cat([grid, -grid]).repeat(10).view(1, 160)
+    packed, scales, _ = arc_ple_nvfp4.quantize_rows(row)
+    assert torch.all(scales.float() == 1.0)
+    torch.testing.assert_close(
+        arc_ple_nvfp4.dequantize_rows(packed, scales), row, rtol=0, atol=0
+    )
+    assert int(packed[0, 0]) == 0x10  # element 0 low nibble, element 1 high
+
+
+def test_qwen4_ple_nvfp4_refusals(monkeypatch):
+    monkeypatch.setenv("ARC_PLE_NVFP4", "1")
+    with pytest.raises(TypeError, match="needs an fp8 PLE table"):
+        Qwen4ExpPinnedHostEmbedding(_make_source_embedding(embedding_dim=160))
+    with pytest.raises(ValueError, match="divisible by 16"):
+        Qwen4ExpPinnedHostEmbedding(
+            _make_source_embedding(dtype=torch.float8_e4m3fn, embedding_dim=24)
+        )
+    offloaded = Qwen4ExpPinnedHostEmbedding(
+        _make_source_embedding(dtype=torch.float8_e4m3fn, embedding_dim=32)
+    )
+    with pytest.raises(TypeError, match="fp8 PLE rows only"):
+        offloaded.load_rows(torch.zeros((8, 32), dtype=torch.bfloat16), 0)
+    offloaded.load_rows(_fp8_rows(8, 32)[:6], 0)
+    with pytest.raises(RuntimeError, match="quantized 6 PLE rows"):
+        offloaded.finish_nvfp4_load()
+    monkeypatch.setenv("ARC_PLE_NVFP4", "yes")
+    with pytest.raises(ValueError, match="expected 0 or 1"):
+        Qwen4ExpPinnedHostEmbedding(
+            _make_source_embedding(dtype=torch.float8_e4m3fn, embedding_dim=32)
+        )
+
+
 if __name__ == "__main__":
     import sys
 

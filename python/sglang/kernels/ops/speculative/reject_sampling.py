@@ -1,3 +1,4 @@
+import torch
 import triton
 import triton.language as tl
 
@@ -205,4 +206,279 @@ def chain_speculative_sampling_triton(
         NUM_SLOTS=num_slots,
         VOCAB_SIZE=vocab_size,
         BLOCK_V=4096,
+    )
+
+
+# arc (DFlash ARC_DFLASH_SPARSE_Q=1): the same chain rejection sampling with the proposal q given as each row's
+# support (selector candidates) and their probabilities instead of a dense [batch, num_slots - 1, vocab] tensor.
+# q is zero off the support, so every value the dense kernel reads is reproduced exactly: q(x) for the accept test is
+# the support entry equal to x (0 when there is none), and the residual block is p with q subtracted on the support
+# lanes only. The residual vector, its reductions and the inverse CDF are the dense kernel's, op for op, so with the
+# same p and coins the accept lengths and tokens are the dense kernel's (bitwise on GPU is to be checked, see
+# test_arc_dflash_sparse_q.py). The degenerate-residual fallback (VOCAB_SIZE - 1) and the NaN-q guard are kept as
+# they are for that comparison; hardening them is a separate change.
+
+
+@triton.jit
+def _sparse_q_block(
+    ids_base,
+    q_base,
+    stride_ids_k,
+    stride_q_k,
+    v_start,
+    v_offsets,
+    BLOCK_V: tl.constexpr,
+    SUPPORT: tl.constexpr,
+):
+    """q over vocabulary block [v_start, v_start + BLOCK_V) of one proposal row: zero but on the support ids that
+    fall in the block. A support id outside the block costs one scalar compare, not a pass over the block."""
+    q_val = tl.zeros([BLOCK_V], dtype=tl.float32)
+    for s in tl.static_range(SUPPORT):
+        sid = tl.load(ids_base + s * stride_ids_k)
+        if (sid >= v_start) & (sid < v_start + BLOCK_V):
+            q_val += tl.where(v_offsets == sid, tl.load(q_base + s * stride_q_k), 0.0)
+    return q_val
+
+
+@triton.jit
+def speculative_sampling_sparse_q_kernel(
+    # Pointers
+    Predicts,
+    AcceptIndex,
+    AcceptTokenNum,
+    Candidates,
+    RetriveIndex,
+    UniformSamples,
+    UniformSamplesFinal,
+    TargetProbs,
+    DraftIds,
+    DraftQ,
+    # Strides
+    stride_cand_b,
+    stride_cand_s,
+    stride_idx_b,
+    stride_idx_s,
+    stride_uni_b,
+    stride_uni_s,
+    stride_tp_b,
+    stride_tp_s,
+    stride_tp_v,
+    stride_di_b,
+    stride_di_s,
+    stride_di_k,
+    stride_dq_b,
+    stride_dq_s,
+    stride_dq_k,
+    # Constants
+    NUM_SLOTS: tl.constexpr,
+    VOCAB_SIZE: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    SUPPORT: tl.constexpr,
+    SUPPORT_P2: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    cur_prob_row = 0
+
+    cand_ptr_base = Candidates + pid * stride_cand_b
+    idx_ptr_base = RetriveIndex + pid * stride_idx_b
+    uni_ptr_base = UniformSamples + pid * stride_uni_b
+    k_offsets = tl.arange(0, SUPPORT_P2)
+    k_mask = k_offsets < SUPPORT
+
+    root_global_idx = tl.load(idx_ptr_base + 0 * stride_idx_s)
+    tl.store(AcceptIndex + pid * stride_idx_b + 0 * stride_idx_s, root_global_idx)
+    last_accepted_global_idx = root_global_idx
+
+    num_accept = 0
+
+    # Verification Loop
+    step = 1
+    continue_verifying = 1
+
+    while (step < NUM_SLOTS) and (continue_verifying == 1):
+        draft_token = tl.load(cand_ptr_base + step * stride_cand_s)
+
+        offset_prob = (
+            (pid * stride_tp_b)
+            + (cur_prob_row * stride_tp_s)
+            + (draft_token * stride_tp_v)
+        )
+        p = tl.load(TargetProbs + offset_prob)
+        # q(draft_token): the row's support entry for it (ids are unique within a row: one entry or none)
+        ids = tl.load(
+            DraftIds + pid * stride_di_b + cur_prob_row * stride_di_s + k_offsets * stride_di_k,
+            mask=k_mask,
+            other=-1,
+        )
+        qs = tl.load(
+            DraftQ + pid * stride_dq_b + cur_prob_row * stride_dq_s + k_offsets * stride_dq_k,
+            mask=k_mask,
+            other=0.0,
+        )
+        q = tl.sum(tl.where(ids == draft_token, qs, 0.0), axis=0)
+
+        coin = tl.load(uni_ptr_base + (step - 1) * stride_uni_s)
+
+        if coin * q < p:
+            num_accept += 1
+            cur_prob_row = step
+            tl.store(Predicts + last_accepted_global_idx, draft_token)
+
+            curr_global_idx = tl.load(idx_ptr_base + step * stride_idx_s)
+            tl.store(
+                AcceptIndex + pid * stride_idx_b + num_accept * stride_idx_s,
+                curr_global_idx,
+            )
+            last_accepted_global_idx = curr_global_idx
+
+            step += 1
+        else:
+            continue_verifying = 0
+
+    tl.store(AcceptTokenNum + pid, num_accept)
+
+    # Final Sampling
+    all_drafts_accepted = continue_verifying
+    coin_final = tl.load(UniformSamplesFinal + pid)
+    norm_sum = 0.0
+
+    tp_base_ptr = TargetProbs + (pid * stride_tp_b) + (cur_prob_row * stride_tp_s)
+    # As in the dense kernel: on all-accept cur_prob_row == NUM_SLOTS - 1 has no q row, and only the rejection
+    # branch below dereferences these pointers (cur_prob_row <= NUM_SLOTS - 2 there).
+    di_base_ptr_safe = DraftIds + (pid * stride_di_b) + (cur_prob_row * stride_di_s)
+    dq_base_ptr_safe = DraftQ + (pid * stride_dq_b) + (cur_prob_row * stride_dq_s)
+
+    # Pass 1: Sum
+    for v_start in range(0, VOCAB_SIZE, BLOCK_V):
+        v_offsets = v_start + tl.arange(0, BLOCK_V)
+        mask = v_offsets < VOCAB_SIZE
+
+        p_ptr = tp_base_ptr + v_offsets * stride_tp_v
+        p_val = tl.load(p_ptr, mask=mask, other=0.0)
+
+        if all_drafts_accepted:
+            val = p_val
+        else:
+            q_val = _sparse_q_block(
+                di_base_ptr_safe, dq_base_ptr_safe, stride_di_k, stride_dq_k,
+                v_start, v_offsets, BLOCK_V, SUPPORT,
+            )
+            # Same NaN-q guard as the dense kernel.
+            q_val = tl.where(q_val == q_val, q_val, 0.0)
+            diff = p_val - q_val
+            val = tl.where(diff > 0.0, diff, 0.0)
+
+        norm_sum += tl.sum(val)
+
+    # Pass 2: CDF (the dense kernel's, including its VOCAB_SIZE - 1 fallback on a zero residual).
+    target_u = coin_final * norm_sum
+    cum_sum = 0.0
+    final_token = VOCAB_SIZE - 1
+    found = 0
+
+    for v_start in range(0, VOCAB_SIZE, BLOCK_V):
+        if found == 0:
+            v_offsets = v_start + tl.arange(0, BLOCK_V)
+            mask = v_offsets < VOCAB_SIZE
+
+            p_ptr = tp_base_ptr + v_offsets * stride_tp_v
+            p_val = tl.load(p_ptr, mask=mask, other=0.0)
+
+            if all_drafts_accepted:
+                val = p_val
+            else:
+                q_val = _sparse_q_block(
+                    di_base_ptr_safe, dq_base_ptr_safe, stride_di_k, stride_dq_k,
+                    v_start, v_offsets, BLOCK_V, SUPPORT,
+                )
+                q_val = tl.where(q_val == q_val, q_val, 0.0)
+                diff = p_val - q_val
+                val = tl.where(diff > 0.0, diff, 0.0)
+
+            block_cumsum = tl.cumsum(val, axis=0)
+            total_cumsum = cum_sum + block_cumsum
+
+            candidates_mask = total_cumsum > target_u
+            has_match = tl.max(candidates_mask, axis=0)
+
+            if has_match:
+                match_idx = tl.argmax(candidates_mask.to(tl.int32), axis=0)
+                final_token = v_start + match_idx
+                found = 1
+
+            cum_sum += tl.sum(val)
+
+    tl.store(Predicts + last_accepted_global_idx, final_token)
+
+
+def chain_speculative_sampling_sparse_q_triton(
+    predicts,
+    accept_index,
+    accept_token_num,
+    candidates,
+    retrive_index,
+    uniform_samples,
+    uniform_samples_for_final_sampling,
+    target_probs,
+    draft_ids,
+    draft_q,
+):
+    """chain_speculative_sampling_triton (topk=1 chain) with q given sparsely.
+
+    draft_ids / draft_q: [batch, num_slots - 1, support]; row j is the proposal distribution of candidates[:, j + 1]
+    as target-vocab ids (unique within a row) and their probabilities, q being zero elsewhere. Shapes and dtypes are
+    checked here (host metadata only, no device sync); id range and uniqueness are the producer's contract.
+    """
+    batch_size, num_slots = candidates.shape
+    vocab_size = target_probs.shape[-1]
+    if tuple(target_probs.shape) != (batch_size, num_slots, vocab_size):
+        raise ValueError(
+            f"target_probs {tuple(target_probs.shape)} for candidates {tuple(candidates.shape)}"
+        )
+    if (
+        draft_ids.ndim != 3
+        or draft_ids.shape != draft_q.shape
+        or tuple(draft_ids.shape[:2]) != (batch_size, num_slots - 1)
+        or draft_ids.shape[2] < 1
+    ):
+        raise ValueError(
+            f"sparse q ids {tuple(draft_ids.shape)} / probs {tuple(draft_q.shape)} for "
+            f"{batch_size} rows of {num_slots - 1} proposals"
+        )
+    if draft_q.dtype != torch.float32 or draft_ids.dtype not in (torch.int32, torch.int64):
+        raise ValueError(f"sparse q dtypes ids {draft_ids.dtype} / probs {draft_q.dtype}")
+    support = draft_ids.shape[2]
+
+    grid = (batch_size,)
+    speculative_sampling_sparse_q_kernel[grid](
+        predicts,
+        accept_index,
+        accept_token_num,
+        candidates,
+        retrive_index,
+        uniform_samples,
+        uniform_samples_for_final_sampling,
+        target_probs,
+        draft_ids,
+        draft_q,
+        candidates.stride(0),
+        candidates.stride(1),
+        retrive_index.stride(0),
+        retrive_index.stride(1),
+        uniform_samples.stride(0),
+        uniform_samples.stride(1),
+        target_probs.stride(0),
+        target_probs.stride(1),
+        target_probs.stride(2),
+        draft_ids.stride(0),
+        draft_ids.stride(1),
+        draft_ids.stride(2),
+        draft_q.stride(0),
+        draft_q.stride(1),
+        draft_q.stride(2),
+        NUM_SLOTS=num_slots,
+        VOCAB_SIZE=vocab_size,
+        BLOCK_V=4096,
+        SUPPORT=support,
+        SUPPORT_P2=triton.next_power_of_2(support),
     )
