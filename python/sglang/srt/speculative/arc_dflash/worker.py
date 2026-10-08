@@ -9,7 +9,9 @@ graphs. Per cycle:
   draft()                     one drafter forward folds the previous verify's accepted block into each request's
                               window cache and proposes K-1 tokens (selector chain, sampled at the request's
                               temperature); q is scattered into the dense draft_probs rejection sampling reads
-  verify                      SGLang's run_eagle_verify, unchanged (chain RS kernel: draft_probs row j <-> slot j+1)
+                              (ARC_DFLASH_SPARSE_Q=1: handed over as the candidates and their probabilities)
+  verify                      SGLang's run_eagle_verify, unchanged (chain RS kernel: draft_probs row j <-> slot j+1;
+                              the sparse-q variant of that kernel with ARC_DFLASH_SPARSE_Q=1)
   _draft_extend_for_decode    records [bonus, p1..p_{K-1}] with the verify GR and the accept length as a pending
                               commit; nothing runs (the next draft() folds it in)
   _draft_extend_for_prefill   builds or extends the request's window cache from the prefill GR and the ids
@@ -397,6 +399,17 @@ class DFlashDraftWorker:
             raise ValueError(f"max_running_requests {total} does not split over attention DP {dp}")
         self.max_running_requests = total // dp
         self.use_rejection_sampling = bool(spec.speculative_use_rejection_sampling)
+        # ARC_DFLASH_SPARSE_Q (default 0): hand rejection sampling q as each position's selector candidates and their
+        # probabilities ([batch, K-1, selector_top_k]) instead of the dense [max batch, K-1, vocab] FP32 buffer, which
+        # is then not allocated (0.71 GiB at 110 requests x K=8, taken from the target's KV budget); verify runs the
+        # sparse-q chain kernel (kernels/ops/speculative/reject_sampling.py). Same q, same accept/resample rule.
+        sparse_q = os.environ.get("ARC_DFLASH_SPARSE_Q", "0")
+        if sparse_q not in ("0", "1"):
+            raise ValueError(f"ARC_DFLASH_SPARSE_Q must be 0 or 1, got {sparse_q!r}")
+        self.sparse_q = sparse_q == "1"
+        if self.sparse_q and not self.use_rejection_sampling:
+            raise ValueError("ARC_DFLASH_SPARSE_Q=1 is the q of rejection sampling: it needs "
+                             "--speculative-use-rejection-sampling")
         self.check_agree = os.environ.get("ARC_DFLASH_CHECK_AGREE") == "1"
         directory = Path(drafter_dir())
         raw = json.loads((directory / "config.json").read_text())
@@ -451,7 +464,7 @@ class DFlashDraftWorker:
         layout = os.environ.get("ARC_DFLASH_POOL", "ring")
         pool_cls = {"ring": RingStatePool, "shift": StatePool}[layout]
         self.pool = pool_cls(self.model, slots=self.max_running_requests + 16, max_batch=self.max_running_requests,
-                             device=self.device, steps=self.steps)
+                             device=self.device, steps=self.steps, sparse_q=self.sparse_q)
         torch.cuda.empty_cache()  # the BF16 staging must not count as used when the target sizes its pools
         if os.environ.get("ARC_DFLASH_MEM_PROFILE"):  # analysis runs only: records every allocation (slows the host)
             from . import mem_profile
@@ -487,12 +500,12 @@ class DFlashDraftWorker:
         logger.info(
             "DFlash drafter %s on attention-TP group %s (rank %d/%d, attention DP %d), %s experts: %d layers, experts "
             "kept %s (%s on this rank), weights %.2f GiB, state pool %d slots %.2f GiB (window %d, %s layout), "
-            "lm_head %s, loaded in %.1f s; prefill tail %d, rejection sampling %s, verify width %d, compile %s",
+            "lm_head %s, loaded in %.1f s; prefill tail %d, rejection sampling %s (q %s), verify width %d, compile %s",
             directory, list(self.group.ranks), self.group.rank_in_group, self.group.world_size, dp, self.backend,
             self.model.config.num_layers, kept, local,
             self.weight_bytes / 2**30, self.pool.slots, self.pool.bytes() / 2**30, self.model.config.window, layout,
             type(self.model.lm_head).__name__, self._weight_load_time, self.prefill_tail, self.use_rejection_sampling,
-            self.width, self.model.compile_mode,
+            "sparse" if self.sparse_q else "dense", self.width, self.model.compile_mode,
         )
         self._init_exact_state()
         if self.exact_prefill:
@@ -919,7 +932,7 @@ class DFlashDraftWorker:
         temperature = batch.sampling_info.temperatures.view(-1).float()
         start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         start.record()
-        tokens, probs = self.pool.step(slots, anchor, temperature)
+        tokens, q = self.pool.step(slots, anchor, temperature)
         end.record()
         self._timing(start, end, bs)
         self._profile_step(False)
@@ -931,11 +944,18 @@ class DFlashDraftWorker:
             if not all(torch.equal(both[0], both[r]) for r in range(1, self.group.world_size)):
                 raise RuntimeError(f"DFlash: attention-TP group {list(self.group.ranks)} proposed different tokens "
                                    f"at cycle {self.cycle}")
+        dense_q = sparse_q = None
+        if self.use_rejection_sampling and self.sparse_q:
+            from sglang.srt.speculative.eagle_info import SparseDraftProbs
+
+            ids, probs = q
+            sparse_q = SparseDraftProbs(ids=ids, probs=probs, vocab_size=self.vocab)
+        elif self.use_rejection_sampling:
+            dense_q = q
         return build_eagle_verify_input(
-            batch, draft_input, self.parents[:bs], self.score_index[:bs], tokens.clone(),
-            probs if self.use_rejection_sampling else None,
+            batch, draft_input, self.parents[:bs], self.score_index[:bs], tokens.clone(), dense_q,
             target_worker=self.target_worker, topk=1, num_steps=self.steps, num_draft_tokens=self.width,
-            tree_mask_mode=self.tree_mask_mode, device=self.device,
+            tree_mask_mode=self.tree_mask_mode, device=self.device, draft_probs_sparse=sparse_q,
         )
 
     def _timing(self, start, end, bs):

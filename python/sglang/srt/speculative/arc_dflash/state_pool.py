@@ -10,7 +10,10 @@ slot is simply reused.
 The step reads the batch's slots by an index tensor, so for a fixed batch size every shape is static: one CUDA graph
 per captured batch size, padded with a scratch slot (the last one) whose results are discarded. The graph covers the
 drafter forward, the window shift, the scatter back into the pool, the 7-step selector chain (sampled with the
-default CUDA generator, which graph capture supports) and the dense q for rejection sampling.
+default CUDA generator, which graph capture supports) and the q for rejection sampling: by default scattered into a
+dense [max_batch, steps, vocab] FP32 buffer (0.71 GiB at 110 requests x 7, charged against the target's KV budget);
+with sparse_q (ARC_DFLASH_SPARSE_Q=1) only each position's selector candidates and their probabilities,
+[max_batch, steps, selector_top_k], and no dense buffer is allocated.
 """
 
 from __future__ import annotations
@@ -51,11 +54,12 @@ def fast_propose(model, hidden, anchor, temperature):
 
 
 class StatePool:
-    def __init__(self, model, slots: int, max_batch: int, device, *, steps: int = 7):
+    def __init__(self, model, slots: int, max_batch: int, device, *, steps: int = 7, sparse_q: bool = False):
         c = model.config
         if not 1 <= steps < c.block_size:
             raise ValueError(f"{steps} proposals per cycle; the drafter's block holds {c.block_size - 1}")
         self.model, self.c, self.slots, self.device, self.steps = model, c, slots, device, steps
+        self.sparse_q = sparse_q
         w, b, layers = c.window, c.block_size, c.num_layers
         kv = (layers, slots, c.num_key_value_heads, w, c.head_dim)
         bf16 = dict(dtype=torch.bfloat16, device=device)
@@ -80,15 +84,23 @@ class StatePool:
         self.anchor = torch.zeros(max_batch, dtype=torch.long, device=device)
         self.temperature = torch.ones(max_batch, device=device)
         self.tokens_out = torch.zeros((max_batch, steps), dtype=torch.long, device=device)
-        self.probs_out = torch.zeros((max_batch, steps, c.vocab_size), dtype=torch.float32, device=device)
+        # the q of the last step: cand_out holds each position's candidates (target-vocab ids, unique: a top-k);
+        # dense mode scatters their probabilities into probs_out, sparse mode keeps them in cand_probs_out
         self.cand_out = torch.zeros((max_batch, steps, c.selector_top_k), dtype=torch.long, device=device)
+        if sparse_q:
+            self.probs_out = None
+            self.cand_probs_out = torch.zeros((max_batch, steps, c.selector_top_k), dtype=torch.float32, device=device)
+        else:
+            self.probs_out = torch.zeros((max_batch, steps, c.vocab_size), dtype=torch.float32, device=device)
+            self.cand_probs_out = None
         self.graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self.graph_pool = None
 
     def bytes(self):
+        q = (self.cand_out, self.cand_probs_out) if self.sparse_q else (self.probs_out,)
         return sum(t.numel() * t.element_size() for t in (
             self.key, self.value, self.boundary, self.positions, self.last_gr, self.last_position,
-            self.pending_tokens, self.pending_gr, self.pending_length, self.probs_out))
+            self.pending_tokens, self.pending_gr, self.pending_length, *q))
 
     # ---- slots -------------------------------------------------------------------------------------------------
     def acquire(self, rid):
@@ -201,7 +213,8 @@ class StatePool:
 
     # ---- the step -----------------------------------------------------------------------------------------------
     def _step(self, batch):
-        """Static-shape body: slots self.idx[:batch] -> proposals in tokens_out / probs_out, windows advanced."""
+        """Static-shape body: slots self.idx[:batch] -> proposals in tokens_out, their q in probs_out (or
+        cand_out / cand_probs_out), windows advanced."""
         model, c = self.model, self.c
         idx = self.idx[:batch]
         prefix = CleanCache(
@@ -230,9 +243,14 @@ class StatePool:
         self._emit(batch, proposal)
 
     def _emit(self, batch, proposal):
-        """Proposals and the dense q: only the 16 x steps entries each row wrote last time are cleared, not the
-        whole [batch, steps, vocab] buffer (a 0.77 GB memset per cycle at 110 requests)."""
+        """Proposals and their q. Dense: only the 16 x steps entries each row wrote last time are cleared, not the
+        whole [batch, steps, vocab] buffer (a 0.77 GB memset per cycle at 110 requests). Sparse: the candidates and
+        their probabilities as they are -- the same q, zero off the candidates."""
         self.tokens_out[:batch] = proposal.tokens
+        if self.sparse_q:
+            self.cand_out[:batch] = proposal.candidates
+            self.cand_probs_out[:batch] = proposal.probabilities.float()
+            return
         probs = self.probs_out[:batch]
         probs.scatter_(2, self.cand_out[:batch], 0.0)
         probs.scatter_(2, proposal.candidates, proposal.probabilities.float())
@@ -252,7 +270,8 @@ class StatePool:
         target_pool / target_stream: capture into the target's graph memory pool, on the target's capture stream
         (the caching allocator hands a freed block back only to the stream that allocated it, so a new stream gets
         none of the target's freed blocks). Safe because the drafter's outputs live in static buffers outside the
-        pool (tokens_out / probs_out / cand_out, the state pool) and its replays never overlap the target's."""
+        pool (tokens_out / probs_out or cand_probs_out / cand_out, the state pool) and its replays never overlap the
+        target's."""
         if (target_pool is None) != (target_stream is None):
             raise ValueError("target_pool and target_stream go together")
         if target_pool is not None:
@@ -279,7 +298,9 @@ class StatePool:
 
     @torch.no_grad()
     def step(self, slots, anchor, temperature):
-        """slots/anchor/temperature: [batch] device tensors. Returns (tokens [batch, steps], probs [batch, steps, vocab])."""
+        """slots/anchor/temperature: [batch] device tensors. Returns (tokens [batch, steps], q): q is probs
+        [batch, steps, vocab], or with sparse_q (candidate ids, their probabilities), each [batch, steps, top_k].
+        All are views of static buffers the next step overwrites: consume them before it (verify does)."""
         batch = slots.shape[0]
         size = self.bucket(batch)
         self.idx.fill_(self.scratch)
@@ -290,6 +311,8 @@ class StatePool:
             self._step(batch)
         else:
             self.graphs[size].replay()
+        if self.sparse_q:
+            return self.tokens_out[:batch], (self.cand_out[:batch], self.cand_probs_out[:batch])
         return self.tokens_out[:batch], self.probs_out[:batch]
 
 
@@ -304,8 +327,9 @@ class RingStatePool(StatePool):
     the scatter needs no mask and nothing it holds is ever attendable.
     """
 
-    def __init__(self, model, slots: int, max_batch: int, device, *, steps: int = 7, width: int | None = None):
-        super().__init__(model, slots, max_batch, device, steps=steps)
+    def __init__(self, model, slots: int, max_batch: int, device, *, steps: int = 7, width: int | None = None,
+                 sparse_q: bool = False):
+        super().__init__(model, slots, max_batch, device, steps=steps, sparse_q=sparse_q)
         c = self.c
         w = c.window
         # A step forwards [committed <= K, anchor, mask...] and reads proposals at anchor + 0..steps-1, so it needs
