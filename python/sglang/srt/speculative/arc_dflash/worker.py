@@ -82,6 +82,24 @@ LOG_EVERY = int(os.environ.get("ARC_DFLASH_LOG_EVERY", "500"))
 GRAPH_SIZES = (1, 2, 4, 8, 12, 16, 24, 32, 40, 48, 56, 64, 80, 96)
 
 
+def graph_sizes(max_running: int) -> list[int]:
+    """Drafter CUDA graph batch sizes: GRAPH_SIZES below max_running, plus max_running itself (a batch runs the
+    smallest graph that holds it). ARC_DFLASH_GRAPH_SIZES=<comma-separated sizes> (opt-in) replaces GRAPH_SIZES, for
+    servers whose decode batches run in the hundreds (the default jumps from 96 straight to max_running)."""
+    value = os.environ.get("ARC_DFLASH_GRAPH_SIZES")
+    if value is None:
+        base = GRAPH_SIZES
+    else:
+        try:
+            base = tuple(int(s) for s in value.split(","))
+        except ValueError:
+            raise ValueError(f"ARC_DFLASH_GRAPH_SIZES must be comma-separated integers, got {value!r}") from None
+        if not base or min(base) < 1 or max(base) > max_running:
+            raise ValueError(f"ARC_DFLASH_GRAPH_SIZES {value!r}: sizes must be in [1, max_running_requests "
+                             f"{max_running}]")
+    return sorted({s for s in base if s < max_running} | {max_running})
+
+
 def _env_int(name, default):
     value = int(os.environ.get(name, default))
     if value <= 0:
@@ -558,7 +576,7 @@ class DFlashDraftWorker:
         fast_drafter.warm(self)
         if not self.use_graphs:
             return
-        sizes = sorted({s for s in GRAPH_SIZES if s < self.max_running_requests} | {self.max_running_requests})
+        sizes = graph_sizes(self.max_running_requests)
         begin = time.monotonic()
         free_before = torch.cuda.mem_get_info(self.device)[0]
         # the group's all-reduce / all-gather inside the graphs go through pynccl, which SGLang enables only here
