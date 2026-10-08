@@ -1,4 +1,4 @@
-"""arc-forge: Qwen4-Exp text extend under the breakable prefill CUDA graph (opt-in, default off).
+"""arc-forge: Qwen4-Exp extend (text and media) under the breakable prefill CUDA graph (opt-in, default off).
 
 ``ARC_QWEN4_EXP_PREFILL_BCG=1`` lets the breakable (BCG) prefill runner capture the Qwen4-Exp
 transformer body. The body is token-wise except for four places that read the live batch's host
@@ -15,7 +15,10 @@ MoE with its routed-experts writes, the attention-TP all-reduces) replays from t
 
 The model returns ``(hidden, hc_hidden)`` from the captured body; the runner hands the stored pair
 back through ``Qwen4ExpVLModel.unpack_breakable_body_output`` so ``logits_output.hidden_states``
-(the GR the DFlash drafter reads) is the replayed HC stream. Batches with media fall back to eager.
+(the GR the DFlash drafter reads) is the replayed HC stream. Batches with media replay too: the
+eager outer forward runs the ViT and the media merge into the static input_embeds slot, rewrites
+the media ids in the static input_ids the PLE break reads, and M-RoPE positions come from their
+static slot (prefill_cuda_graph_runner.py).
 
 Off (the default) nothing changes: Qwen4-Exp stays off the multimodal BCG allowlist, and a BCG
 capture of it (an explicit ``--cuda-graph-backend-prefill breakable``) raises instead of capturing
