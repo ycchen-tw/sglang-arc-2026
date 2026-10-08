@@ -20,7 +20,7 @@ import os
 import torch
 
 from . import serving
-from .model import CleanCache, LayerCache, require
+from .model import ASYNC_REFRESH, CleanCache, LayerCache, require
 from .ring_attention import RingWindow
 from .sampling import Proposal, distribution, sample_index
 
@@ -123,17 +123,37 @@ class StatePool:
             raise RuntimeError(f"DFlash: attaching {rid} to slot {slot}: the request holds a slot or the slot is free")
         self.slot_of[rid] = slot
 
-    def settle(self, slot) -> int:
+    def snapshot(self, slot, stream):
+        """ARC_DFLASH_REFRESH_ASYNC: (cursor, pending length, window end) of a slot, copied to pinned host memory on
+        `stream` (the forward stream, so after every cycle already launched for the slot) without waiting; `settle`
+        reads it. Nothing writes a parked slot between the two."""
+        if self.positions.device.type != "cuda":
+            return torch.stack((self.last_position[slot], self.pending_length[slot], self.positions[slot].max())), None
+        with torch.cuda.stream(stream):
+            values = torch.stack((self.last_position[slot], self.pending_length[slot], self.positions[slot].max()))
+            host = torch.empty(3, dtype=values.dtype, pin_memory=True)
+            host.copy_(values, non_blocking=True)
+            done = torch.cuda.Event()
+            done.record(stream)
+        return host, done
+
+    def settle(self, slot, snapshot=None) -> int:
         """A parked slot as prefill leaves one: no pending commit, the cursor at the end of the clean window.
 
         The pending rows are the finished request's last verify block, or, under overlap scheduling, the block of the
         one cycle a finished request still runs before the scheduler sees it finish (whose step already folded the
         last verify in). Either way they are dropped, not folded in: the window stays exactly what the drafter
         committed, and the next request appends whatever lies past it. The GR at the window's end is the pending
-        block's first predecessor. Returns that end (one host sync)."""
-        last, pending, end = torch.stack(
-            (self.last_position[slot], self.pending_length[slot], self.positions[slot].max())
-        ).tolist()
+        block's first predecessor. Returns that end (one host sync, or none from a `snapshot` taken at park time)."""
+        if snapshot is None:
+            last, pending, end = torch.stack(
+                (self.last_position[slot], self.pending_length[slot], self.positions[slot].max())
+            ).tolist()
+        else:
+            host, done = snapshot
+            if done is not None:
+                done.synchronize()  # long landed: the copy was queued when the slot was parked
+            last, pending, end = host.tolist()
         if end != last - pending:
             raise RuntimeError(f"DFlash: parked slot {slot}: window ends at {end}, cursor {last}, {pending} pending")
         gr = self.pending_gr[slot, 0].clone()
@@ -169,7 +189,9 @@ class StatePool:
     def read_request(self, rid) -> serving.DraftRequest:
         """The slot as a DraftRequest (for continuing a chunked prefill); refuses a pending commit."""
         s = self.slot_of[rid]
-        if int(self.pending_length[s]) != 0:
+        if ASYNC_REFRESH:
+            require(self.pending_length[s] == 0, f"{rid}: a pending commit cannot continue into a prefill chunk")
+        elif int(self.pending_length[s]) != 0:
             raise RuntimeError(f"{rid}: a pending commit cannot continue into a prefill chunk")
         layers = tuple(
             LayerCache(self.key[i, s : s + 1].clone(), self.value[i, s : s + 1].clone(),
@@ -341,7 +363,9 @@ class RingStatePool(StatePool):
 
     def read_request(self, rid):
         s = self.slot_of[rid]
-        if int(self.pending_length[s]) != 0:
+        if ASYNC_REFRESH:
+            require(self.pending_length[s] == 0, f"{rid}: a pending commit cannot continue into a prefill chunk")
+        elif int(self.pending_length[s]) != 0:
             raise RuntimeError(f"{rid}: a pending commit cannot continue into a prefill chunk")
         w = self.c.window
         ring = self.positions[s, :w]
