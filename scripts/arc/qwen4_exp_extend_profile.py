@@ -163,23 +163,29 @@ def _check_batch(
     return {"graph": graph}
 
 
-def _wait_traces(out_dir: str, prefix: str, timeout: float = 600.0) -> List[str]:
-    """Both ranks' traces, once their sizes stop changing."""
+def _wait_traces(log: "_Log", out_dir: str, prefix: str, timeout: float = 900.0) -> List[str]:
+    """Both ranks' traces once the server logged "Profiling done" for out_dir on TP0 and TP1 (the
+    export runs after /stop_profile returns, ~40 s and more for these traces; file sizes pause
+    between bursts, so a stable size is no sign of a finished file), each checked to be a whole gzip
+    stream. `log` is marked before /stop_profile."""
+    done = re.compile(r"\[[^\]]* TP(\d)[^\]]*\] Profiling done\. Traces are saved to: " + re.escape(out_dir.rstrip("/")) + r"/?$")
     deadline = time.monotonic() + timeout
-    last = None
-    stable = 0
+    ranks = set()
     while time.monotonic() < deadline:
-        files = sorted(glob.glob(os.path.join(out_dir, f"{prefix}-*-TP-*.trace.json.gz")))
-        sizes = tuple((f, os.path.getsize(f)) for f in files)
-        if len(files) == 2 and sizes == last:
-            stable += 1
-            if stable >= 3:
-                return files
-        else:
-            stable = 0
-        last = sizes
+        ranks = {m.group(1) for m in map(done.search, log.new_lines()) if m}
+        if ranks >= {"0", "1"}:
+            break
         time.sleep(3)
-    raise RuntimeError(f"no stable TP0+TP1 traces {prefix}-* in {out_dir} after {timeout} s (have {last})")
+    else:
+        raise RuntimeError(f"no 'Profiling done' for {out_dir} on both ranks after {timeout} s (have TP {sorted(ranks)})")
+    files = sorted(glob.glob(os.path.join(out_dir, f"{prefix}-*-TP-*.trace.json.gz")))
+    if len(files) != 2:
+        raise RuntimeError(f"expected the TP0 and TP1 traces {prefix}-* in {out_dir}, found {files}")
+    for f in files:
+        with gzip.open(f) as g:  # EOFError on a truncated stream
+            while g.read(1 << 24):
+                pass
+    return files
 
 
 def _telemetry_bins(log_path: str, since: float, key: str) -> dict:
@@ -284,8 +290,9 @@ def drive(args) -> None:
             )
             for _ in range(args.profile_reps):
                 batch()
+            log.mark()
             chk._post(f"{url}/stop_profile", None)
-            traces = _wait_traces(prof_dir, shape)
+            traces = _wait_traces(log, prof_dir, shape)
         result["shapes"][shape] = {
             "spec": spec,
             "telemetry_key": key,
