@@ -154,10 +154,47 @@ class SchedulerKeepIdentityTest(CustomTestCase):
         self.assertNotIn("load", self.events)
 
     def test_speculative_decoding_is_refused_untouched(self):
-        updater = self._updater(draft=SimpleNamespace())
-        out = updater.update_weights_from_disk(self._request())
+        """A draft other than DFlash (native MTP / EAGLE: EAGLEWorkerV2 around an EagleDraftWorker)."""
+        for draft in (
+            SimpleNamespace(),
+            SimpleNamespace(_draft_worker=SimpleNamespace(draft_runner=object())),
+        ):
+            for flush in (True, False):
+                updater = self._updater(draft=draft)
+                out = updater.update_weights_from_disk(self._request(flush_cache=flush))
+                self.assertFalse(out.success)
+                self.assertIn("speculative", out.message)
+                self.assertEqual(self.events, [])
+                self.assertEqual(self.recorded, [])
+
+    def test_dflash_draft_loads_the_target_only(self):
+        """EAGLEWorkerV2 around the DFlash drafter: the target loads, the draft is never asked to."""
+        from sglang.srt.speculative.arc_dflash.worker import DFlashDraftWorker
+
+        dflash = DFlashDraftWorker.__new__(DFlashDraftWorker)  # no GPU: only its type is read
+
+        def draft_load(recv_req):
+            raise AssertionError("keep_identity must not load into the drafter")
+
+        draft = SimpleNamespace(_draft_worker=dflash, update_weights_from_disk=draft_load)
+        for flush, events in (
+            (False, ["sync", "load", "sync"]),
+            (True, ["sync", "load", "flush", "sync"]),
+        ):
+            updater = self._updater(draft=draft)
+            out = updater.update_weights_from_disk(self._request(flush_cache=flush))
+            self.assertTrue(out.success, out.message)
+            self.assertEqual(self.events, events)
+            self.assertEqual(self.recorded, ["3"])
+
+    def test_dflash_draft_with_flush_still_needs_idle(self):
+        from sglang.srt.speculative.arc_dflash.worker import DFlashDraftWorker
+
+        draft = SimpleNamespace(_draft_worker=DFlashDraftWorker.__new__(DFlashDraftWorker))
+        updater = self._updater(draft=draft, idle=False)
+        out = updater.update_weights_from_disk(self._request(flush_cache=True))
         self.assertFalse(out.success)
-        self.assertIn("speculative", out.message)
+        self.assertIn("idle", out.message)
         self.assertEqual(self.events, [])
 
     def test_failure_after_loading_started_poisons_and_aborts(self):

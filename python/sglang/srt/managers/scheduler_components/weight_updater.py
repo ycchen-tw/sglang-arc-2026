@@ -61,6 +61,20 @@ def _get_draft_model_runner(draft_worker):
     return None
 
 
+def _dflash_draft(draft_worker) -> bool:
+    """Whether the scheduler's draft worker is EAGLEWorkerV2 running the arc
+    DFlash drafter (``ARC_DFLASH_DRAFTER``). A keep_identity update then loads
+    the target only: the drafter's own weights come from its export and are
+    never in a target delta (the target's load plan refuses names it cannot
+    place), and it reads the target's embedding and lm_head by reference
+    (``arc_dflash.heads``), so an in-place target write reaches it too. Its
+    window states keep the GR the old weights produced; that steers proposals
+    only, and rejection sampling keeps the output the new target's."""
+    from sglang.srt.speculative.arc_dflash.worker import DFlashDraftWorker
+
+    return isinstance(getattr(draft_worker, "_draft_worker", None), DFlashDraftWorker)
+
+
 def _merge_checksum_payloads(target: Dict, draft: Dict) -> Dict:
     merged_checksums = dict(target["checksums"])
     for name, chk in draft["checksums"].items():
@@ -186,9 +200,11 @@ class SchedulerWeightUpdaterManager:
         identity, with no rollback.
 
         - Refused, nothing loaded, poisoned state unchanged: under speculative
-          decoding (a draft runner would reload and re-postprocess its own
-          weights from a delta that does not carry them), or with
-          ``flush_cache`` while the scheduler is not fully idle on every rank.
+          decoding with any draft but the arc DFlash drafter (a draft runner
+          would reload and re-postprocess its own weights from a delta that
+          does not carry them; DFlash loads the target only, see
+          ``_dflash_draft``), or with ``flush_cache`` while the scheduler is
+          not fully idle on every rank.
           Without ``flush_cache`` there is no idle requirement: the mid-flight
           sync is ``pause_generation(mode="in_place")`` -> this ->
           ``continue_generation``, and the paused requests go on with the new
@@ -201,8 +217,9 @@ class SchedulerWeightUpdaterManager:
         - Success clears the poisoned state and records ``weight_version``
           (tokens of requests alive across the update are attributed per span;
           under the overlap scheduler the batch in flight at the pause samples
-          one more token per request with the old weights, which is attributed
-          to the new version).
+          one more token per request with the old weights -- under speculative
+          decoding one verify step, up to the verify width -- which is
+          attributed to the new version).
         """
 
         def refuse(message: str) -> UpdateWeightFromDiskReqOutput:
@@ -211,11 +228,12 @@ class SchedulerWeightUpdaterManager:
                 success=False, message=message, weights_poisoned=self.poisoned
             )
 
-        if self.draft_worker is not None:
+        if self.draft_worker is not None and not _dflash_draft(self.draft_worker):
             return refuse(
-                "keep_identity: speculative decoding is not supported (the draft "
-                "would reload and re-postprocess its weights from a delta that "
-                "does not carry them); nothing was loaded."
+                "keep_identity: speculative decoding is supported with the arc "
+                "DFlash drafter only (another draft would reload and re-postprocess "
+                "its weights from a delta that does not carry them); nothing was "
+                "loaded."
             )
         if recv_req.flush_cache and not self._on_every_rank(self.is_fully_idle()):
             return refuse(

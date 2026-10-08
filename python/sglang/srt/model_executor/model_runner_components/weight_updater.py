@@ -361,7 +361,7 @@ class WeightUpdater:
         if self.get_model_runner().is_draft_worker:
             raise RuntimeError(
                 "keep_identity weight updates are target-only; the scheduler "
-                "refuses them under speculative decoding"
+                "never sends them to a draft runner"
             )
         self._assert_weight_cache_inactive("update_weights_from_disk")
         error = _unsupported_derived_weight_cache_error()
