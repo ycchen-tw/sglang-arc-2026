@@ -84,3 +84,25 @@
   - `ARC_DFLASH_REFRESH_ASYNC=1`（需 `ARC_DFLASH_EXACT_PREFILL=1`，否則起服 raise）：prefill refresh 的 position 檢查改成 device assert（`require`），window 的 cursor 由 prefill 寫的 host 鏡像提供（請求 decode 後丟棄），停車 slot 的 (cursor, pending, window end) 在停車時於 forward stream 複製到 pinned memory，`settle` 讀那份。refresh 不在 forward stream 上會 raise。G4：refresh 每批 GPU −4.2 ms（−17%）、CPU −10 ms（按請求數×token 分 bin 對齊）。
   - `ARC_RS_FUSED_SOFTMAX=1`（需 `ARC_DFLASH_SPARSE_Q=1`，否則 raise）：verify 直接從 target logits 做 sparse-q rejection sampling（`reject_sampling.chain_speculative_sampling_sparse_q_from_logits`），先逐列算 div_rn(logit, T) 的 online max／sum，讀到 target 機率時才算 exp(·−M)/S，不寫出 [bs×K, vocab] 的 softmax；有 top-k／top-p 的 batch 走原路徑。精度比 torch FP32 更接近 float64；2,200 次共用亂數的判定只有 4 次不同（亂數落在邊界上）；400k 次 Monte Carlo 分布檢驗通過。kernel K=4 1.95 → 0.64 ms、K=8 3.71 → 0.93 ms；G4 decode cycle −1.3～−1.6 ms（−1.7～−2.0%），accept 長度不變。
   - 三項全開（對同一棵樹全關，按請求數×token 分 bin）：target 每批 GPU −2.5 ms、refresh −5.7 ms（−24%），decode 每輪 −1.0～−1.4 ms；gen tok/s +1.4%（第 5–16 分鐘 3,196 對 3,153，小於 run 間噪音，看分項）。
+- **RL extend 的 host 同步移除**（branch `exp/b200-perf-extend`，2026-10-08；兩個旗標都是 opt-in，沒設時行為逐位不變；GPU 只驗過和 Qwen4-Exp 的 prefill CUDA graph（`ARC_QWEN4_EXP_PREFILL_BCG=1`，下一個 commit）同開的 TP1 NVFP4，對 eager 基準逐位相同（`runs/qwen38fn_b200_perf/20261008-bcg-r3-tp1-B2`）；不開 BCG 的 eager 路徑與 TP2 還沒上 GPU）：
+  - `ARC_MAMBA_TRACK_HOST=1`
+    - 作用範圍：`extra_buffer` 下 plain EXTEND 的 mamba radix track。
+    - 原本的問題：計算 track plan 時要從 device 把資料讀回 host，而這些讀取會同步 stream。這些讀取包括：
+      - scheduler 每個請求一次的 `.item()`，以及三個 pageable 的 `torch.tensor(list, device=)`。
+      - backend 的 `mask.any()`。
+      - conv indices 的布林遮罩索引，以及 `clamp(0, qsl[-1] - 1)`。後者因為傳入 0 維 tensor，會綁到 Scalar overload 而觸發 `.item()`。
+      - `_init_track_ssm_indices` 的 6 個 `.cpu()`。
+      - GDN 的 `nonzero()`。
+      - FlashInfer checkpoint plan 的 4 個 `.cpu()`。
+    - 開旗標後的做法：
+      - scheduler 記下每個請求這次要用的 ping-pong 位置。`mamba_track_indices` 改成在 schedule stream 上把各請求的 ping-pong buffer `stack` 起來再 `gather`，跟所有寫入這些 buffer 的操作在同一條 stream、照順序執行。
+      - mask 與 seqlens 改用 pinned＋non_blocking 上傳，host 端的 list 同時保留在 `ScheduleBatch`／`ForwardBatch.mamba_extend_track_{mask,seqlens}_cpu`。
+      - backend 用這兩份鏡像加上 `extend_{seq,prefix}_lens_cpu`，在 host 上算出所有列的選擇（`layers/attention/mamba/track_host.py`），一次 pinned 上傳。slot id 在 device 上用整數索引 `gather`。
+      - 值、dtype、device 都和舊路徑相同。
+    - 只有 plain EXTEND 走新路徑，decode、verify、draft-extend、mixed 都照舊。
+    - 會 raise 的情況：plain EXTEND 帶了 track mask 卻沒有鏡像，或鏡像長度對不上。已知會碰到的有 DP attention 的 `convert_decode_to_extend`。prefill CUDA graph 的 capture batch 與 replay batch 現在都帶鏡像（runner 從 capture batch 的靜態 slot 讀出、replay batch 從 live batch 帶過來），不再 raise。
+    - `check` 模式：每個 extend 同時跑舊路徑，dtype、shape、device、值任何一項不同就 raise。這個模式本身會同步，只用來驗證。每比對 100 個 extend 印一行 `ARC_MAMBA_TRACK_HOST=check: all comparisons matched so far: {...}`，列出比對過的 extend、列數、checkpoint plan、slot gather 次數，用來確認這條路徑真的有跑到。另外，check 模式會把被拿掉的同步加回來，所以拿掉同步後才可能出現的 race 在這個模式下看不到，要另外用 `=1` 跑一輪驗證。
+    - 測試在 `test/registered/unit/layers/test_mamba_track_host.py`，涵蓋兩件事：
+      - 用隨機 batch 對舊路徑逐值比對，GDN 與 Mamba2 都有。
+      - device tensor 放在 meta 上，任何 host 讀取都會 raise。舊路徑當陽性對照，確實會 raise。
+  - `ARC_MROPE_EXTEND_PINNED=1`：`_compute_mrope_positions_extend` 拼出 3×token 的 int64 positions 後，先 pin 再 non_blocking 上傳，數值相同。原本從 pageable 記憶體上傳時，driver 要經 staging buffer 複製，大小超過 staging buffer 就會等 stream。

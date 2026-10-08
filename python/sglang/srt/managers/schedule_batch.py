@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.layers.attention.mamba import track_host as mamba_track_host
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -2116,8 +2117,11 @@ class Req(ReqDllmMixin):
 
 class _MambaRadixCacheV2TrackEntry(NamedTuple):
     track_mask: bool
-    track_index: int
+    # None under ARC_MAMBA_TRACK_HOST=1 (the slot id is gathered on the device from track_position).
+    track_index: Optional[int]
     track_seqlen: int
+    # The ping-pong position the slot id is read from (mamba_next_track_idx before the swap).
+    track_position: int
 
 
 def mamba_lazy_spec_in_window(
@@ -2372,6 +2376,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     mamba_track_seqlens: torch.Tensor = None  # shape: [b], int64
     mamba_track_mask_cpu: Optional[List[bool]] = None  # shape: [b]
     mamba_track_mask_next_cpu: Optional[List[bool]] = None  # shape: [b]
+    # ARC_MAMBA_TRACK_HOST: host copies of a plain extend's mamba_track_mask / mamba_track_seqlens (None
+    # otherwise, and always None with the flag unset). Not the decode-only mamba_track_mask_cpu above.
+    mamba_extend_track_mask_cpu: Optional[List[bool]] = None  # shape: [b]
+    mamba_extend_track_seqlens_cpu: Optional[List[int]] = None  # shape: [b]
     mamba_decode_batch_idx_cpu: Optional[List[int]] = None  # shape: [b]
     # Lazy + spec: this iteration's per-req scatter positions
     # (see mamba_lazy_spec_prepare).
@@ -2710,6 +2718,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_mask_cpu = []
         mamba_track_indices_cpu = []
         mamba_track_seqlens_cpu = []
+        mamba_track_positions = []
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             assert seq_len - pre_len == req.extend_range.length
@@ -2780,6 +2789,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 mamba_track_mask_cpu.append(track_entry.track_mask)
                 mamba_track_indices_cpu.append(track_entry.track_index)
                 mamba_track_seqlens_cpu.append(track_entry.track_seqlen)
+                mamba_track_positions.append(track_entry.track_position)
 
             if self.return_logprob:
                 # Find input logprob token ids.
@@ -2880,7 +2890,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_logprob_start_lens = extend_logprob_start_lens
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
-        if get_exec().mamba.enable_mamba_extra_buffer:
+        if (
+            get_exec().mamba.enable_mamba_extra_buffer
+            and mamba_track_host.MAMBA_TRACK_HOST == "0"
+        ):
             self.mamba_track_indices = torch.tensor(
                 mamba_track_indices_cpu,
                 dtype=torch.int64,
@@ -2896,6 +2909,30 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 dtype=torch.int64,
                 device=self.device,
             )
+        elif get_exec().mamba.enable_mamba_extra_buffer:
+            # ARC_MAMBA_TRACK_HOST: no per-request .item(), no pageable copies (see track_host.py). The
+            # gather reads the ping-pong buffers in schedule-stream order, where every write to them is issued.
+            self.mamba_track_indices = mamba_track_host.gather_track_slots(
+                [req.kv.mamba_ping_pong_track_buffer for req in reqs],
+                mamba_track_positions,
+                self.device,
+            )
+            if mamba_track_host.MAMBA_TRACK_HOST == "check":
+                gathered = self.mamba_track_indices.tolist()
+                if gathered != mamba_track_indices_cpu:
+                    raise RuntimeError(
+                        f"{mamba_track_host.MAMBA_TRACK_HOST_ENV}=check: mamba_track_indices differ: "
+                        f".item() {mamba_track_indices_cpu} vs device gather {gathered}"
+                    )
+                mamba_track_host.note_checked("slots", reqs=len(reqs))
+            self.mamba_track_mask = mamba_track_host.to_device_pinned(
+                mamba_track_mask_cpu, torch.bool, self.device
+            )
+            self.mamba_track_seqlens = mamba_track_host.to_device_pinned(
+                mamba_track_seqlens_cpu, torch.int64, self.device
+            )
+            self.mamba_extend_track_mask_cpu = mamba_track_mask_cpu
+            self.mamba_extend_track_seqlens_cpu = mamba_track_seqlens_cpu
 
         # Collect mamba init info for deferred ops on forward stream
         if any(req.kv.holds_mamba for req in reqs):
@@ -2940,9 +2977,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return i + 1
 
         mask = req.extend_range.length >= checkpoint_grid
-        track_index = req.kv.mamba_ping_pong_track_buffer[
-            req.kv.mamba_next_track_idx
-        ].item()
+        track_position = req.kv.mamba_next_track_idx
+        if mamba_track_host.MAMBA_TRACK_HOST == "1":
+            # Gathered on the device in prepare_for_extend; .item() here synchronizes the stream.
+            track_index = None
+        else:
+            track_index = req.kv.mamba_ping_pong_track_buffer[track_position].item()
         mamba_track_seqlen = -1
         if mask:
             # mamba_track_seqlen is used to calculate the indices to track in
@@ -3004,6 +3044,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             track_mask=mask,
             track_index=track_index,
             track_seqlen=mamba_track_seqlen,
+            track_position=track_position,
         )
 
     def _collect_deferred_mamba_cow_and_clear(self, reqs):
@@ -3466,6 +3507,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_clear_indices = None
         self.mamba_restore_bufs = None
         self.mamba_restore_dst_indices = None
+        # ARC_MAMBA_TRACK_HOST mirrors describe the extend this object last ran, never a decode.
+        self.mamba_extend_track_mask_cpu = None
+        self.mamba_extend_track_seqlens_cpu = None
 
         # Clear context parallel metadata - CP is only for prefill, not decode
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
@@ -3614,6 +3658,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_seqlens = None
         self.mamba_track_mask_cpu = None
         self.mamba_track_mask_next_cpu = None
+        self.mamba_extend_track_mask_cpu = None
+        self.mamba_extend_track_seqlens_cpu = None
         self.mamba_decode_batch_idx_cpu = None
         self.mamba_lazy_spec_track_positions_cpu = None
         self.mamba_cow_src_indices = None
@@ -3682,6 +3728,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_seqlens = None
         self.mamba_track_mask_cpu = None
         self.mamba_track_mask_next_cpu = None
+        self.mamba_extend_track_mask_cpu = None
+        self.mamba_extend_track_seqlens_cpu = None
         self.mamba_decode_batch_idx_cpu = None
         self.mamba_lazy_spec_track_positions_cpu = None
         if self.return_logprob and other.return_logprob:

@@ -1320,6 +1320,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         else:
             global_num_tokens_cpu = None
 
+        # ARC_MAMBA_TRACK_HOST plans an extend's track rows from host mirrors of the track mask and
+        # seqlens; give the capture batch mirrors of what its static slots hold (one read per
+        # bucket, at startup, outside any capture).
+        if registry.has_slot("mamba_track_mask"):
+            capture_track_mask_cpu = [
+                bool(x) for x in _slot("mamba_track_mask").tolist()
+            ]
+            capture_track_seqlens_cpu = [
+                int(x) for x in _slot("mamba_track_seqlens").tolist()
+            ]
+        else:
+            capture_track_mask_cpu = capture_track_seqlens_cpu = None
+
         if global_num_tokens_cpu is not None:
             global_dp_buffer_len = sum(global_num_tokens_cpu)
             num_tokens_tensor = torch.tensor(
@@ -1362,6 +1375,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     if registry.has_slot("mamba_track_seqlens")
                     else None
                 ),
+                mamba_extend_track_mask_cpu=capture_track_mask_cpu,
+                mamba_extend_track_seqlens_cpu=capture_track_seqlens_cpu,
                 encoder_lens=None,
                 return_logprob=False,
                 extend_num_tokens=num_tokens,
@@ -1660,6 +1675,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             mamba_track_indices=mamba_track_indices,
             mamba_track_mask=mamba_track_mask,
             mamba_track_seqlens=mamba_track_seqlens,
+            # bs-axis slots copied unpadded from the live batch, so its host mirrors hold.
+            mamba_extend_track_mask_cpu=forward_batch.mamba_extend_track_mask_cpu,
+            mamba_extend_track_seqlens_cpu=forward_batch.mamba_extend_track_seqlens_cpu,
             encoder_lens=forward_batch.encoder_lens,
             return_logprob=(
                 forward_batch.return_logprob

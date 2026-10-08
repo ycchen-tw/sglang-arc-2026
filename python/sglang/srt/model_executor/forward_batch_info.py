@@ -72,6 +72,11 @@ from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 # ARC: ARC_MROPE_DECODE_PAGEABLE=1 restores the upstream pageable (stream-synchronous) copy of the
 # per-request mrope deltas in multimodal decode; only for A/B. Default 0 = pinned, non_blocking.
 _ARC_MROPE_DECODE_PAGEABLE = {"0": False, "1": True}[os.environ.get("ARC_MROPE_DECODE_PAGEABLE", "0")]
+# ARC: ARC_MROPE_EXTEND_PINNED=1 (opt-in, default 0) stages the extend mrope positions (host-built, 3 x
+# extend tokens int64) in pinned memory before the non_blocking copy. From pageable memory the copy is staged
+# by the driver and, past its staging buffer, waits for the stream, so a long multimodal extend (the RL
+# rollout's agent turns) waited for the previous forward. Same values, dtype and device.
+_ARC_MROPE_EXTEND_PINNED = {"0": False, "1": True}[os.environ.get("ARC_MROPE_EXTEND_PINNED", "0")]
 
 if TYPE_CHECKING:
     from sglang.srt.layers.cp.base import BaseContextParallelMetadata
@@ -439,6 +444,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     # The seqlens to track mamba state if masked, prefill only.
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+    # ARC_MAMBA_TRACK_HOST: host copies of a plain extend's mamba_track_mask /
+    # mamba_track_seqlens (ScheduleBatch.prepare_for_extend); None otherwise.
+    mamba_extend_track_mask_cpu: Optional[List[bool]] = None  # shape: [b]
+    mamba_extend_track_seqlens_cpu: Optional[List[int]] = None  # shape: [b]
     # Deferred mamba init ops: COW pairs and clear indices (performed on forward stream)
     mamba_cow_src_indices: Optional[torch.Tensor] = None
     mamba_cow_dst_indices: Optional[torch.Tensor] = None
@@ -852,6 +861,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mamba_track_indices=batch.mamba_track_indices,
             mamba_track_mask=batch.mamba_track_mask,
             mamba_track_seqlens=batch.mamba_track_seqlens,
+            mamba_extend_track_mask_cpu=batch.mamba_extend_track_mask_cpu,
+            mamba_extend_track_seqlens_cpu=batch.mamba_extend_track_seqlens_cpu,
             mamba_cow_src_indices=batch.mamba_cow_src_indices,
             mamba_cow_dst_indices=batch.mamba_cow_dst_indices,
             mamba_clear_indices=batch.mamba_clear_indices,
@@ -1397,6 +1408,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     )
             mrope_positions_list[batch_idx] = mrope_positions
 
+        if _ARC_MROPE_EXTEND_PINNED:
+            positions = torch.cat(mrope_positions_list, dim=1).to(dtype=torch.int64)
+            if positions.is_cpu and is_pin_memory_available(model_runner.device):
+                positions = positions.pin_memory()
+            self.mrope_positions = positions.to(model_runner.device, non_blocking=True)
+            return
         self.mrope_positions = torch.cat(
             mrope_positions_list,
             dim=1,
@@ -1671,6 +1688,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.mamba_track_seqlens = self._pad_tensor_to_size(
                 self.mamba_track_seqlens, bs
             )
+        # ARC_MAMBA_TRACK_HOST mirrors pad like the tensors above (zeros: untracked rows).
+        # New lists: init_new shares them with the ScheduleBatch.
+        if self.mamba_extend_track_mask_cpu is not None:
+            self.mamba_extend_track_mask_cpu = self.mamba_extend_track_mask_cpu + [
+                False
+            ] * (bs - len(self.mamba_extend_track_mask_cpu))
+        if self.mamba_extend_track_seqlens_cpu is not None:
+            self.mamba_extend_track_seqlens_cpu = self.mamba_extend_track_seqlens_cpu + [
+                0
+            ] * (bs - len(self.mamba_extend_track_seqlens_cpu))
 
         if self.mrope_positions is not None:
             self.mrope_positions = torch.cat(

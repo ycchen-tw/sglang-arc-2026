@@ -78,6 +78,10 @@ class ForwardMetadata:
     fused_accept_num_accepted: Optional[torch.Tensor] = None
 
     has_mamba_track_mask: bool = False
+    # ARC_MAMBA_TRACK_HOST: the mask rows (int64, == mamba_track_mask.nonzero()) when
+    # the extend's track plan was built from host mirrors; None on the old path.
+    # Set means the GDN backend and the FlashInfer checkpoint plan take the host path too.
+    mamba_track_rows: Optional[torch.Tensor] = None
     mamba_track_mask_indices: Optional[torch.Tensor] = None
     conv_states_mask_indices: Optional[torch.Tensor] = None
 

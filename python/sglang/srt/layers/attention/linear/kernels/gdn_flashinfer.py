@@ -19,6 +19,7 @@ import torch
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
+from sglang.srt.layers.attention.mamba import track_host as mamba_track_host
 from sglang.srt.runtime_context import (
     mamba_cache_chunk_size,
 )
@@ -76,6 +77,33 @@ def maybe_build_flashinfer_checkpoint_plan(
         return
 
     checkpoint_every_n_tokens = mamba_cache_chunk_size()
+    if forward_metadata.mamba_track_rows is not None:
+        _build_flashinfer_checkpoint_plan_host(
+            forward_batch, forward_metadata, device, checkpoint_every_n_tokens
+        )
+        return
+    track_checkpoint_src, checkpoint_cu_starts = _flashinfer_checkpoint_plan_cpu(
+        forward_batch, checkpoint_every_n_tokens
+    )
+    if track_checkpoint_src.numel() and track_checkpoint_src.min() < 0:
+        raise ValueError("Tracked GDN state precedes the first FlashInfer checkpoint.")
+    assert track_checkpoint_src.numel() == forward_metadata.track_ssm_h_dst.numel()
+
+    forward_metadata.track_ssm_h_src = track_checkpoint_src.to(
+        device, non_blocking=True
+    )
+    forward_metadata.state_checkpoint_cu_starts = checkpoint_cu_starts.to(
+        device, non_blocking=True
+    )
+    forward_metadata.num_state_checkpoints = int(checkpoint_cu_starts[-1])
+    forward_metadata.state_checkpoint_every_n_tokens = checkpoint_every_n_tokens
+
+
+def _flashinfer_checkpoint_plan_cpu(
+    forward_batch: ForwardBatch, checkpoint_every_n_tokens: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(track checkpoint src, checkpoint cu_starts) as int64 CPU tensors, read from
+    the device tensors (four synchronizing .cpu() copies)."""
     extend_seq_lens = forward_batch.extend_seq_lens.to(device="cpu", dtype=torch.int64)
     track_mask = forward_batch.mamba_track_mask.to(device="cpu", dtype=torch.bool)
     relative_track_lens = forward_batch.mamba_track_seqlens.to(
@@ -90,17 +118,52 @@ def maybe_build_flashinfer_checkpoint_plan(
     track_checkpoint_src = checkpoint_cu_starts[:-1][use_checkpoint] + (
         relative_track_lens[use_checkpoint] // checkpoint_every_n_tokens - 1
     )
-    if track_checkpoint_src.numel() and track_checkpoint_src.min() < 0:
-        raise ValueError("Tracked GDN state precedes the first FlashInfer checkpoint.")
-    assert track_checkpoint_src.numel() == forward_metadata.track_ssm_h_dst.numel()
+    return track_checkpoint_src, checkpoint_cu_starts
 
-    forward_metadata.track_ssm_h_src = track_checkpoint_src.to(
-        device, non_blocking=True
+
+def _build_flashinfer_checkpoint_plan_host(
+    forward_batch: ForwardBatch,
+    forward_metadata: ForwardMetadata,
+    device: str,
+    checkpoint_every_n_tokens: int,
+) -> None:
+    """ARC_MAMBA_TRACK_HOST: the plan from the host mirrors instead of
+    _flashinfer_checkpoint_plan_cpu's synchronizing copies; one pinned upload,
+    same values and dtypes."""
+    src, cu_starts = mamba_track_host.plan_flashinfer_checkpoints(
+        mask=forward_batch.mamba_extend_track_mask_cpu,
+        track_seqlens=forward_batch.mamba_extend_track_seqlens_cpu,
+        prefix_lens=forward_batch.extend_prefix_lens_cpu,
+        extend_seq_lens=forward_batch.extend_seq_lens_cpu,
+        every=checkpoint_every_n_tokens,
     )
-    forward_metadata.state_checkpoint_cu_starts = checkpoint_cu_starts.to(
-        device, non_blocking=True
-    )
-    forward_metadata.num_state_checkpoints = int(checkpoint_cu_starts[-1])
+    if src and min(src) < 0:
+        raise ValueError("Tracked GDN state precedes the first FlashInfer checkpoint.")
+    assert len(src) == forward_metadata.track_ssm_h_dst.numel()
+    h_src, cu = mamba_track_host.upload_int64([src, cu_starts], device)
+    if mamba_track_host.MAMBA_TRACK_HOST == "check":
+        ref_src, ref_cu = _flashinfer_checkpoint_plan_cpu(
+            forward_batch, checkpoint_every_n_tokens
+        )
+        mamba_track_host.assert_same(
+            "track_ssm_h_src (FlashInfer checkpoints)",
+            ref_src.to(device, non_blocking=True),
+            h_src,
+        )
+        mamba_track_host.assert_same(
+            "state_checkpoint_cu_starts",
+            ref_cu.to(device, non_blocking=True),
+            cu,
+        )
+        if int(ref_cu[-1]) != cu_starts[-1]:
+            raise RuntimeError(
+                f"{mamba_track_host.MAMBA_TRACK_HOST_ENV}=check: num_state_checkpoints "
+                f"{int(ref_cu[-1])} vs {cu_starts[-1]}"
+            )
+        mamba_track_host.note_checked("checkpoints", src=len(src))
+    forward_metadata.track_ssm_h_src = h_src
+    forward_metadata.state_checkpoint_cu_starts = cu
+    forward_metadata.num_state_checkpoints = cu_starts[-1]
     forward_metadata.state_checkpoint_every_n_tokens = checkpoint_every_n_tokens
 
 

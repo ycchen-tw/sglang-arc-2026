@@ -227,6 +227,7 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
         metadata = SimpleNamespace(
             track_ssm_h_src=torch.empty(4),
             track_ssm_h_dst=torch.empty(4),
+            mamba_track_rows=None,  # the device-tensor plan (ARC_MAMBA_TRACK_HOST off)
         )
 
         # The chunk size is a derived config member; seed its private cache on a
@@ -248,7 +249,9 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
         backend = object.__new__(GDNAttnBackend)
         backend.device = "cpu"
         backend.kernel_dispatcher = SimpleNamespace(extend_uses_state_checkpoints=True)
-        metadata = SimpleNamespace(has_mamba_track_mask=True, track_ssm_h_src=None)
+        metadata = SimpleNamespace(
+            has_mamba_track_mask=True, track_ssm_h_src=None, mamba_track_rows=None
+        )
         forward_batch = SimpleNamespace(
             multi_item_delimiter_indices=None,
             mamba_track_mask=torch.tensor([True]),
