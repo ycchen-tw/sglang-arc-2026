@@ -14,15 +14,27 @@ def distributed_hisparse_enabled() -> bool:
     return value == "1"
 
 
+def tp4_attention_enabled() -> bool:
+    """ARC_HISPARSE_TP4=1 (arc L4 topology experiment): pure TP4 -- one scheduler, attention TP4 over all four ranks
+    (the 2 KV heads replicated on two ranks each) instead of attention DP2 x TP2. Only the shape gates change; the
+    consensus and the spec protocol channels take the group of four."""
+    value = os.environ.get("ARC_HISPARSE_TP4", "0")
+    if value not in ("0", "1"):
+        raise ValueError("ARC_HISPARSE_TP4 must be 0 or 1")
+    return value == "1"
+
+
 def distributed_shape_needs(view) -> dict[str, bool]:
     """Admit h25 fallback or the explicitly gated h29 NEXTN3 shape."""
     user = json.loads(view.hisparse_config) if view.hisparse_config else {}
     spec = distributed_spec_enabled()
+    tp4 = tp4_attention_enabled()
     needs = {
         "ARC_HISPARSE_DISTRIBUTED: --tp-size 4 --ep-size 4":
             view.tp_size == 4 and view.ep_size == 4,
-        "ARC_HISPARSE_DISTRIBUTED: --dp-size 2 --enable-dp-attention":
-            view.dp_size == 2 and view.enable_dp_attention,
+        "ARC_HISPARSE_DISTRIBUTED: --dp-size 2 --enable-dp-attention (ARC_HISPARSE_TP4: --dp-size 1, no DP attention)":
+            (view.dp_size == 1 and not view.enable_dp_attention) if tp4
+            else (view.dp_size == 2 and view.enable_dp_attention),
         "ARC_HISPARSE_DISTRIBUTED: one node": view.nnodes == 1,
         "ARC_HISPARSE_DISTRIBUTED: no speculative decoding":
             spec or view.speculative_algorithm is None,
@@ -208,14 +220,15 @@ def new_spec_protocols(namespace, attention_ranks):
     if dist.get_world_size() != 4:
         raise ValueError("h29 protocol channels require four target ranks")
     own = dist.get_rank()
-    if list(attention_ranks) != ([0, 1] if own < 2 else [2, 3]):
-        raise ValueError("h29 protocol channels require contiguous attention TP2 ranks")
+    groups = [[0, 1, 2, 3]] if tp4_attention_enabled() else [[0, 1], [2, 3]]
+    if list(attention_ranks) not in groups or own not in attention_ranks:
+        raise ValueError(f"h29 protocol channels require attention TP ranks in {groups}, got {list(attention_ranks)}")
     result = {}
     for channel in ("allocation", "forward"):
-        for ranks in ([0, 1], [2, 3]):
+        for ranks in groups:
             group = dist.new_group(ranks, backend="gloo")
             if own in ranks:
-                result[channel] = AttentionTPConsensus(group, 2, namespace + ":spec-" + channel)
+                result[channel] = AttentionTPConsensus(group, len(ranks), namespace + ":spec-" + channel)
     return result
 
 

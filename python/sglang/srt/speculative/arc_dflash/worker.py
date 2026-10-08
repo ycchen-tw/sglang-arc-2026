@@ -214,9 +214,17 @@ def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, 
         raise ValueError(f"{directory}: not a dense B8 drafter (ffn_type {c.ffn_type}, block {c.block_size})")
     rank, size = group.rank_in_group, group.world_size
     shard = size > 1 and os.environ.get("ARC_DFLASH_ATTN_TP", "1") == "1"
-    if shard and (c.num_attention_heads % size or c.num_key_value_heads % size):
-        raise ValueError(f"{c.num_attention_heads}/{c.num_key_value_heads} heads do not divide across {size} ranks")
-    heads, kv, dim = c.num_attention_heads // size, c.num_key_value_heads // size, c.head_dim
+    kv_rep = 1  # ranks sharing one KV head
+    if shard:
+        if c.num_attention_heads % size:
+            raise ValueError(f"{c.num_attention_heads} query heads do not divide across {size} ranks")
+        if c.num_key_value_heads % size:
+            # more ranks than KV heads (L4 pure TP4: 24 query / 2 KV heads over 4): each KV head is replicated on
+            # size / num_kv ranks, each holding a contiguous part of that head's query group (GQA groups stay whole)
+            if size % c.num_key_value_heads:
+                raise ValueError(f"{c.num_key_value_heads} KV heads neither divide nor tile {size} ranks")
+            kv_rep = size // c.num_key_value_heads
+    heads, kv, dim = c.num_attention_heads // size, max(1, c.num_key_value_heads // size), c.head_dim
 
     def attention_slice(name):
         """(axis, start, count) of this rank's part of an attention projection, or None (kept whole)."""
@@ -226,7 +234,7 @@ def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, 
         if proj == "q_proj":  # [head, 2 * head_dim] rows per head: the value and its gate, contiguous
             return 0, rank * heads * 2 * dim, heads * 2 * dim
         if proj in ("k_proj", "v_proj"):
-            return 0, rank * kv * dim, kv * dim
+            return 0, (rank // kv_rep) * kv * dim, kv * dim
         if proj == "o_proj":
             return 1, rank * heads * dim, heads * dim
         return None
