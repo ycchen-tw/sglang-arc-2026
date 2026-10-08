@@ -1445,6 +1445,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            # arc-forge S0 (ARC_EXTEND_TELEMETRY): events + host times around the target
+            # extend and the draft refresh; None when off.
+            from sglang.srt.managers.arc_extend_telemetry import get_extend_telemetry
+
+            telemetry = get_extend_telemetry()
+            extend_record = (
+                telemetry.begin(batch)
+                if telemetry is not None and not batch.forward_mode.is_idle()
+                else None
+            )
             # arc: the DFlash drafter's ids are read before the target forward, whose mm embed may rewrite the media
             # positions of batch.input_ids in place (DFlashDraftWorker.prefill_draft_ids).
             draft_extend_kwargs = {}
@@ -1465,6 +1475,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 pp_proxy_tensors=pp_proxy_tensors,
                 capture_hidden_mode=target_capture_mode,
             )
+            if extend_record is not None:
+                telemetry.target_done(extend_record)
 
             # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
             # Extend processed L prompt tokens; next verify iter expects same L.
@@ -1476,6 +1488,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # A rank that does not host the draft (prefill-side PP builds it only on
             # the last stage) forwards the target's proxy tensors and stops here.
             if self._draft_worker is None:
+                if extend_record is not None:
+                    telemetry.end(extend_record)
                 return batch_output
 
             # Draft prefill
@@ -1494,7 +1508,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         **draft_extend_kwargs,
                     )
                 )
-                return batch_output
+            if extend_record is not None:
+                telemetry.end(extend_record)
+            return batch_output
         else:
             self.activate_step_by_batch(batch.seq_lens.shape[0])
             # arc-forge d02: per-phase GPU time (ARC_SPEC_PHASE_TIMING)

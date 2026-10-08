@@ -188,6 +188,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightVersionReqOutput,
     sock_send,
 )
+from sglang.srt.managers.arc_extend_telemetry import get_extend_telemetry
 from sglang.srt.managers.load_snapshot import create_load_snapshot_writer
 from sglang.srt.managers.min_free_slots_delayer import (
     MinFreeSlotsDelayer,
@@ -1463,6 +1464,8 @@ class Scheduler(
                     device=self.tp_group.device,
                     debug_log_enabled=self.ps.attn_tp_rank == 0,
                 )
+        # arc-forge S0: bad ARC_EXTEND_TELEMETRY values fail at startup, not at the first extend batch.
+        get_extend_telemetry()
 
         # NOTE: preemption is enabled by default for priority scheduling.
         self.enable_priority_preemption = (
