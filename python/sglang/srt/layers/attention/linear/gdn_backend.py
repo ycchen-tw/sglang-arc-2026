@@ -2,8 +2,10 @@ from typing import Optional, Tuple, Union
 
 import msgspec
 import torch
+import triton
 
 from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
+from sglang.kernels.ops.attention.fla import index as fla_index
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -536,6 +538,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
         self.mis_metadata = None
+        if fla_index.HOST_CHUNK_INDICES != "0":
+            self._plan_chunk_indices(forward_batch)
         if forward_batch.multi_item_delimiter_indices is not None:
             if not self.enable_mis:
                 raise ValueError("GDN MIS metadata requires --enable-mis")
@@ -557,6 +561,24 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 maybe_build_flashinfer_checkpoint_plan(
                     forward_batch, self.forward_metadata, self.device
                 )
+
+    def _plan_chunk_indices(self, forward_batch: ForwardBatch):
+        """ARC_GDN_HOST_CHUNK_INDICES: the chunk prefill's chunk indices from the host extend lengths, so the first
+        GDN layer does not synchronize (fla/index.py). Chunk size 64 everywhere, plus chunk_fwd_o's
+        min(64, max(16, next_power_of_2(T))) when the batch has fewer than 64 tokens."""
+        mode = forward_batch.forward_mode
+        if not mode.is_extend(include_draft_extend_v2=True) or mode.is_target_verify():
+            return
+        query_start_loc = self.forward_metadata.query_start_loc
+        if query_start_loc is None:  # a draft-extend-v2 batch without linear metadata
+            return
+        lens = forward_batch.extend_seq_lens_cpu
+        if lens is None:
+            raise RuntimeError(f"{fla_index.HOST_CHUNK_INDICES_ENV}: a {mode} batch without extend_seq_lens_cpu")
+        tokens = sum(lens)
+        fla_index.plan_chunk_indices(
+            query_start_loc, lens, (FLA_CHUNK_SIZE, min(FLA_CHUNK_SIZE, max(16, triton.next_power_of_2(tokens))))
+        )
 
     def forward_decode(
         self,

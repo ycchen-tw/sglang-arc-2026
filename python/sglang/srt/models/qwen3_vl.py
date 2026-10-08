@@ -52,6 +52,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.managers.mm_schedule import MM_NO_SYNC
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
@@ -1014,6 +1015,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         forward_metadata = prepare_vision_attention_metadata(
             cu_seqlens,
             device=self.device,
+            # ARC_MM_NO_SYNC: the same value from the host copy, without a .item() on the device cu_seqlens
+            max_seqlen=int(np.diff(token_cu_seqlens).max()) if MM_NO_SYNC else None,
             packed_indptrs=packed_indptrs,
             sequence_lengths=flashinfer_sequence_lengths,
             flashinfer_max_seqlen=flashinfer_max_seqlen,
