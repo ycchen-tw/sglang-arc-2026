@@ -12,7 +12,8 @@ graphs. Per cycle:
   verify                      SGLang's run_eagle_verify, unchanged (chain RS kernel: draft_probs row j <-> slot j+1)
   _draft_extend_for_decode    records [bonus, p1..p_{K-1}] with the verify GR and the accept length as a pending
                               commit; nothing runs (the next draft() folds it in)
-  _draft_extend_for_prefill   builds or extends the request's window cache from the prefill GR
+  _draft_extend_for_prefill   builds or extends the request's window cache from the prefill GR and the ids
+                              prefill_draft_ids took before the target forward (media pads -> <|image_pad|>)
 
 Where it runs: on the attention-TP group of this rank. One GPU (G4: TP1) is a group of one. With attention DP
 (L4: TP4 target, attention DP2) each DP group's attention-TP ranks run one drafter together, with collectives only on
@@ -555,7 +556,23 @@ class DFlashDraftWorker:
 
     # ---- prefill ---------------------------------------------------------------------------------------------
     @torch.no_grad()
-    def _draft_extend_for_prefill(self, batch, target_hidden_states, next_token_ids, mm_input_embeds=None):
+    def prefill_draft_ids(self, batch):
+        """The drafter's ids for an extend batch. EAGLEWorkerV2 takes them before the target forward.
+
+        Multimodal prompts carry per-item hash values in place of the media pad ids (SGLang's radix keys, all out of
+        vocab); the target reads vision embeddings there. The drafter is text-only: it sees <|image_pad|> at every
+        image and video pad, its training view (arc-forge capture_tito.drafter_ids). The target's mm embed rewrites
+        those positions in place (to vocab_size - 1, or <|image_pad|> / <|video_pad|> with --ple-mm-placeholder-ids)
+        in the tensor model.forward receives: the eager runner's input copy by default, batch.input_ids itself under
+        SGLANG_EAGER_INPUT_NO_COPY, --enable-pdmux or a full prefill CUDA graph. Read after the forward, a rewritten
+        position is in vocab and the drafter would see 248319 or <|video_pad|> there."""
+        ids = batch.input_ids
+        return torch.where((ids >= 0) & (ids < self.vocab), ids, torch.full_like(ids, self.image_token))
+
+    @torch.no_grad()
+    def _draft_extend_for_prefill(self, batch, target_hidden_states, next_token_ids, mm_input_embeds=None, *,
+                                  draft_ids):
+        """draft_ids: prefill_draft_ids(batch), taken before the target forward (None for an idle batch)."""
         from sglang.srt.speculative.eagle_info import EagleDraftInput
 
         if batch.forward_mode.is_idle():
@@ -564,8 +581,13 @@ class DFlashDraftWorker:
                 topk_index=torch.empty((0, 1), dtype=torch.int64, device=self.device),
                 bonus_tokens=next_token_ids, num_tokens_per_req=1, num_tokens_for_logprob_per_req=1,
             )
+        if draft_ids is None or draft_ids.shape != batch.input_ids.shape:
+            raise RuntimeError(
+                f"DFlash prefill: draft ids {None if draft_ids is None else tuple(draft_ids.shape)} for input_ids "
+                f"{tuple(batch.input_ids.shape)}; prefill_draft_ids must run on this batch before the target forward"
+            )
         c = self.model.config
-        ids = batch.input_ids
+        ids = draft_ids
         target_hidden_states = self._unpad(target_hidden_states, ids.numel(), "prefill")
         if target_hidden_states is None or tuple(target_hidden_states.shape) != (ids.numel(), c.hc_count * c.hidden_size):
             raise RuntimeError(
@@ -573,9 +595,6 @@ class DFlashDraftWorker:
                 f"!= [{ids.numel()}, {c.hc_count * c.hidden_size}]"
             )
         gr = target_hidden_states.view(-1, c.hc_count, c.hidden_size)
-        # Multimodal prompts carry per-image hash values in place of the image pad ids (SGLang's radix keys);
-        # the target reads vision embeddings there. The drafter is text-only: it sees <|image_pad|> instead.
-        ids = torch.where((ids >= 0) & (ids < self.vocab), ids, torch.full_like(ids, self.image_token))
         offset = 0
         begin = time.perf_counter()
         for req, length, start in zip(batch.reqs, batch.extend_lens, batch.prefix_lens, strict=True):

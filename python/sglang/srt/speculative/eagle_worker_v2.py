@@ -1445,6 +1445,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            # arc: the DFlash drafter's ids are read before the target forward, whose mm embed may rewrite the media
+            # positions of batch.input_ids in place (DFlashDraftWorker.prefill_draft_ids).
+            draft_extend_kwargs = {}
+            if self._dflash:
+                draft_extend_kwargs["draft_ids"] = (
+                    None
+                    if batch.forward_mode.is_idle()
+                    else self._draft_worker.prefill_draft_ids(batch)
+                )
             # Target prefill
             target_capture_mode = (
                 CaptureHiddenMode.NULL
@@ -1482,6 +1491,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         batch_output.logits_output.hidden_states,
                         batch_output.next_token_ids,
                         batch_output.logits_output.mm_input_embeds,
+                        **draft_extend_kwargs,
                     )
                 )
                 return batch_output
