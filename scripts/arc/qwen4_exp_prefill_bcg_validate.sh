@@ -6,11 +6,12 @@
 #   bash scripts/arc/qwen4_exp_prefill_bcg_validate.sh s2          # TP1 NVFP4: A2 (GPU2) + B2 = B1 + task-2 flags (GPU3)
 #   bash scripts/arc/qwen4_exp_prefill_bcg_validate.sh s3          # compare only (no GPU)
 #   bash scripts/arc/qwen4_exp_prefill_bcg_validate.sh s4          # TP2 FP8 SPEC=none: A1 -> B1 -> A2, then compare
-#   bash scripts/arc/qwen4_exp_prefill_bcg_validate.sh s4d         # TP2 FP8 SPEC=dflash K4: A -> B, then compare
+#   bash scripts/arc/qwen4_exp_prefill_bcg_validate.sh s4d         # TP2 FP8 SPEC=dflash K4, --random-seed 1234: A -> B, then compare
 #   bash scripts/arc/qwen4_exp_prefill_bcg_validate.sh s5 off|on   # real harness, 16 groups x 15 min (run_arms.sh)
 #
 # RUN=<tag> names a fresh set of arm directories ($DAY-bcg-<tag>-<arm>) for a rerun of the steps.
-# s3/s4/s4d also run `isolation` on each arm: gated (--expect-bitwise) on the graph arms.
+# s3/s4/s4d also run `isolation` on each arm: gated (--expect-bitwise) on the graph arms. Collects from
+# before the iso_*_pad2/fill2 cases (RUN=r3) no longer pass `isolation`; their s3 output is in the run dirs.
 #
 # Rules this script enforces: GPUs 2,3 only; ports 30620-30629; servers only through arc-forge's serve_arm.sh
 # (systemd user unit b200perf-p<PORT>), stopped only with `systemctl --user stop` of that unit; every ARM_DIR new
@@ -88,10 +89,11 @@ compare() {
     echo "== compare $1 vs $2"
     "$PY" "$CHECK" compare "$BASE$1/collect.json" "$BASE$2/collect.json" | tee "$BASE$2/compare-vs-$1.txt"
 }
-# iso <arm> [--expect-bitwise]: padding isolation within one arm (gate it on graph arms)
+# iso <arm> [--expect-bitwise [--gate-single]]: padding isolation within one arm (gate it on graph
+# arms; --gate-single only where FlashInfer's GDN prefill never takes its CP kernel, i.e. TP1)
 iso() {
-    echo "== isolation $1 ${2:-(reported only)}"
-    "$PY" "$CHECK" isolation "$BASE$1/collect.json" ${2:+"$2"} | tee "$BASE$1/isolation.txt"
+    echo "== isolation $1 ${*:2}"
+    "$PY" "$CHECK" isolation "$BASE$1/collect.json" "${@:2}" | tee "$BASE$1/isolation.txt"
 }
 
 case ${1:?step} in
@@ -122,8 +124,8 @@ case ${1:?step} in
         compare tp1-A1 tp1-B1 || rc=1
         compare tp1-A1 tp1-B2 || rc=1
         iso tp1-A1
-        iso tp1-B1 --expect-bitwise || rc=1
-        iso tp1-B2 --expect-bitwise || rc=1
+        iso tp1-B1 --expect-bitwise --gate-single || rc=1
+        iso tp1-B2 --expect-bitwise --gate-single || rc=1
         exit $rc
         ;;
     s4)
@@ -146,11 +148,13 @@ case ${1:?step} in
         exit $rc
         ;;
     s4d)
-        start tp2-dA 30627 2,3 2 fp8 dflash "$DET" "$ROUTED"
+        # A fixed --random-seed on both arms: DFlash's verify draws from the server RNG, so unseeded arms
+        # do not reproduce the decode even eager vs eager (ARC.md, 2026-10-08 r5 dA/dA2)
+        start tp2-dA 30627 2,3 2 fp8 dflash "$DET" "$ROUTED --random-seed 1234"
         ready tp2-dA
         collect tp2-dA
         stop tp2-dA
-        start tp2-dB 30628 2,3 2 fp8 dflash "$DET $ON" "$ROUTED --cuda-graph-bs-prefill $BUCKETS"
+        start tp2-dB 30628 2,3 2 fp8 dflash "$DET $ON" "$ROUTED --random-seed 1234 --cuda-graph-bs-prefill $BUCKETS"
         ready tp2-dB
         collect tp2-dB
         stop tp2-dB

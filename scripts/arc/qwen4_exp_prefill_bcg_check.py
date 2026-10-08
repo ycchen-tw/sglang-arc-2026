@@ -9,7 +9,9 @@ same GPUs (start, `collect`, stop, start the other, `collect`), then `compare`:
 
 Both need the three determinism switches, or nothing below is reproducible even eager vs eager
 (memory qsa-fast-topk-nondeterminism): ARC_QSA_TOPK_EXACT=1 SGLANG_FLASHINFER_MOE_FUSED_FINALIZE=0
-ARC_HC_MIX_DETERMINISTIC=1. Add --enable-return-routed-experts to both to compare routing.
+ARC_HC_MIX_DETERMINISTIC=1. Add --enable-return-routed-experts to both to compare routing. With
+DFlash also the same --random-seed on both: its verify draws from the server RNG, and unseeded
+servers do not reproduce the decode even eager vs eager.
 
 Control first: start A twice (A1, A2) and `compare a1.json a2.json`. It must pass; if it does not,
 the A-vs-B result means nothing (serving is not batch-invariant, so a restart alone can move
@@ -27,20 +29,29 @@ logprobs). Then `compare a1.json b.json`.
                          extends on P's cached KV and the mamba state the extend tracked at the
                          last multiple of 64 <= n (P's very end for n = 1088, 3328; 704 for 722;
                          none for 17), 16 output tokens alone (bs=1)
+             iso_<n>_pad2 / iso_<n>_fill2   the same with an 8-token companion request after P in
+                         both variants ([P, C] padded vs [P, C, filler]): every extend holds >= 2
+                         sequences. FlashInfer's GDN prefill (use_cp="auto") switches a lone
+                         sequence to its context-parallel kernel when num_seqs x v-heads-per-rank
+                         x 4 < SMs (TP2 on B200: 24 heads, so 1 sequence -> CP, 2 -> not), which
+                         makes pad (1 sequence) vs fill (2) differ for a reason that is not
+                         padding; pad2/fill2 never switch
              prefix      a 10240-token prompt, then it + 1024 tokens: the second extend runs on a
                          cached prefix (mamba/PLE track restore, QSA prefix path) at an exact bucket
              pad_prefix_800  the same cached prefix + 800 other tokens (padded to 896)
            and records per request: every prompt token's logprob and top-5 ids, 16 greedy output
            tokens and their logprobs, cached_tokens, spec counters, routed experts.
   compare  a.json b.json   exit 1 unless every case whose extends all run at an exact bucket
-           (exact_*, prefix, iso_*_fill, iso_<n>_fill_follow for 64 | n) is bitwise identical.
+           (exact_*, prefix, iso_*_fill[2], iso_<n>_fill[2]_follow for 64 | n) is bitwise identical.
            pad_* replays at a larger M than eager runs it, so GEMMs may pick other tiles; pair_*
            depends on both servers batching the two prompts alike; both reported only.
-  isolation x.json [--expect-bitwise]   within one server, iso_<n>_pad vs iso_<n>_fill: P's
-           extend at the same M, once next to padding rows and once next to a real request. On the
-           graph server (--expect-bitwise) P's routed experts and the whole follow-up (prompt and
-           output logprobs, ids, routing) must match bitwise: a padding row leaking into P's rows,
-           its KV or its GDN state shows up there. P's own logprobs come from the eager LM head
+  isolation x.json [--expect-bitwise] [--gate-single]   within one server, iso_<n>_pad2 vs
+           iso_<n>_fill2 (and iso_<n>_pad vs iso_<n>_fill): P's extend at the same M, once next to
+           padding rows and once next to a real request. On the graph server (--expect-bitwise)
+           P's routed experts and the whole follow-up (prompt and output logprobs, ids, routing)
+           must match bitwise: a padding row leaking into P's rows, its KV or its GDN state shows
+           up there. The single-sequence pair is gated only with --gate-single (where the GDN CP
+           switch above never fires, e.g. TP1 on B200). P's own logprobs come from the eager LM head
            at a different M (n vs bucket rows) and are reported only. The first decode step after
            a fill extend would hold the finished filler too (overlap scheduler), so P's decode is
            not compared; the follow-up decodes alone. On the eager server this measures how far
@@ -78,13 +89,14 @@ PAD_SIZES = (17, 722, 1100)
 # where leaked padding tokens would land; 722 restores the state at 704, 17 none.
 ISO_CASES = ((17, 32), (722, 768), (1088, 1280), (3328, 4096))
 ISO_FOLLOW = 256  # a captured bucket
+ISO_COMPANION = 8  # pad2/fill2: a second sequence in every extend (see the docstring)
 MAMBA_TRACK_GRID = 64
 
 
 def _gated(name: str) -> bool:
     if name.startswith(("exact_", "prefix")):
         return True
-    m = re.fullmatch(r"iso_(\d+)_fill(_follow)?", name)
+    m = re.fullmatch(r"iso_(\d+)_fill2?(_follow)?", name)
     return bool(m) and (m.group(2) is None or int(m.group(1)) % MAMBA_TRACK_GRID == 0)
 
 
@@ -183,18 +195,18 @@ def collect(args) -> None:
     buckets = server_info["cuda_graph_bs_prefill"]
     if buckets is not None:
         for n, bucket in ISO_CASES:
-            padded_to = min(b for b in buckets if b >= n)
-            if padded_to != bucket:
-                raise RuntimeError(
-                    f"iso_{n} pads to {padded_to} under --cuda-graph-bs-prefill {buckets}, but "
-                    f"ISO_CASES sizes its filler for {bucket}"
-                )
+            for rows in (n, n + ISO_COMPANION):
+                padded_to = min(b for b in buckets if b >= rows)
+                if padded_to != bucket:
+                    raise RuntimeError(
+                        f"iso_{n}: {rows} rows pad to {padded_to} under --cuda-graph-bs-prefill "
+                        f"{buckets}, but ISO_CASES sizes its filler for {bucket}"
+                    )
         if ISO_FOLLOW not in buckets:
             raise RuntimeError(f"ISO_FOLLOW {ISO_FOLLOW} is not a captured bucket: {buckets}")
     flushed = _flush(url)
     exact = [int(x) for x in args.exact_sizes.split(",") if x]
     cases: Dict[str, List[dict]] = {}
-    seed = 1000
 
     def run(name, prompts, logprob_start=0, max_new_tokens=None):
         print(f"  {name}: {[len(p) for p in prompts]} tokens", flush=True)
@@ -209,32 +221,53 @@ def collect(args) -> None:
             )
         ]
 
-    for n in exact:
-        seed += 1
-        run(f"exact_{n}", [_tokens(seed, n)])
-    for n in PAD_SIZES:
-        seed += 1
-        run(f"pad_{n}", [_tokens(seed, n)])
-    seed += 1
-    run("pair_600_424", [_tokens(seed, 600), _tokens(seed + 50, 424)])
-    for n, bucket in ISO_CASES:
+    # Phase 1 runs every case whose extends are all exact buckets on the graph server, before any
+    # padded one: the graph and the eager server then share the request history up to the last
+    # gated case. Spec decoding (DFlash) depends on that history, not only on the request: the
+    # eager server alone decodes the same request differently after different earlier requests.
+    exact_prompts = {n: _tokens(1000 + 1 + i, n) for i, n in enumerate(exact)}
+    pad_seed = 1000 + len(exact)
+    pair_seed = pad_seed + len(PAD_SIZES) + 1
+    prefix_seed = pair_seed + 100
+
+    def iso(n: int, bucket: int, variant: str) -> None:
         prompt = _tokens(3000 + n, n)
-        follow = prompt + _tokens(4000 + n, ISO_FOLLOW)
-        for variant, prompts in (("pad", [prompt]), ("fill", [prompt, _tokens(5000 + n, bucket - n)])):
-            # each variant extends P from scratch
-            _flush(url)
-            run(f"iso_{n}_{variant}", prompts, max_new_tokens=[1] * len(prompts))
-            run(f"iso_{n}_{variant}_follow", [follow], logprob_start=n)
-    seed += 100
-    prefix = _tokens(seed, PREFIX_TOKENS)
+        companion = _tokens(6000 + n, ISO_COMPANION)
+        prompts = {
+            "pad": [prompt],
+            "fill": [prompt, _tokens(5000 + n, bucket - n)],
+            "pad2": [prompt, companion],
+            "fill2": [prompt, companion, _tokens(7000 + n, bucket - n - ISO_COMPANION)],
+        }[variant]
+        # each variant extends P from scratch
+        _flush(url)
+        run(f"iso_{n}_{variant}", prompts, max_new_tokens=[1] * len(prompts))
+        run(f"iso_{n}_{variant}_follow", [prompt + _tokens(4000 + n, ISO_FOLLOW)], logprob_start=n)
+
+    for n in exact:
+        run(f"exact_{n}", [exact_prompts[n]])
+    run("pair_600_424", [_tokens(pair_seed, 600), _tokens(pair_seed + 50, 424)])
+    phase1_iso = [(n, b) for n, b in ISO_CASES if n % MAMBA_TRACK_GRID == 0]
+    for n, bucket in phase1_iso:
+        for variant in ("fill", "fill2"):
+            iso(n, bucket, variant)
+    prefix = _tokens(prefix_seed, PREFIX_TOKENS)
     # warm the radix cache with the prefix (its chunks also run through the graph or eager)
     _generate(url, [prefix], logprob_start=PREFIX_TOKENS - 1, routed=False)
-    run("prefix", [prefix + _tokens(seed + 1, PREFIX_EXTRA)], logprob_start=PREFIX_TOKENS)
+    run("prefix", [prefix + _tokens(prefix_seed + 1, PREFIX_EXTRA)], logprob_start=PREFIX_TOKENS)
+    # Phase 2: padded extends
     run(
         f"pad_prefix_{PREFIX_EXTRA_PAD}",
-        [prefix + _tokens(seed + 2, PREFIX_EXTRA_PAD)],
+        [prefix + _tokens(prefix_seed + 2, PREFIX_EXTRA_PAD)],
         logprob_start=PREFIX_TOKENS,
     )
+    for i, n in enumerate(PAD_SIZES):
+        run(f"pad_{n}", [_tokens(pad_seed + 1 + i, n)])
+    for n, bucket in ISO_CASES:
+        done = ("fill", "fill2") if (n, bucket) in phase1_iso else ()
+        for variant in ("pad", "fill", "pad2", "fill2"):
+            if variant not in done:
+                iso(n, bucket, variant)
 
     with open(args.out, "w") as f:
         json.dump({"server_info": server_info, "flush": flushed, "cases": cases}, f)
@@ -318,8 +351,13 @@ def _routed(rec: dict) -> np.ndarray:
     return np.array(r["data"]).reshape(r["shape"])
 
 
-def _routed_diff(ra: dict, rb: dict) -> tuple:
+def _routed_diff(ra: dict, rb: dict, rows: Optional[int] = None) -> tuple:
     ea, eb = _routed(ra), _routed(rb)
+    if rows is not None:
+        # the prompt rows only (routing of the decoded tokens follows the decode)
+        if ra["routed_experts"]["start"] != 0 or rb["routed_experts"]["start"] != 0:
+            raise RuntimeError("routed experts do not start at token 0")
+        ea, eb = ea[:rows], eb[:rows]
     if ra["routed_experts"]["start"] != rb["routed_experts"]["start"] or ea.shape != eb.shape:
         return False, (
             f"start/shape {ra['routed_experts']['start']}/{ea.shape} vs "
@@ -333,48 +371,76 @@ def _routed_diff(ra: dict, rb: dict) -> tuple:
     return tok.size == 0, desc
 
 
+def _iso_pair(
+    cases: dict, n: int, bucket: int, pad: str, fill: str, gate: bool, decode_gated: bool
+) -> bool:
+    """P's extend next to padding rows (iso_<n>_<pad>) vs next to a real request (iso_<n>_<fill>),
+    and the follow-up after each; prints both, returns whether they match bitwise. Without
+    decode_gated (spec decoding) the follow-up's decode is reported only."""
+    tag = "GATE" if gate else "info"
+    pa, *pad_rest = cases[f"iso_{n}_{pad}"]
+    pf, *fill_rest = cases[f"iso_{n}_{fill}"]
+    (fa,) = cases[f"iso_{n}_{pad}_follow"]
+    (ff,) = cases[f"iso_{n}_{fill}_follow"]
+    if len(fill_rest) != len(pad_rest) + 1:
+        raise RuntimeError(f"iso_{n}_{fill} holds {1 + len(fill_rest)} requests, {pad} {1 + len(pad_rest)}")
+    for rec in [pa, pf, *pad_rest, *fill_rest]:
+        if rec["cached_tokens"] != 0:
+            raise RuntimeError(f"iso_{n}_{pad}/{fill}: a request cached {rec['cached_tokens']} tokens after a flush")
+        if len(rec["output_ids"]) != 1:
+            raise RuntimeError(f"iso_{n}_{pad}/{fill}: a request decoded {len(rec['output_ids'])} tokens, not 1")
+    # P's extend: the body rows (routing) must match; its logprobs come from the LM head at a
+    # different row count
+    p_routed_same, p_routed = _routed_diff(pa, pf)
+    n_in, max_in = _diff(pa["input_logprobs"], pf["input_logprobs"])
+    print(
+        f"{tag} iso_{n} {pad}/{fill} (bucket {bucket}) P extend: routed {p_routed} | reported only: "
+        f"prompt lp {n_in} differ (max {max_in}), top{TOP_K} "
+        f"{'same' if pa['input_top_ids'] == pf['input_top_ids'] else 'DIFF'}, first output "
+        f"{'same' if pa['output_ids'] == pf['output_ids'] else 'DIFF'}"
+    )
+    # the follow-up is the same request on P's cached KV / mamba state: all of it must match
+    expect_cached = n // MAMBA_TRACK_GRID * MAMBA_TRACK_GRID
+    f_in, f_max_in = _diff(fa["input_logprobs"], ff["input_logprobs"])
+    f_out, f_max_out = _diff(fa["output_logprobs"], ff["output_logprobs"])
+    f_routed_same, f_routed = _routed_diff(fa, ff, None if decode_gated else n + ISO_FOLLOW)
+    f_top = fa["input_top_ids"] == ff["input_top_ids"]
+    f_ids = fa["output_ids"] == ff["output_ids"]
+    f_cached = fa["cached_tokens"] == ff["cached_tokens"]
+    follow_same = f_in == 0 and f_top and f_routed_same and f_cached
+    if decode_gated:
+        follow_same = follow_same and f_out == 0 and f_ids
+    decode = (
+        f"output ids {'same' if f_ids else 'DIFF'}, output lp {f_out} differ (max {f_max_out})"
+    )
+    print(
+        f"{tag} iso_{n} {pad}/{fill} follow-up: cached {fa['cached_tokens']}/{ff['cached_tokens']} "
+        f"(the 64-grid predicts {expect_cached}), prompt lp {f_in} differ (max {f_max_in}), "
+        f"top{TOP_K} {'same' if f_top else 'DIFF'}, "
+        + (f"{decode}, routed {f_routed}" if decode_gated else
+           f"prompt rows routed {f_routed} | spec decode, reported only: {decode}")
+    )
+    return p_routed_same and follow_same
+
+
 def isolation(args) -> int:
-    cases = json.load(open(args.x))["cases"]
-    tag = "GATE" if args.expect_bitwise else "info"
+    collected = json.load(open(args.x))
+    cases = collected["cases"]
+    # spec decoding: the eager server alone decodes the same follow-up differently after different
+    # earlier requests (DFlash, 2026-10-08), so only the follow-up's prompt side is gated
+    decode_gated = collected["server_info"]["speculative_algorithm"] is None
+    if f"iso_{ISO_CASES[0][0]}_pad2" not in cases:
+        raise RuntimeError(f"{args.x} predates the iso_*_pad2/fill2 cases; collect it again")
     failed = []
     for n, bucket in ISO_CASES:
-        (pa,) = cases[f"iso_{n}_pad"]
-        pf, filler = cases[f"iso_{n}_fill"]
-        (fa,) = cases[f"iso_{n}_pad_follow"]
-        (ff,) = cases[f"iso_{n}_fill_follow"]
-        if pa["cached_tokens"] != 0 or pf["cached_tokens"] != 0:
-            raise RuntimeError(
-                f"iso_{n} cached {pa['cached_tokens']}/{pf['cached_tokens']} tokens after a flush"
-            )
-        if len(filler["output_ids"]) != 1:
-            raise RuntimeError(f"iso_{n}_fill filler decoded {len(filler['output_ids'])} tokens, not 1")
-        # P's extend: the body rows (routing) must match; its logprobs come from the LM head at
-        # n vs bucket rows
-        p_routed_same, p_routed = _routed_diff(pa, pf)
-        n_in, max_in = _diff(pa["input_logprobs"], pf["input_logprobs"])
-        print(
-            f"{tag} iso_{n} (bucket {bucket}) P extend: routed {p_routed} | reported only: prompt lp "
-            f"{n_in} differ (max {max_in}), top{TOP_K} "
-            f"{'same' if pa['input_top_ids'] == pf['input_top_ids'] else 'DIFF'}, first output "
-            f"{'same' if pa['output_ids'] == pf['output_ids'] else 'DIFF'}"
-        )
-        # the follow-up is the same request on P's cached KV / mamba state: all of it must match
-        expect_cached = n // MAMBA_TRACK_GRID * MAMBA_TRACK_GRID
-        f_in, f_max_in = _diff(fa["input_logprobs"], ff["input_logprobs"])
-        f_out, f_max_out = _diff(fa["output_logprobs"], ff["output_logprobs"])
-        f_routed_same, f_routed = _routed_diff(fa, ff)
-        f_top = fa["input_top_ids"] == ff["input_top_ids"]
-        f_ids = fa["output_ids"] == ff["output_ids"]
-        f_cached = fa["cached_tokens"] == ff["cached_tokens"]
-        follow_same = f_in == 0 and f_out == 0 and f_top and f_ids and f_routed_same and f_cached
-        print(
-            f"{tag} iso_{n} follow-up: cached {fa['cached_tokens']}/{ff['cached_tokens']} "
-            f"(the 64-grid predicts {expect_cached}), prompt lp {f_in} differ (max {f_max_in}), "
-            f"top{TOP_K} {'same' if f_top else 'DIFF'}, output ids {'same' if f_ids else 'DIFF'}, "
-            f"output lp {f_out} differ (max {f_max_out}), routed {f_routed}"
-        )
-        if args.expect_bitwise and not (p_routed_same and follow_same):
-            failed.append(f"iso_{n}")
+        if (
+            not _iso_pair(cases, n, bucket, "pad2", "fill2", args.expect_bitwise, decode_gated)
+            and args.expect_bitwise
+        ):
+            failed.append(f"iso_{n} pad2/fill2")
+        gate_single = args.expect_bitwise and args.gate_single
+        if not _iso_pair(cases, n, bucket, "pad", "fill", gate_single, decode_gated) and gate_single:
+            failed.append(f"iso_{n} pad/fill")
     if failed:
         print(f"FAIL: padding rows are not isolated bitwise: {failed}")
         return 1
@@ -429,6 +495,7 @@ def main() -> int:
     i = sub.add_parser("isolation")
     i.add_argument("x")
     i.add_argument("--expect-bitwise", action="store_true")
+    i.add_argument("--gate-single", action="store_true")
     g = sub.add_parser("log")
     g.add_argument("log")
     args = p.parse_args()
