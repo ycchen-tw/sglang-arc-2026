@@ -7,6 +7,8 @@
 #   bash scripts/arc/qwen4_exp_prefill_bcg_validate.sh s3          # compare only (no GPU)
 #   bash scripts/arc/qwen4_exp_prefill_bcg_validate.sh s4          # TP2 FP8 SPEC=none: A1 -> B1 -> A2, then compare
 #   bash scripts/arc/qwen4_exp_prefill_bcg_validate.sh s4d         # TP2 FP8 SPEC=dflash K4, --random-seed 1234: A -> B, then compare
+#   bash scripts/arc/qwen4_exp_prefill_bcg_validate.sh s4dc        # s4d's two arms again (A2, B2): seeded reproducibility, A2 vs B2
+#   bash scripts/arc/qwen4_exp_prefill_bcg_validate.sh s4dv        # media (ViT) cost per extend, eager and graph DFlash, twice each
 #   bash scripts/arc/qwen4_exp_prefill_bcg_validate.sh s5 off|on   # real harness, 16 groups x 15 min (run_arms.sh)
 #
 # RUN=<tag> names a fresh set of arm directories ($DAY-bcg-<tag>-<arm>) for a rerun of the steps.
@@ -27,7 +29,8 @@ DAY=${DAY:-$(date -u +%Y%m%d)}
 BASE=$R/$DAY-bcg-${RUN:+$RUN-}
 # memory qsa-fast-topk-nondeterminism: without all three a restart alone moves logprobs
 DET="ARC_QSA_TOPK_EXACT=1 SGLANG_FLASHINFER_MOE_FUSED_FINALIZE=0 ARC_HC_MIX_DETERMINISTIC=1"
-BUCKETS="16 32 64 128 256 384 512 640 768 896 1024 1280 1536 1792 2048 2560 3072 4096"
+# the production list (G1, 2026-10-08): up to chunked_prefill_size 8192
+BUCKETS="16 32 64 128 256 384 512 640 768 896 1024 1280 1536 1792 2048 2560 3072 4096 5120 6144 8192"
 ON="ARC_QWEN4_EXP_PREFILL_BCG=1"
 TASK2="ARC_MAMBA_TRACK_HOST=1 ARC_MROPE_EXTEND_PINNED=1"
 ROUTED="--enable-return-routed-experts"
@@ -89,6 +92,19 @@ compare() {
     echo "== compare $1 vs $2"
     "$PY" "$CHECK" compare "$BASE$1/collect.json" "$BASE$2/collect.json" | tee "$BASE$2/compare-vs-$1.txt"
 }
+# vit <arm>: media embedding (ViT + merge) vs language model GPU time per extend (torch profiler)
+vit() {
+    echo "== vitcost $1"
+    "$PY" "$CHECK" vitcost --url "http://127.0.0.1:$(json_field "$BASE$1/arm.json" port)" --out-dir "$BASE$1/vitcost" \
+        | tee "$BASE$1/vitcost.txt"
+}
+# vittel <arm>: the same media cost without a profiler, from the extend telemetry (spec arms only)
+TELEMETRY="ARC_EXTEND_TELEMETRY=1 ARC_EXTEND_TELEMETRY_INTERVAL_S=10"
+vittel() {
+    echo "== vittel $1 ${2:-}"
+    "$PY" "$CHECK" vittel --url "http://127.0.0.1:$(json_field "$BASE$1/arm.json" port)" --log "$BASE$1/serve/server.log" \
+        --interval 10 | tee "$BASE$1/vittel${2:-}.txt"
+}
 # iso <arm> [--expect-bitwise [--gate-single]]: padding isolation within one arm (gate it on graph
 # arms; --gate-single only where FlashInfer's GDN prefill never takes its CP kernel, i.e. TP1)
 iso() {
@@ -138,6 +154,9 @@ case ${1:?step} in
             fi
             ready "$n"
             collect "$n"
+            if [ "$n" = tp2-A1 ]; then
+                vit "$n" || echo "✗ vitcost failed (above); the gate run continues"
+            fi
             stop "$n"
         done
         rc=0
@@ -150,19 +169,53 @@ case ${1:?step} in
     s4d)
         # A fixed --random-seed on both arms: DFlash's verify draws from the server RNG, so unseeded arms
         # do not reproduce the decode even eager vs eager (ARC.md, 2026-10-08 r5 dA/dA2)
-        start tp2-dA 30627 2,3 2 fp8 dflash "$DET" "$ROUTED --random-seed 1234"
+        start tp2-dA 30627 2,3 2 fp8 dflash "$DET $TELEMETRY" "$ROUTED --random-seed 1234"
         ready tp2-dA
         collect tp2-dA
+        vittel tp2-dA || echo "✗ vittel failed (above); the gate run continues"
         stop tp2-dA
-        start tp2-dB 30628 2,3 2 fp8 dflash "$DET $ON" "$ROUTED --random-seed 1234 --cuda-graph-bs-prefill $BUCKETS"
+        start tp2-dB 30628 2,3 2 fp8 dflash "$DET $TELEMETRY $ON" "$ROUTED --random-seed 1234 --cuda-graph-bs-prefill $BUCKETS"
         ready tp2-dB
         collect tp2-dB
+        vittel tp2-dB || echo "✗ vittel failed (above); the gate run continues"
         stop tp2-dB
         rc=0
         compare tp2-dA tp2-dB || rc=1
         iso tp2-dA
         iso tp2-dB --expect-bitwise || rc=1
         exit $rc
+        ;;
+    s4dc)
+        # s4d's seeded arms once more: does seeded DFlash reproduce its decode eager vs eager / graph vs graph?
+        start tp2-dA2 30629 2,3 2 fp8 dflash "$DET $TELEMETRY" "$ROUTED --random-seed 1234"
+        ready tp2-dA2
+        collect tp2-dA2
+        vittel tp2-dA2 || echo "✗ vittel failed (above); the gate run continues"
+        stop tp2-dA2
+        start tp2-dB2 30620 2,3 2 fp8 dflash "$DET $TELEMETRY $ON" "$ROUTED --random-seed 1234 --cuda-graph-bs-prefill $BUCKETS"
+        ready tp2-dB2
+        collect tp2-dB2
+        vittel tp2-dB2 || echo "✗ vittel failed (above); the gate run continues"
+        stop tp2-dB2
+        rc=0
+        compare tp2-dA tp2-dA2 || { rc=1; echo "✗ seeded eager DFlash does not reproduce"; }
+        compare tp2-dB tp2-dB2 || { rc=1; echo "✗ seeded graph DFlash does not reproduce"; }
+        compare tp2-dA2 tp2-dB2 || rc=1
+        iso tp2-dB2 --expect-bitwise || rc=1
+        exit $rc
+        ;;
+    s4dv)
+        # the media cost alone, twice per arm (no collect): eager and graph DFlash
+        start tp2-dAv 30621 2,3 2 fp8 dflash "$DET $TELEMETRY" "$ROUTED --random-seed 1234"
+        ready tp2-dAv
+        vittel tp2-dAv 1
+        vittel tp2-dAv 2
+        stop tp2-dAv
+        start tp2-dBv 30622 2,3 2 fp8 dflash "$DET $TELEMETRY $ON" "$ROUTED --random-seed 1234 --cuda-graph-bs-prefill $BUCKETS"
+        ready tp2-dBv
+        vittel tp2-dBv 1
+        vittel tp2-dBv 2
+        stop tp2-dBv
         ;;
     s5)
         mode=${2:?s5 off|on}

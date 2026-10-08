@@ -285,9 +285,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     buffer population, attention metadata init, and output slicing.
     """
 
-    # ARC_QWEN4_EXP_PREFILL_BCG (models/qwen4_exp_prefill_bcg.py): off unless __init__ finds a
+    # ARC_QWEN4_EXP_PREFILL_BCG (models/qwen4_exp_prefill_bcg.py): set when __init__ finds a
     # Qwen4-Exp body under the Breakable backend.
-    _qwen4_exp_bcg: bool = False
     _body_output_unpacker: Optional[Callable[[Any], Any]] = None
 
     def __init__(self, model_runner: ModelRunner):
@@ -577,7 +576,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             model_runner.model_config.hf_config
         ):
             qwen4_exp_prefill_bcg.validate_runner(model_runner)
-            self._qwen4_exp_bcg = True
+            # Batches with media replay too: the eager tail runs the outer forward on the static
+            # batch, so the ViT and the media merge write the input_embeds slot, the media
+            # positions' ids are rewritten in the static input_ids (what the PLE break reads, as
+            # eager reads the rewritten live ids), and M-RoPE positions come from their slot.
             # The captured body returns (hidden, hc_hidden); replay hands the stored pair back
             # through the model so logits_output.hidden_states is the replayed HC stream.
             self._body_output_unpacker = self.layer_model.unpack_breakable_body_output
@@ -1222,12 +1224,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # Every dp rank must hold tokens this forward (reads the synced
         # table post dp-padding; idle ranks vote permissively upstream).
         if self._has_inactive_dp_rank(forward_batch):
-            return False
-
-        # ARC_QWEN4_EXP_PREFILL_BCG covers text extends; a batch with media (its embed routine
-        # rewrites ids and mrope positions in place) stays eager. TP-only (validate_runner), so
-        # every rank sees the same batch and reaches the same verdict.
-        if self._qwen4_exp_bcg and forward_batch.contains_mm_inputs():
             return False
 
         # Non-DP local check (sole decision for tp-only).

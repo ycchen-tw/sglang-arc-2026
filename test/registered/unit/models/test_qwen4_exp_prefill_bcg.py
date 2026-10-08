@@ -10,7 +10,7 @@ CPU coverage of the pieces that do not need a capture:
   * the VL body's (hidden, hc_hidden) contract under BCG and its replay unpack;
   * the runner: the replayed pair goes through the unpack hook, the replay batch carries the host
     mirrors (req_pool_indices_cpu, the mamba track mirrors), the capture batch mirrors its static
-    track slots, and batches with media stay eager.
+    track slots, and batches with media are not held back.
 Capture / replay itself and bitwise agreement with eager need a GPU:
 scripts/arc/qwen4_exp_prefill_bcg_check.py.
 """
@@ -435,7 +435,7 @@ class TestRunner(CustomTestCase):
         self.assertEqual(fb.mamba_extend_track_mask_cpu, [True])
         self.assertEqual(fb.mamba_extend_track_seqlens_cpu, [128])
 
-    def test_media_batches_stay_eager(self):
+    def test_media_batches_replay(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._is_full_backend = False
         runner.enable_lora = False
@@ -460,9 +460,9 @@ class TestRunner(CustomTestCase):
                 contains_mm_inputs=lambda: with_media,
             )
 
-        self.assertTrue(runner.can_run_graph(batch(True)))  # other models: unchanged
-        runner._qwen4_exp_bcg = True
-        self.assertFalse(runner.can_run_graph(batch(True)))
+        # media runs in the eager tail (ViT, merge into the input_embeds slot); the body replays
+        runner._body_output_unpacker = lambda output: output
+        self.assertTrue(runner.can_run_graph(batch(True)))
         self.assertTrue(runner.can_run_graph(batch(False)))
 
     def test_replay_unpacks_the_body_pair(self):
