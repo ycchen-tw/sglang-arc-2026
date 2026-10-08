@@ -6,7 +6,8 @@
            Against one DFlash server with ARC_EXTEND_TELEMETRY=1, ARC_EXTEND_TELEMETRY_INTERVAL_S=<interval>
            and SGLANG_ENABLE_COLOCATED_BATCH_GEN=1 (a batched /generate with images then reaches the
            scheduler as one group instead of one request per media processing step). Per shape (SHAPES):
-             1. warm the shape's cached prefixes (one request each, cached_tokens checked later);
+             1. warm the shape's cached prefixes (one request each, cached_tokens checked later) and
+                run one unmeasured batch of the shape (the first pays one-time compiles);
              2. telemetry: --reps batches, each ONE /generate of k prompts = prefix_i + a fresh new
                 segment (text, or a new 512x512 image + text), one output token; an idle interval and
                 a 17-token trigger flush the telemetry window; the k4+ bin of the windows logged
@@ -226,12 +227,6 @@ def drive(args) -> None:
                     f"{url}/generate",
                     {"text": prefixes[(i, plen)], "sampling_params": {"temperature": 0.0, "max_new_tokens": 1}},
                 )
-        # flush the telemetry window that holds the warm-up (and the previous shape)
-        time.sleep(args.interval + 2)
-        chk._post(f"{url}/generate", {"text": text(seed, TRIGGER_TOKENS), "sampling_params": {"max_new_tokens": 1}})
-        seed += 1
-        time.sleep(2)
-        t_start = time.time()
         graph = set()
 
         def batch() -> None:
@@ -243,6 +238,16 @@ def drive(args) -> None:
             log.mark()
             out = _send(url, prompts)
             graph.add(_check_batch(log, shape, spec, out, prompts, expect_graph)["graph"])
+
+        # one unmeasured batch of the shape: the first one pays one-time compiles (r1 p10k, both arms:
+        # ~1.8 s for the first k=4 batch vs ~77 ms after)
+        batch()
+        # flush the telemetry window that holds the warm-ups (and the previous shape)
+        time.sleep(args.interval + 2)
+        chk._post(f"{url}/generate", {"text": text(seed, TRIGGER_TOKENS), "sampling_params": {"max_new_tokens": 1}})
+        seed += 1
+        time.sleep(2)
+        t_start = time.time()
 
         # 2. telemetry
         for _ in range(args.reps):
