@@ -1,5 +1,6 @@
 """Multimodal embedding scheduling and cache coordination."""
 
+import os
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -13,6 +14,18 @@ from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.utils import is_hip, is_npu, is_xpu
 from sglang.srt.utils.async_probe import maybe_assert_sum
 from sglang.utils import logger
+
+# arc-forge: ARC_MM_NO_SYNC=1 (opt-in, default 0) keeps an extend that encodes a new image from waiting on the GPU.
+# The scheduler holds pixel features in pageable memory, and a large pageable host-to-device copy blocks the host
+# until the stream reaches it: inside an extend that is the in-flight decode cycle (up to ~70 ms on G4 c110), after
+# which the rest of the eager forward launches from an empty GPU queue. With the flag the feature is first copied
+# into pinned memory (one host memcpy, ~10 MB per screenshot) so the device copy is asynchronous, and the Qwen3-VL
+# vision encoder takes its attention max_seqlen from the host cu_seqlens instead of a .item() on the device copy.
+MM_NO_SYNC_ENV = "ARC_MM_NO_SYNC"
+_mm_no_sync_raw = os.environ.get(MM_NO_SYNC_ENV, "0")
+if _mm_no_sync_raw not in ("0", "1"):
+    raise ValueError(f"{MM_NO_SYNC_ENV} must be 0 or 1, got {_mm_no_sync_raw!r}")
+MM_NO_SYNC = _mm_no_sync_raw == "1"
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -214,7 +227,10 @@ def _move_items_to_device(
     """Move item features to the target device (in-place, non-blocking)."""
     for item in items:
         if isinstance(item.feature, torch.Tensor) and item.feature.device != device:
-            item.feature = item.feature.to(device, non_blocking=True)
+            feature = item.feature
+            if MM_NO_SYNC and feature.device.type == "cpu" and device.type == "cuda" and not feature.is_pinned():
+                feature = feature.pin_memory()
+            item.feature = feature.to(device, non_blocking=True)
 
 
 def _acknowledge_deferred_cuda_ipc_cache_hits(
