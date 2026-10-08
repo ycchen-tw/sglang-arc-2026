@@ -23,6 +23,10 @@ from sglang.srt.layers.attention.qsa.config import (
     is_qwen_qsa,
     parse_qsa_profile,
 )
+from sglang.srt.layers.attention.qsa.direct_tiles import (
+    load_tile_table as load_direct_tile_table,
+    resolve_tile as resolve_direct_tile,
+)
 from sglang.srt.layers.attention.qsa.kernel import qsa_sparse_attention
 from sglang.srt.layers.attention.qsa.metadata import (
     QSAHiSparseDecode,
@@ -31,6 +35,10 @@ from sglang.srt.layers.attention.qsa.metadata import (
     build_pending_ring_slots,
     build_rope_position_matrix,
     compressed_decode_view,
+)
+from sglang.srt.layers.attention.qsa.selection_stats import (
+    QSASelectionStats,
+    parse_env as parse_selection_stats_env,
 )
 from sglang.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_fa2_cu_seqlens_triton,
@@ -82,6 +90,17 @@ _ARC_QSA_NVFP4_DIRECT = _arc_flag("ARC_QSA_NVFP4_DIRECT")
 _ARC_QSA_FP8_DIRECT = _arc_flag("ARC_QSA_FP8_DIRECT")
 # (block_n, warps, stages, chunk, decode) per pool kind, from the G4 microbench (h22 note)
 _ARC_QSA_DIRECT_TILE = {"nvfp4": (64, 4, 3, 512, 2), "fp8": (64, 4, 3, 1024, 0)}
+# sm_89 HiSparse route (h25/h28): arithmetic E2M1 decode, two stages (99 KiB shared memory)
+_ARC_QSA_SM89_TILE = {"nvfp4": (64, 4, 2, 512, 0), "fp8": (64, 4, 2, 1024, 0)}
+# Opt-in measured tiles per exact shape (qsa/direct_tiles.py); unset = the tiles above, bit for bit.
+_ARC_QSA_DIRECT_TILE_TABLE_PATH = os.environ.get("ARC_QSA_DIRECT_TILE_TABLE")
+_ARC_QSA_DIRECT_TILE_TABLE = (
+    load_direct_tile_table(_ARC_QSA_DIRECT_TILE_TABLE_PATH)
+    if _ARC_QSA_DIRECT_TILE_TABLE_PATH is not None
+    else None
+)
+# Opt-in verify selection-overlap telemetry (qsa/selection_stats.py): (windows, layer ids) or None.
+_ARC_QSA_SELECTION_STATS = parse_selection_stats_env()
 
 # One fused four-plane gather instead of two same-shaped passes over the same
 # address chain. Byte-for-byte identical output, so "split" exists only as a
@@ -417,10 +436,112 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
         self._extend_plan_state: Optional[_QSAExtendPlan] = None  # h15
+        # arc-forge QSA verify tooling (opt-in, default off): measured direct tiles
+        # (ARC_QSA_DIRECT_TILE_TABLE) and verify selection telemetry
+        # (ARC_QSA_SELECTION_STATS). Only the target runs TARGET_VERIFY.
+        self._direct_tile_logged = set()
+        self._selection_stats: Optional[QSASelectionStats] = None
+        if _ARC_QSA_SELECTION_STATS is not None:
+            if runner is None:
+                raise RuntimeError("ARC_QSA_SELECTION_STATS needs a ModelRunner")
+            if not runner.is_draft_worker:
+                self._selection_stats = self._build_selection_stats(
+                    config, *_ARC_QSA_SELECTION_STATS
+                )
         # QSA HiSparse offload (arc-forge h04). ModelRunner builds the
         # coordinator in alloc_memory_pool, before the attention backends.
         if self.hisparse_coordinator is not None:
             self._validate_hisparse()
+
+    def _build_selection_stats(self, config, windows: int, layers) -> QSASelectionStats:
+        layer_types = getattr(config, "layer_types", None)
+        if not layer_types:
+            raise RuntimeError(
+                "ARC_QSA_SELECTION_STATS checks its layers against config.layer_types, "
+                "which this model config does not have"
+            )
+        qsa_layers = [i for i, kind in enumerate(layer_types) if kind == "full_attention"]
+        unknown = [layer for layer in layers if layer not in qsa_layers]
+        if unknown:
+            raise RuntimeError(
+                f"ARC_QSA_SELECTION_STATS_LAYERS {unknown} are not QSA layers; "
+                f"QSA layers are {qsa_layers}"
+            )
+        if envs.SGLANG_ENABLE_METADATA_GLUE_GRAPH.get():
+            raise RuntimeError(
+                "ARC_QSA_SELECTION_STATS counts verify forwards in "
+                "init_forward_metadata_out_graph, which SGLANG_ENABLE_METADATA_GLUE_GRAPH "
+                "replays from a graph; turn one of them off"
+            )
+        logger.info(
+            "ARC_QSA_SELECTION_STATS: first %d TARGET_VERIFY forwards, layers %s "
+            "(debug window; captured verify graphs keep running the gated stats ops)",
+            windows,
+            list(layers),
+        )
+        return QSASelectionStats(windows, tuple(layers), self.device)
+
+    def _count_verify_forward(self, forward_batch) -> None:
+        """ARC_QSA_SELECTION_STATS host hook: one TARGET_VERIFY forward is about to launch."""
+        if self._selection_stats is None or not forward_batch.forward_mode.is_target_verify():
+            return
+        from sglang.srt.model_executor.runner import get_is_capture_mode
+
+        if get_is_capture_mode():
+            return  # capture and its warmup forwards are not workload
+        self._selection_stats.on_verify_forward()
+
+    def _observe_selection(
+        self, layer, forward_batch, metadata, table, table_rows, indices, lens
+    ) -> None:
+        """ARC_QSA_SELECTION_STATS: queue this layer's verify selection counts, eagerly
+        or recorded into the verify graph capture."""
+        from sglang.srt.model_executor.runner import get_is_capture_mode
+
+        if get_is_capture_mode() and not torch.cuda.is_current_stream_capturing():
+            return  # graph warmup: dummy batches before the capture
+        if metadata.row_req_pool_indices is None:
+            raise RuntimeError(
+                "QSA selection stats need per-row request indices on a TARGET_VERIFY forward"
+            )
+        self._selection_stats.observe(
+            layer_id=layer.layer_id,
+            k=int(forward_batch.spec_info.draft_token_num),
+            table=table,
+            table_rows=table_rows,
+            indices=indices,
+            lens=lens,
+            logical_lens=metadata.sequence_lengths,
+            row_req=metadata.row_req_pool_indices,
+        )
+
+    def _direct_tile(self, kind: str, baseline, q: torch.Tensor, k: torch.Tensor, indices: torch.Tensor):
+        """(block_n, warps, stages, chunk, decode) for qsa_sparse_decode_direct: the built-in
+        tile, or the ARC_QSA_DIRECT_TILE_TABLE entry for this exact shape."""
+        if _ARC_QSA_DIRECT_TILE_TABLE is None:
+            return baseline
+        rows, q_heads, head_dim = q.shape
+        kv_heads, width = k.shape[1], indices.shape[1]
+        tile, entry = resolve_direct_tile(
+            _ARC_QSA_DIRECT_TILE_TABLE,
+            baseline=baseline,
+            capability=torch.cuda.get_device_capability(q.device),
+            kind=kind,
+            q_heads=q_heads,
+            kv_heads=kv_heads,
+            head_dim=head_dim,
+            width=width,
+            rows=rows,
+        )
+        key = (kind, rows, q_heads, kv_heads, head_dim, width)
+        if key not in self._direct_tile_logged:
+            self._direct_tile_logged.add(key)
+            logger.info(
+                "QSA direct tile %s rows=%d heads=%d/%d dim=%d width=%d -> %s (%s)",
+                kind, rows, q_heads, kv_heads, head_dim, width, tile,
+                entry.provenance if entry is not None else "built-in, no table entry",
+            )
+        return tile
 
     def _validate_hisparse(self) -> None:
         """HiSparse decode reads KV through coordinator device rows, which only
@@ -1146,6 +1267,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         if forward_batch.forward_mode.is_idle():
             self.forward_metadata = None
             return
+        if self._selection_stats is not None:
+            self._count_verify_forward(forward_batch)
         self.forward_metadata = self._metadata_from_forward_batch(forward_batch)
         if self._plans_extend_early(forward_batch):
             # h15: the landing-zone fill of the first QSA layer starts now,
@@ -1172,6 +1295,8 @@ class QwenSparseAttnBackend(AttentionBackend):
                 spec_info=forward_batch.spec_info,
             )
         else:
+            if self._selection_stats is not None:
+                self._count_verify_forward(forward_batch)
             num_padding = getattr(forward_batch, "num_padding", None)
             self._replay_cuda_graph_metadata(
                 bs=forward_batch.batch_size,
@@ -2492,21 +2617,26 @@ class QwenSparseAttnBackend(AttentionBackend):
                     f"ARC_QSA_NVFP4_DIRECT needs host float global scales, got "
                     f"{type(k_global).__name__}/{type(v_global).__name__}"
                 )
-            tile = _ARC_QSA_DIRECT_TILE["nvfp4"]
+            kind = "nvfp4"
         else:
             k, v = pool.get_key_buffer(layer.layer_id), pool.get_value_buffer(layer.layer_id)
             k_sf = v_sf = None
             k_global = v_global = 1.0
-            tile = _ARC_QSA_DIRECT_TILE["fp8"]
+            kind = "fp8"
         table, rows, indices, lens = self._decode_gather_tables(
             metadata, forward_batch, topk_indices
         )
-        block_n, warps, stages, chunk, decode = tile
+        indices = indices.to(torch.int32).contiguous()
+        block_n, warps, stages, chunk, decode = self._direct_tile(
+            kind, _ARC_QSA_DIRECT_TILE[kind], q, k, indices
+        )
         output = qsa_sparse_decode_direct(
             q.contiguous(), k, v, k_sf, v_sf, table, rows,
-            indices.to(torch.int32).contiguous(), lens, layer.scaling, k_global, v_global,
+            indices, lens, layer.scaling, k_global, v_global,
             block_n=block_n, warps=warps, stages=stages, chunk=chunk, decode=decode,
         )
+        if self._selection_stats is not None and forward_batch.forward_mode.is_target_verify():
+            self._observe_selection(layer, forward_batch, metadata, table, rows, indices, lens)
         return output.reshape(q.shape[0], -1)
 
     def _forward_hisparse_sm89(self, q, layer, forward_batch, topk_indices):
@@ -2525,12 +2655,19 @@ class QwenSparseAttnBackend(AttentionBackend):
             # Match h22 and the gather path: QSA FP8 storage is unscaled.
             kg = vg = 1.0
         # h22 guards padded/all-invalid rows; decode=0 uses Ada-compatible E2M1 arithmetic.
+        kind = "nvfp4" if self.arc_nvfp4 else "fp8"
+        indices = indices.to(torch.int32).contiguous()
+        block_n, warps, stages, chunk, decode = self._direct_tile(
+            kind, _ARC_QSA_SM89_TILE[kind], q, k, indices
+        )
         output = qsa_sparse_decode_direct(
             q.contiguous(), k, v, ks, vs, table, rows,
-            indices.to(torch.int32).contiguous(), lens, layer.scaling,
-            float(kg), float(vg), block_n=64, warps=4, stages=2,
-            chunk=512 if self.arc_nvfp4 else 1024, decode=0,
+            indices, lens, layer.scaling,
+            float(kg), float(vg), block_n=block_n, warps=warps, stages=stages,
+            chunk=chunk, decode=decode,
         )
+        if self._selection_stats is not None and forward_batch.forward_mode.is_target_verify():
+            self._observe_selection(layer, forward_batch, metadata, table, rows, indices, lens)
         return output.reshape(q.shape[0], -1)
 
     def forward_decode(
