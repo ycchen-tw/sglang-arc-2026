@@ -103,8 +103,46 @@ class StatePool:
     def release(self, rid):
         slot = self.slot_of.pop(rid, None)
         if slot is not None:
-            self.pending_length[slot].fill_(0)  # fill_: `t[i] = 0` copies a CPU scalar, a stream sync
-            self.free.append(slot)
+            self.free_slot(slot)
+
+    def free_slot(self, slot):
+        """A slot no request holds (a released or a parked one) back to the free list."""
+        if slot in self.free or slot == self.scratch or slot in self.slot_of.values():
+            raise RuntimeError(f"DFlash: freeing slot {slot}, which is free, the scratch slot or held")
+        self.pending_length[slot].fill_(0)  # fill_: `t[i] = 0` copies a CPU scalar, a stream sync
+        self.free.append(slot)
+
+    # ---- parked slots (worker ARC_DFLASH_SESSION_PARK): a finished request's window kept for its session ------------
+    def detach(self, rid) -> int:
+        """Unmap a finished request from its slot without freeing it; the caller owns the slot from here on."""
+        return self.slot_of.pop(rid)
+
+    def attach(self, rid, slot):
+        """Map a request to a parked slot (after `settle`)."""
+        if rid in self.slot_of or slot in self.free or slot == self.scratch:
+            raise RuntimeError(f"DFlash: attaching {rid} to slot {slot}: the request holds a slot or the slot is free")
+        self.slot_of[rid] = slot
+
+    def settle(self, slot) -> int:
+        """A parked slot as prefill leaves one: no pending commit, the cursor at the end of the clean window.
+
+        The pending rows are the finished request's last verify block, or, under overlap scheduling, the block of the
+        one cycle a finished request still runs before the scheduler sees it finish (whose step already folded the
+        last verify in). Either way they are dropped, not folded in: the window stays exactly what the drafter
+        committed, and the next request appends whatever lies past it. The GR at the window's end is the pending
+        block's first predecessor. Returns that end (one host sync)."""
+        last, pending, end = torch.stack(
+            (self.last_position[slot], self.pending_length[slot], self.positions[slot].max())
+        ).tolist()
+        if end != last - pending:
+            raise RuntimeError(f"DFlash: parked slot {slot}: window ends at {end}, cursor {last}, {pending} pending")
+        gr = self.pending_gr[slot, 0].clone()
+        self.last_gr[slot] = gr
+        self.pending_gr[slot] = gr  # a step reads row 0 as the cursor's GR when nothing is pending
+        self.last_position[slot].fill_(end)
+        self.pending_length[slot].fill_(0)
+        self.pending_tokens[slot].fill_(0)
+        return end
 
     def live(self):
         return len(self.slot_of)

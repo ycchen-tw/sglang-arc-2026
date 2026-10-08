@@ -42,6 +42,16 @@ Prefill only refreshes the last ARC_DFLASH_PREFILL_TAIL tokens of each extend ch
 receptive field is layers x window, but its state only steers proposals, and rejection sampling keeps the output
 exactly target-distributed whatever the draft does. A chunk that does not continue the request's cached cursor
 (session resume, HiSparse replay, retraction) starts a fresh window from the chunk itself.
+
+ARC_DFLASH_EXACT_PREFILL=1 (opt-in) makes the window after a prompt the one a single refresh over the whole prompt
+gives: the state at a position depends on the `receptive` = layers x (window + 3) positions ending there, so prefill
+refreshes exactly the prompt's last `receptive` positions (continuing chunks append; a fresh window starts at that
+tail with the true predecessor GR). Only a chunk whose history never reached the drafter -- a resumed session prefix
+-- still bootstraps from its own tail. ARC_DFLASH_SESSION_PARK=1 (opt-in, needs EXACT_PREFILL) fills that history: a
+finished request of a session whose whole prompt reached the drafter keeps its slot (parked, given back oldest first
+when a slot is needed; a request ended between prompt chunks is released), and the session's next request takes the
+window over when its ids equal the parked request's on every position the window has read; it then appends only
+what lies past the window.
 """
 
 from __future__ import annotations
@@ -55,6 +65,7 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -74,6 +85,19 @@ def _env_int(name, default):
     if value <= 0:
         raise ValueError(f"{name} must be positive, got {value}")
     return value
+
+
+def _env_flag(name):
+    value = os.environ.get(name, "0")
+    if value not in ("0", "1"):
+        raise ValueError(f"{name} must be 0 or 1, got {value!r}")
+    return value == "1"
+
+
+def _ids(req):
+    """The request's whole sequence (prompt, then what it generated) as int64; multimodal pads keep their per-item
+    values, so two requests agree on an image position only if they carry the same image."""
+    return np.concatenate([np.asarray(part, dtype=np.int64) for part in (req.origin_input_ids, req.output_ids)])
 
 
 def moe_backend(device) -> str:
@@ -389,6 +413,10 @@ class DFlashDraftWorker:
         self.prefill_tail = _env_int("ARC_DFLASH_PREFILL_TAIL", 2048)
         # tokens per drafter forward when a window is rebuilt (default: the whole tail in one forward)
         self.prefill_chunk = _env_int("ARC_DFLASH_PREFILL_CHUNK", self.prefill_tail)
+        self.exact_prefill = _env_flag("ARC_DFLASH_EXACT_PREFILL")
+        self.session_park = _env_flag("ARC_DFLASH_SESSION_PARK")
+        if self.session_park and not self.exact_prefill:
+            raise ValueError("ARC_DFLASH_SESSION_PARK=1 needs ARC_DFLASH_EXACT_PREFILL=1")
         self.evict_cycles = _env_int("ARC_DFLASH_EVICT_CYCLES", 512)
         self.use_graphs = os.environ.get("ARC_DFLASH_GRAPH", "1") == "1"
         begin = time.monotonic()
@@ -466,6 +494,26 @@ class DFlashDraftWorker:
             type(self.model.lm_head).__name__, self._weight_load_time, self.prefill_tail, self.use_rejection_sampling,
             self.width, self.model.compile_mode,
         )
+        self._init_exact_state()
+        if self.exact_prefill:
+            logger.info(
+                "DFlash exact prefill: a prompt's window from its last %d positions (%d layers x (window %d + 3)) in "
+                "forwards of <= %d; session park %s", self.receptive, self.model.config.num_layers,
+                self.model.config.window, self.prefill_chunk, "on" if self.session_park else "off",
+            )
+
+    def _init_exact_state(self):
+        c = self.model.config
+        # How far back a window depends on the history: per layer the attention window plus one row for each of the
+        # three convolutions that read the row before (model.Decoder); arc-forge fast_train.receptive_field.
+        self.receptive = c.num_layers * (c.window + 3)
+        # rid -> Req, SESSION_PARK only: session requests whose last prefill chunk completed their prompt, the ones a
+        # finish parks (a request decodes only from here)
+        self.live_reqs = {}
+        self.parked = collections.OrderedDict()  # session id -> (slot, ids of the request that parked it), oldest first
+        self.adopted = set()  # rids holding a parked window: it may already cover the start of their next chunk
+        self.carry = {}  # rid -> (position, GR) of the last row of a chunk that lies wholly before the prompt's tail
+        self.state_stats = collections.Counter()
 
     # ---- EagleDraftWorker surface used by EAGLEWorkerV2 / the scheduler ----------------------------------------
     def draft_tp_context(self, _group):
@@ -535,12 +583,50 @@ class DFlashDraftWorker:
         return self.pool.live()
 
     def note_request_finished(self, rid):
-        self.pool.release(rid)
+        req = self.live_reqs.pop(rid, None)
+        if req is not None:
+            # every path that drops a request's slot (_forget) unregisters it first
+            if rid not in self.pool.slot_of:
+                raise RuntimeError(f"DFlash: session request {rid} finished registered for parking without a slot")
+            self._forget(rid, release=False)
+            self._park(req)
+            return
+        self._forget(rid)
+
+    def _forget(self, rid, release=True):
+        if release:
+            self.pool.release(rid)
         self.last_seen.pop(rid, None)
+        self.live_reqs.pop(rid, None)
+        self.adopted.discard(rid)
+        self.carry.pop(rid, None)
 
     def clear_cache_pool(self):
         for rid in list(self.pool.slot_of):
-            self.note_request_finished(rid)
+            self._forget(rid)
+        while self.parked:
+            self.pool.free_slot(self.parked.popitem()[1][0])
+        self.live_reqs.clear()
+        self.carry.clear()
+
+    def _park(self, req):
+        """ARC_DFLASH_SESSION_PARK: keep a finished session request's window (its slot, unmapped) for the session's
+        next request; the ids say which positions it holds. A newer finish of the same session replaces it."""
+        slot = self.pool.detach(req.rid)
+        old = self.parked.pop(req.session_id, None)
+        if old is not None:
+            self.pool.free_slot(old[0])
+            self.state_stats["park_replaced"] += 1
+        self.parked[req.session_id] = (slot, _ids(req))
+        self.state_stats["park"] += 1
+
+    def _make_room(self, rid):
+        """A request about to take a slot gets one: parked windows give theirs back, oldest first."""
+        if rid in self.pool.slot_of:
+            return
+        while not self.pool.free and self.parked:
+            self.pool.free_slot(self.parked.popitem(last=False)[1][0])
+            self.state_stats["park_evicted"] += 1
 
     def _unpad(self, hidden, rows: int, what: str):
         """Attention TP pads a batch's token rows to a multiple of the group size (trailing rows); the target GR
@@ -598,7 +684,18 @@ class DFlashDraftWorker:
         offset = 0
         begin = time.perf_counter()
         for req, length, start in zip(batch.reqs, batch.extend_lens, batch.prefix_lens, strict=True):
-            self._prefill_one(req.rid, ids[offset : offset + length], gr[offset : offset + length], int(start))
+            chunk_ids, chunk_gr = ids[offset : offset + length], gr[offset : offset + length]
+            if self.exact_prefill:
+                self._prefill_exact(req, chunk_ids, chunk_gr, int(start))
+            else:
+                self._prefill_one(req.rid, chunk_ids, chunk_gr, int(start))
+            if self.session_park and req.session_id is not None:
+                if int(start) + length == len(req.origin_input_ids) + len(req.output_ids):
+                    self.live_reqs[req.rid] = req  # the prompt's last chunk: from here a finish parks the window
+                else:
+                    # A window cut between chunks may start at the whole prompt's tail with nothing before it: a
+                    # finish (an abort) before the last chunk releases it instead of parking it
+                    self.live_reqs.pop(req.rid, None)
             self.last_seen[req.rid] = self.cycle
             offset += length
         if offset != ids.numel():
@@ -611,6 +708,9 @@ class DFlashDraftWorker:
             logger.info("DFlash prefill: %d extend batches, %.1f s in the drafter refresh, %d tokens (%.2f ms per batch)",
                         self.prefill_stats[0], self.prefill_stats[1], self.prefill_stats[2],
                         1e3 * self.prefill_stats[1] / self.prefill_stats[0])
+            if self.exact_prefill:
+                logger.info("DFlash exact prefill: %s; %d windows parked", dict(sorted(self.state_stats.items())),
+                            len(self.parked))
         bs = len(batch.reqs)
         return EagleDraftInput(
             topk_p=torch.ones((bs, 1), dtype=torch.float32, device=self.device),
@@ -655,6 +755,117 @@ class DFlashDraftWorker:
             serving.decode_cache(cache, self.model.config.window), gr[None, -1].clone(), positions[:, -1].clone()
         ))
 
+    def _prefill_exact(self, req, tokens, gr, start):
+        """ARC_DFLASH_EXACT_PREFILL: this chunk (positions start .. start+n-1, gr[t] the target GR at start+t) of a
+        request whose prefill ends at `total`. The window after the prompt depends on positions total - receptive
+        .. total - 1 only, so those are what gets refreshed: by appending to the request's window when it reaches
+        them (an earlier chunk, or a parked one), else by a fresh window from the tail. The only approximation left
+        is a fresh window whose predecessor never reached the drafter (`bootstrap`: a resumed prefix, no parked
+        window), which keeps the legacy behaviour."""
+        rid, n = req.rid, tokens.shape[0]
+        end, total = start + n, len(req.origin_input_ids) + len(req.output_ids)
+        if not 0 <= start < end <= total:
+            raise RuntimeError(f"DFlash: {rid} prefills [{start}, {end}) of a {total}-token sequence")
+        if total == 1:  # a one-token prompt (/health): as the legacy path
+            self._make_room(rid)
+            self.pool.write_request(rid, self._blank_state(gr[None, 0].clone(), start))
+            return
+        tail = max(1, total - self.receptive)  # position 0 has no predecessor GR
+        cursor = self._window_cursor(rid, start)
+        if cursor is None and start > 0 and self.session_park and rid not in self.carry:
+            cursor = self._adopt(req, start)
+        if cursor is not None and cursor + 1 >= tail:
+            skip = cursor + 1 - start  # start .. cursor are in the window already
+            if skip < n:
+                self._append(rid, tokens[skip:], gr[skip:], start + skip)
+            return
+        if cursor is not None:  # an adopted window older than the tail: the result does not depend on it
+            self.state_stats["park_stale"] += 1
+            self._forget(rid)
+        first = max(start, tail)
+        if first >= end:  # the whole chunk precedes the tail: keep only the GR the next chunk's first token pairs with
+            self.carry[rid] = (end - 1, gr[-1].clone())
+            self.state_stats["skipped_tokens"] += n
+            return
+        carried = self.carry.pop(rid, None)
+        if first > start:
+            pred = gr[first - start - 1 : n - 1]
+        elif carried is not None:
+            if carried[0] != start - 1:
+                raise RuntimeError(f"DFlash: {rid} carried the GR of {carried[0]} into a chunk at {start}")
+            pred = torch.cat((carried[1][None], gr[: n - 1]))
+        else:
+            # The history before `start` never reached the drafter: the legacy fresh window from the chunk's own tail,
+            # with the first token's own GR standing in for its predecessor when the tail starts the chunk.
+            self.state_stats["bootstrap"] += 1
+            first = max(start, end - self.prefill_tail)
+            pred = gr[first - start - 1 : n - 1] if first > start else torch.cat((gr[:1], gr[: n - 1]))
+        kept = tokens[first - start :].long()[None]
+        positions = torch.arange(first, end, device=self.device)[None]
+        cache = None
+        for a in range(0, kept.shape[1], self.prefill_chunk):
+            b = min(a + self.prefill_chunk, kept.shape[1])
+            _, cache = self.model.refresh(kept[:, a:b], pred[None, a:b], positions[:, a:b], cache)
+        self._make_room(rid)
+        self.pool.write_request(rid, serving.DraftRequest(
+            serving.decode_cache(cache, self.model.config.window), gr[None, -1].clone(), positions[:, -1].clone()
+        ))
+
+    def _window_cursor(self, rid, start):
+        """Where the request's window ends, if a chunk at `start` continues it; any other window is dropped (a
+        retracted request's, which decode moved on)."""
+        slot = self.pool.slot_of.get(rid)
+        if slot is None:
+            return None
+        last, pending = torch.stack((self.pool.last_position[slot], self.pool.pending_length[slot])).tolist()
+        if pending == 0 and (last + 1 == start or (rid in self.adopted and start <= last + 1)):
+            return last
+        self._forget(rid)
+        return None
+
+    def _append(self, rid, tokens, gr, start):
+        """Commit positions start .. start+n-1 to the request's window in forwards of ARC_DFLASH_PREFILL_CHUNK
+        tokens: each keeps the window and the newest conv boundaries, all the next one reads, so the split is exact."""
+        state = self.pool.read_request(rid)
+        n = tokens.shape[0]
+        positions = torch.arange(start, start + n, device=self.device)[None]
+        for a in range(0, n, self.prefill_chunk):
+            b = min(a + self.prefill_chunk, n)
+            span = torch.cat((state.last_gr[:, None], gr[None, a:b]), 1)
+            state = state.refresh_committed(self.model, tokens[None, a:b].long(), span, positions[:, a:b])
+        self.pool.write_request(rid, state)
+
+    def _adopt(self, req, start):
+        """ARC_DFLASH_SESSION_PARK: take over the window the request's session parked when its ids equal the parked
+        request's on every position the window has read (0 .. its end) and the chunk starts within reach (no GR is
+        missing). Returns the window's end, or None (a miss: the slot goes back to the pool)."""
+        parked = None if req.session_id is None else self.parked.pop(req.session_id, None)
+        if parked is None:
+            self.state_stats["park_none" if req.session_id is not None else "no_session"] += 1
+            return None
+        slot, parked_ids = parked
+        cursor = self.pool.settle(slot)
+        ids = _ids(req)
+        if cursor < 1:
+            why = "blank"  # a one-token prompt's placeholder window
+        elif cursor + 1 > len(parked_ids):
+            why = "unread"  # the window holds rows the parked request's ids do not (its last verify was cut)
+        elif cursor + 1 > len(ids):
+            why = "short"
+        elif start > cursor + 1:
+            why = "gap"  # the target resumed past the window's end
+        elif not np.array_equal(ids[: cursor + 1], parked_ids[: cursor + 1]):
+            why = "ids"
+        else:
+            self.pool.attach(req.rid, slot)
+            self.adopted.add(req.rid)
+            self.state_stats["park_hit"] += 1
+            self.state_stats["park_reused_tokens"] += cursor + 1 - start
+            return cursor
+        self.state_stats[f"park_miss_{why}"] += 1
+        self.pool.free_slot(slot)
+        return None
+
     def _blank_state(self, last_gr, position):
         """A window with one zero K/V slot at `position` and padding elsewhere: decode needs the cache to end
         at the cursor. The zero key only dilutes attention for the request's first block of proposals."""
@@ -687,6 +898,12 @@ class DFlashDraftWorker:
         self.cycle += 1
         self._profile_step(True)
         rids = [req.rid for req in batch.reqs]
+        if self.session_park:
+            unregistered = [req.rid for req in batch.reqs
+                            if req.session_id is not None and req.rid not in self.live_reqs]
+            if unregistered:
+                raise RuntimeError(f"DFlash: session requests {unregistered[:4]} decode without a completed prefill "
+                                   "(SESSION_PARK registers a request at its prompt's last chunk)")
         for rid in rids:
             self.last_seen[rid] = self.cycle
         self._evict()
@@ -745,7 +962,7 @@ class DFlashDraftWorker:
     def _evict(self):
         stale = [rid for rid, seen in self.last_seen.items() if self.cycle - seen > self.evict_cycles]
         for rid in stale:
-            self.note_request_finished(rid)
+            self._forget(rid)  # never parked: no finish was seen
         self.evicted += len(stale)
 
     def _dump_router_stats(self):
