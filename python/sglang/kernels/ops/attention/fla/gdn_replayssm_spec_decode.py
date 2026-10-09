@@ -59,15 +59,37 @@ def _env_flag(name: str, default: str) -> bool:
 # 0 restores the full-ring loads (kill switch, and the reference for the check).
 _ARC_GDN_COMMIT_LIVE_ROWS = _env_flag("ARC_GDN_COMMIT_LIVE_ROWS", "1")
 
-# arc-forge h20 (opt-in, QSA HiSparse arm only; attention_hook refuses it elsewhere):
-# with a 16-bit checkpoint the accepted window is folded by the NEXT verify, which
-# reads the checkpoint anyway, instead of by the commit, which read and wrote it once
-# more. The commit keeps only the snapshot-track rows and leaves the cursors as the
-# advance set them (base at the window, write_pos = accepted, is_flush = 1); the
-# verify folds those rows with the commit's arithmetic, stores the checkpoint and
-# projects with it. Nothing but the verify and the commit's track reads the live
-# checkpoint on that arm, and a fresh request row starts with zeroed cursors.
-_ARC_GDN_FOLD_IN_VERIFY = _env_flag("ARC_GDN_FOLD_IN_VERIFY", "0")
+# arc-forge h20 (opt-in; attention_hook admits the QSA HiSparse arm and the mamba radix
+# cache in extra_buffer mode, see there): with a 16-bit checkpoint the accepted window
+# is folded by the NEXT verify, which reads the checkpoint anyway, instead of by the
+# commit, which read and wrote it once more. The commit keeps only the snapshot-track
+# rows and leaves the cursors as the advance set them (base at the window, write_pos =
+# accepted, is_flush = 1); the verify folds those rows with the commit's arithmetic,
+# stores the checkpoint and projects with it. Nothing but the verify and the commit's
+# track reads the live checkpoint on those arms. A fresh request row must start with
+# zeroed cursors at its first verify: the zeroing in HybridReqToTokenPool.alloc runs on
+# the schedule stream, unordered against the advance of the row's previous owner still
+# in flight under the overlap scheduler (which then leaves its window pending in the
+# row; the normal commit's finish kernel clears it, this mode has none), so this mode
+# zeroes fresh rows again on the forward stream before their extend
+# (ModelRunner._maybe_execute_deferred_mamba_cow_and_clear). B200 TP2 DFlash K4 on the
+# radix cache with the reset skipped (2026-10-09, i3neg, 10 min of the RL harness at ~98
+# running): 88 verify rows in 76 of 12,303 commits (of 3,034 requests, ~2.9%) found the
+# previous owner's window (write_pos 1, 2 or 4); with the reset, 0 in 12,000+ commits.
+# QSA HiSparse fences every release of a running row behind the forward stream
+# (QSAHiSparseCoordinator.request_finished: schedule stream waits on it), and with
+# native MTP the scheduler's WAR barrier waits for the draft extend, which follows the
+# advance; the race needs neither, so it lives on DFlash (whose last shared read is the
+# target verify's metadata prep, before the advance) off HiSparse.
+# ARC_GDN_FOLD_IN_VERIFY=check: the same kernels, plus a protocol check at every commit
+# (spec_utils.check_fold_in_verify_owners): a window pending in a row must have been
+# left there by the request that now holds the row.
+ARC_GDN_FOLD_IN_VERIFY_MODE = os.environ.get("ARC_GDN_FOLD_IN_VERIFY", "0")
+if ARC_GDN_FOLD_IN_VERIFY_MODE not in ("0", "1", "check"):
+    raise ValueError(
+        f"ARC_GDN_FOLD_IN_VERIFY must be 0, 1 or check, got {ARC_GDN_FOLD_IN_VERIFY_MODE!r}"
+    )
+_ARC_GDN_FOLD_IN_VERIFY = ARC_GDN_FOLD_IN_VERIFY_MODE in ("1", "check")
 # the verify's fold tile (key rows per step) and loop form; any choice gives the same
 # bytes (per element the same dot chain and roundings), they differ in speed only.
 # G4, 36 layers x 53 rows (opt2_fold_sweep.sh): 32 rows unrolled 4.82 ms per step of
@@ -1534,7 +1556,7 @@ def gdn_replayssm_spec_decode(
         is_flush = is_flush.to(torch.int8)
     if _ARC_GDN_FOLD_IN_VERIFY and launch_mode != "verify":
         raise ValueError(
-            f"ARC_GDN_FOLD_IN_VERIFY=1 folds in the verify launch; launch_mode={launch_mode!r}"
+            f"ARC_GDN_FOLD_IN_VERIFY={ARC_GDN_FOLD_IN_VERIFY_MODE} folds in the verify launch; launch_mode={launch_mode!r}"
         )
 
     if launch_mode in ("both", "flush"):
@@ -1698,7 +1720,9 @@ def commit_gdn_replayssm_circular(
     cursors keep the advance's values: the next verify folds the window.
     """
     if _ARC_GDN_FOLD_IN_VERIFY and checkpoint_state.dtype == torch.float32:
-        raise ValueError("ARC_GDN_FOLD_IN_VERIFY=1 needs a 16-bit checkpoint (fold every commit)")
+        raise ValueError(
+            f"ARC_GDN_FOLD_IN_VERIFY={ARC_GDN_FOLD_IN_VERIFY_MODE} needs a 16-bit checkpoint (fold every commit)"
+        )
     launch_gdn_replayssm_compact_commit(
         checkpoint_state=checkpoint_state,
         d_cache=d_cache,

@@ -907,6 +907,9 @@ class ReqKvInfo:
     # Deferred host restore (arc-forge QSA HiSparse h08): GDN host buffer the
     # first extend H2Ds into the newly allocated mamba slot instead of a clear
     mamba_host_restore: Optional[int] = None
+    # Deferred ReplaySSM spec cursor reset (arc-forge h20, ARC_GDN_FOLD_IN_VERIFY): a
+    # fresh request row zeroes its cursors again on the forward stream before its extend
+    replay_cursor_reset: bool = False
 
     def swa_dead_lo(self, page_size: int) -> int:
         # Lowest SWA position this request may free itself: above the tree-owned
@@ -2388,6 +2391,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     mamba_cow_src_indices: torch.Tensor = None
     mamba_cow_dst_indices: torch.Tensor = None
     mamba_clear_indices: torch.Tensor = None
+    # h20 (ARC_GDN_FOLD_IN_VERIFY): fresh request rows whose ReplaySSM spec cursors the
+    # extend zeroes again on the forward stream
+    replay_cursor_reset_rows: torch.Tensor = None
     # QSA HiSparse host restore (h08): GDN host buffer ids -> new mamba slots
     mamba_restore_bufs: Optional[List[int]] = None
     mamba_restore_dst_indices: torch.Tensor = None
@@ -3054,6 +3060,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         clear_tensors = []
         restore_bufs = []
         restore_dst_tensors = []
+        replay_reset_rows = []
         for req in reqs:
             if req.kv.mamba_host_restore is not None:
                 # QSA HiSparse (h08): the H2D overwrites every entry of the slot.
@@ -3071,6 +3078,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             elif req.kv.mamba_needs_clear:
                 clear_tensors.append(req.kv.mamba_pool_idx.unsqueeze(0))
                 req.kv.mamba_needs_clear = False
+            if req.kv.replay_cursor_reset:
+                replay_reset_rows.append(req.kv.req_pool_idx)
+                req.kv.replay_cursor_reset = False
+        # h20 (ARC_GDN_FOLD_IN_VERIFY): pinned, non-blocking -- no stream sync per admission
+        self.replay_cursor_reset_rows = (
+            torch.tensor(replay_reset_rows, dtype=torch.int64, pin_memory=True).to(
+                self.device, non_blocking=True
+            )
+            if replay_reset_rows
+            else None
+        )
         self.mamba_cow_src_indices = (
             torch.cat(cow_src_tensors) if cow_src_tensors else None
         )
@@ -3505,6 +3523,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None
         self.mamba_clear_indices = None
+        self.replay_cursor_reset_rows = None
         self.mamba_restore_bufs = None
         self.mamba_restore_dst_indices = None
         # ARC_MAMBA_TRACK_HOST mirrors describe the extend this object last ran, never a decode.
@@ -3665,6 +3684,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None
         self.mamba_clear_indices = None
+        self.replay_cursor_reset_rows = None
         self.mamba_restore_bufs = None
         self.mamba_restore_dst_indices = None
         self.return_logprob = any(req.return_logprob for req in self.reqs)

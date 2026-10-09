@@ -886,6 +886,107 @@ def _verify_commit_step_indices_at(
     return last_correct_step_indices, mamba_steps_to_track
 
 
+class _FoldInVerifyOwnerCheck:
+    """ARC_GDN_FOLD_IN_VERIFY=check (arc-forge h20): at every commit, before the advance,
+    the cursors of each batch row are what this step's verify consumed; a window pending
+    there (write_pos != 0 or is_flush != 0) must have been left by the request that now
+    holds the row (the previous advance wrote its owner). A fresh row the forward-stream
+    reset missed (or any other cross-request leftover) carries the previous owner's window
+    and fails. The verdict is read one commit later through a pinned copy and an event,
+    so the check adds no stream sync and leaves the overlap scheduler's timing (the race
+    it looks for) alone; a violation raises at the next commit."""
+
+    LOG_EVERY = 2000
+
+    def __init__(self) -> None:
+        self.uids: dict = {}
+        self.pending = None
+        self.commits = 0
+        self.rows = 0
+        self.rows_pending = 0
+        self.violations = 0
+        self.violating_commits = 0
+        # the negative control (ARC_GDN_FOLD_IN_VERIFY_SKIP_FWD_RESET=1, memory_pool) is
+        # expected to violate: count and log every violation instead of raising, so the
+        # run measures how often the race fires
+        self.count_only = os.environ.get("ARC_GDN_FOLD_IN_VERIFY_SKIP_FWD_RESET", "0") == "1"
+
+    def _uid(self, rid) -> int:
+        uid = self.uids.get(rid)
+        if uid is None:
+            uid = len(self.uids)
+            self.uids[rid] = uid
+        return uid
+
+    def _verdict(self) -> None:
+        if self.pending is None:
+            return
+        event, bad, rows, wp, fl, owner, rids, uids = self.pending
+        self.pending = None
+        event.synchronize()
+        self.rows_pending += int(((wp != 0) | (fl != 0)).sum())
+        if bad.any():
+            idx = bad.nonzero().flatten().tolist()
+            inv = {u: r for r, u in self.uids.items()}
+            detail = "; ".join(
+                f"row {int(rows[i])}: {rids[i]} found write_pos={int(wp[i])} is_flush={int(fl[i])} "
+                f"left by {inv.get(int(owner[i]), 'nobody (-1)' if int(owner[i]) < 0 else int(owner[i]))}"
+                for i in idx[:8]
+            )
+            msg = (
+                f"ARC_GDN_FOLD_IN_VERIFY=check: {len(idx)} of {len(rids)} verify rows folded a window "
+                f"another request left pending (commit {self.commits}): {detail}"
+            )
+            if not self.count_only:
+                raise RuntimeError(msg)
+            self.violations += len(idx)
+            self.violating_commits += 1
+            logger.warning(
+                "%s [negative control: %d violations in %d of %d commits, %d requests seen]",
+                msg, self.violations, self.violating_commits, self.commits, len(self.uids),
+            )
+
+    def __call__(self, mamba_pool, batch, replay_indices: torch.Tensor) -> None:
+        self._verdict()
+        owner = mamba_pool.replayssm_fold_owner
+        if owner is None:
+            raise RuntimeError("ARC_GDN_FOLD_IN_VERIFY=check without the owner table (memory_pool)")
+        rids = [req.rid for req in batch.reqs]
+        if len(rids) != replay_indices.shape[0]:
+            raise RuntimeError(
+                f"ARC_GDN_FOLD_IN_VERIFY=check: {len(rids)} reqs vs {replay_indices.shape[0]} replay rows"
+            )
+        uids = [self._uid(r) for r in rids]
+        dev = replay_indices.device
+        ids = torch.tensor(uids, dtype=torch.int64, pin_memory=True).to(dev, non_blocking=True)
+        rows = replay_indices.to(torch.int64)
+        wp = mamba_pool.replayssm_spec_write_pos[rows]
+        fl = mamba_pool.replayssm_is_flush[rows]
+        prev = owner[rows]
+        bad = ((wp != 0) | (fl != 0)) & (prev != ids)
+        owner.index_copy_(0, rows, ids)
+        host = [
+            torch.empty(t.shape, dtype=t.dtype, pin_memory=True) for t in (bad, rows, wp, fl, prev)
+        ]
+        for h, t in zip(host, (bad, rows, wp, fl, prev)):
+            h.copy_(t, non_blocking=True)
+        event = torch.cuda.Event()
+        event.record()
+        self.pending = (event, *host, rids, uids)
+        self.commits += 1
+        self.rows += len(rids)
+        if self.commits % self.LOG_EVERY == 0:
+            logger.info(
+                "ARC_GDN_FOLD_IN_VERIFY=check: %d commits, %d rows checked, %d with a pending "
+                "window, %d violations in %d commits, %d requests seen",
+                self.commits, self.rows, self.rows_pending, self.violations,
+                self.violating_commits, len(self.uids),
+            )
+
+
+_fold_in_verify_owner_check = _FoldInVerifyOwnerCheck()
+
+
 def _commit_ple_side_states_after_replayssm(
     model_runner,
     req_pool,
@@ -1003,6 +1104,7 @@ def commit_mamba_states_after_verify(
         if batch.forward_mode.is_idle() or accept_index.numel() == 0:
             return
         from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode import (
+            ARC_GDN_FOLD_IN_VERIFY_MODE,
             commit_gdn_replayssm_circular,
             commit_gdn_replayssm_spec,
         )
@@ -1021,6 +1123,8 @@ def commit_mamba_states_after_verify(
             draft_token_num=draft_token_num,
             mamba_track_interval=mamba_track_interval,
         )
+        if ARC_GDN_FOLD_IN_VERIFY_MODE == "check":
+            _fold_in_verify_owner_check(mamba_pool, batch, replay_indices)
         # Advance the per-request circular cursors by the accepted count (incl. the
         # bonus token). max_cache_len = ring length L = replayssm_d.shape[-2].
         commit_gdn_replayssm_spec(

@@ -452,6 +452,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     mamba_cow_src_indices: Optional[torch.Tensor] = None
     mamba_cow_dst_indices: Optional[torch.Tensor] = None
     mamba_clear_indices: Optional[torch.Tensor] = None
+    # h20 (ARC_GDN_FOLD_IN_VERIFY): fresh request rows whose ReplaySSM spec cursors are
+    # zeroed again on the forward stream (ModelRunner._maybe_execute_deferred_mamba_cow_and_clear)
+    replay_cursor_reset_rows: Optional[torch.Tensor] = None
     # QSA HiSparse host restore (arc-forge h08): GDN host buffer ids and the new
     # mamba slots they are H2D'd into before the extend (with the COW / clear ops)
     mamba_restore_bufs: Optional[List[int]] = None
@@ -866,6 +869,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mamba_cow_src_indices=batch.mamba_cow_src_indices,
             mamba_cow_dst_indices=batch.mamba_cow_dst_indices,
             mamba_clear_indices=batch.mamba_clear_indices,
+            replay_cursor_reset_rows=batch.replay_cursor_reset_rows,
             mamba_restore_bufs=batch.mamba_restore_bufs,
             mamba_restore_dst_indices=batch.mamba_restore_dst_indices,
             encoder_lens=batch.encoder_lens,
