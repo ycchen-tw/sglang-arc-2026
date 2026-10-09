@@ -274,13 +274,15 @@ def load_model_with_memory_saver(
                 "--ple-offload-embedding only supports Qwen4ExpForConditionalGeneration"
             )
         if is_qwen4_exp:
-            from sglang.srt.models import arc_ple_nvfp4
+            from sglang.srt.models import arc_ple_int5, arc_ple_nvfp4
 
-            if arc_ple_nvfp4.enabled() and not ple_offload_embedding:
-                raise ValueError(
-                    f"{arc_ple_nvfp4.ENV}=1 needs --ple-offload-embedding "
-                    "(only the offloaded PLE table is stored as NVFP4)"
-                )
+            # int5.enabled() also raises when ARC_PLE_INT5 and ARC_PLE_NVFP4 are both set
+            for codec in (arc_ple_int5, arc_ple_nvfp4):
+                if codec.enabled() and not ple_offload_embedding:
+                    raise ValueError(
+                        f"{codec.ENV}=1 needs --ple-offload-embedding "
+                        f"(only the offloaded PLE table is stored as {codec.NAME})"
+                    )
             model_config.hf_text_config.ple_offload_embedding = ple_offload_embedding
             model_config.hf_text_config.ple_offload_backend = (
                 get_exec().offload.ple_offload_backend
