@@ -18,6 +18,22 @@ import torch.nn.functional as F
 from torch import nn
 
 
+# arc-forge ARC_DFLASH_FAST_TOPK (opt-in, default 0): the vocabulary top-k of TargetHead / PairHead by fast_topk
+# (two Triton passes; the same set and order, ties to the lower id) instead of torch.topk
+FAST_TOPK = os.environ.get("ARC_DFLASH_FAST_TOPK", "0")
+if FAST_TOPK not in ("0", "1"):
+    raise ValueError(f"ARC_DFLASH_FAST_TOPK must be 0 or 1, got {FAST_TOPK!r}")
+
+
+def _vocab_topk(logits, k: int):
+    """top-k over the last dimension of 2-D logits."""
+    if FAST_TOPK == "1":
+        from .fast_topk import topk
+
+        return topk(logits, k)
+    return logits.topk(k, -1)
+
+
 class TargetEmbedding(nn.Module):
     """The target's own token embedding (identical tensor)."""
 
@@ -44,6 +60,9 @@ class TargetHead(nn.Module):
         return F.linear(x, self._weight[0])
 
     def topk(self, x, k: int):
+        if FAST_TOPK == "1":
+            values, ids = _vocab_topk(self(x.reshape(-1, x.shape[-1])), k)
+            return values.view(*x.shape[:-1], k), ids.view(*x.shape[:-1], k)
         logits = self(x.reshape(-1, x.shape[-1])).view(*x.shape[:-1], -1)
         return logits.topk(k, -1)
 
@@ -95,7 +114,7 @@ class PairHead(nn.Module):
         flat = x.reshape(-1, x.shape[-1])
         values, ids = [], []
         for w, first in self.parts:
-            v, i = F.linear(flat, w).topk(k, -1)
+            v, i = _vocab_topk(F.linear(flat, w), k)
             values.append(v)
             ids.append(i + first)
         v, i = torch.cat(values, -1), torch.cat(ids, -1)
