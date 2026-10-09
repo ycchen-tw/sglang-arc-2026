@@ -14,6 +14,7 @@ them. Online softmax in fp32, P cast to the value dtype for the PV product (as t
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -103,6 +104,66 @@ TILES = {"small": (32, 64, 4, 2), "large": (64, 32, 4, 2)}
 BLOCK_M = BLOCK_N = NUM_WARPS = NUM_STAGES = None  # the bench overrides the table through these
 
 
+def _env_tile():
+    """arc-forge ARC_DFLASH_RING_TILE (opt-in; unset = TILES). "bm,bn,warps,stages": that tile for the "small" case
+    (rows <= 132, every K <= 6 drafter) at every batch. "auto": per launch, the deployed 32x64 tile or one 128x64
+    (8 warps, 2 stages) program per (request, KV head) -- all 84 rows of a K = 4 step, each K/V tile read once
+    instead of three times -- whichever needs less time by a wave count: both run one program per SM (shared
+    memory), and on B200 a 128-row program takes AUTO_RATIO x as long as a 32-row one (88 vs ~40 us at window 1024,
+    dflash_propose_bench.py ring). At 148 SMs that picks 128 rows for batches <= 74 and >= 99 (batch 128: 0.231 ->
+    0.177 ms per layer; 64: 0.154 -> 0.095) and keeps 32 for 75-98, where 128-row programs need two waves for about
+    1.3 waves of work (96: 0.162 vs 0.175). Another tile reorders the softmax's accumulation, so the drafter's
+    attention moves by rounding (not bitwise); the target's distribution is untouched (rejection sampling). The
+    choice is a function of the batch and the device only, so every rank of a group picks the same tile."""
+    value = os.environ.get("ARC_DFLASH_RING_TILE")
+    if value is None:
+        return None
+    if value == "auto":
+        return "auto"
+    parts = value.split(",")
+    if len(parts) != 4 or not all(p.strip().isdigit() for p in parts):
+        raise ValueError(f"ARC_DFLASH_RING_TILE={value!r}: auto or bm,bn,warps,stages")
+    bm, bn, warps, stages = (int(p) for p in parts)
+    for name, v in (("bm", bm), ("bn", bn), ("warps", warps)):
+        if v < 1 or v & (v - 1):
+            raise ValueError(f"ARC_DFLASH_RING_TILE={value!r}: {name} must be a power of two")
+    if bm < 16 or bn < 16 or stages < 1:
+        raise ValueError(f"ARC_DFLASH_RING_TILE={value!r}: bm, bn >= 16 (tl.dot) and stages >= 1")
+    return bm, bn, warps, stages
+
+
+AUTO_BIG = (128, 64, 8, 2)
+AUTO_RATIO = 2.2
+_SMS: dict = {}
+
+
+def _auto_tile(rows, programs_per_row_tile, device):
+    """ARC_DFLASH_RING_TILE=auto: the deployed small tile or AUTO_BIG, by waves x time per program."""
+    small = TILES["small"]
+    if rows > AUTO_BIG[0]:
+        return small
+    sms = _SMS.get(device)
+    if sms is None:
+        sms = _SMS[device] = torch.cuda.get_device_properties(device).multi_processor_count
+    waves_small = triton.cdiv(triton.cdiv(rows, small[0]) * programs_per_row_tile, sms)
+    waves_big = triton.cdiv(programs_per_row_tile, sms)
+    return AUTO_BIG if waves_big * AUTO_RATIO < waves_small else small
+
+
+# arc-forge ARC_DFLASH_RING_OUT_T (opt-in, default 0): attend writes its output as [B, n, Hq, D] memory and returns
+# the [B, Hq, n, D] view of it, so the model's y.transpose(1, 2).flatten(-2) * sigmoid(gate) reads contiguous rows.
+# Inductor's dynamic-shape kernel for that product over the [B, Hq, n, D] layout ran 68 us per layer at batch 128
+# (vs 21 us); the kernel computes and rounds the same values, only the store addresses change: bitwise.
+OUT_T = os.environ.get("ARC_DFLASH_RING_OUT_T", "0")
+if OUT_T not in ("0", "1"):
+    raise ValueError(f"ARC_DFLASH_RING_OUT_T must be 0 or 1, got {OUT_T!r}")
+
+
+_ENV_TILE = _env_tile()
+if _ENV_TILE is not None and _ENV_TILE != "auto":
+    TILES = {**TILES, "small": _ENV_TILE}
+
+
 def attend(q, k, v, positions, key: RingWindow, value: RingWindow, key_positions, window):
     """q [B, Hq, n, D], k / v [B, Hkv, n, D] (this block), positions [B, n]; key / value: the ring pool;
     key_positions [B, columns] (the batch's ring positions). Returns [B, Hq, n, D]."""
@@ -115,10 +176,15 @@ def attend(q, k, v, positions, key: RingWindow, value: RingWindow, key_positions
     if key_positions.shape != (batch, key.columns) or positions.shape != (batch, n) or key.idx.shape != (batch,):
         raise ValueError(f"positions {tuple(key_positions.shape)} / {tuple(positions.shape)} vs batch {batch}")
     q = q.contiguous()
-    out = torch.empty_like(q)
+    if OUT_T == "1":
+        out = torch.empty((batch, n, hq, dim), dtype=q.dtype, device=q.device).transpose(1, 2)
+    else:
+        out = torch.empty_like(q)
     group = hq // hkv
     rows = group * n
     bm, bn, warps, stages = TILES["large" if rows > 132 else "small"]
+    if _ENV_TILE == "auto" and rows <= 132:
+        bm, bn, warps, stages = _auto_tile(rows, hkv * batch, q.device)
     if BLOCK_M is not None:
         bm, bn, warps, stages = BLOCK_M, BLOCK_N, NUM_WARPS, NUM_STAGES
     grid = (triton.cdiv(rows, bm), hkv, batch)
