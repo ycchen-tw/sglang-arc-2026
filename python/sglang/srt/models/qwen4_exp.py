@@ -1,8 +1,9 @@
 """Inference-only Qwen4-Exp (text + VL) on the Qwen3.5 backbone."""
 
 import math
+import os
 from contextlib import nullcontext
-from typing import Any, Iterable, Optional, Set, Tuple
+from typing import Any, Iterable, NamedTuple, Optional, Set, Tuple
 
 import msgspec
 import sympy
@@ -1455,6 +1456,28 @@ class Qwen4ExpPLELayer(nn.Module):
         return _pad_token_rows(output, batch.physical_tokens)
 
 
+# arc-forge ARC_HC_GATE_PRECOMPUTE (opt-in, default 0): in decode / target verify, a hyper-connection combine over
+# more than 32 rows (hc_combine, one CTA per row: a 10240-wide gate dot, then the gated residual) is split in two.
+# The gate depends only on the mix's normed input, so hc_gate computes it on a side stream as soon as the mix is
+# done, concurrently with the attention / MoE block; after the block's all-reduce only hc_apply (the combine's
+# second phase) is left on the critical path. hc_gate is the combine's first phase and hc_apply its second, both
+# unchanged, so the output is the same bytes (scripts/arc/test_hc_gate_apply.py). "check": also run hc_combine and
+# assert on the device that every element agrees (graph-capturable; validation only). Rows <= 32 keep
+# hc_combine_split; TP4 with SGLANG_QWEN4_MNNVL_HC keeps its fused path.
+_ARC_HC_GATE_PRECOMPUTE = os.environ.get("ARC_HC_GATE_PRECOMPUTE", "0")
+if _ARC_HC_GATE_PRECOMPUTE not in ("0", "1", "check"):
+    raise ValueError(f"ARC_HC_GATE_PRECOMPUTE must be 0, 1 or check, got {_ARC_HC_GATE_PRECOMPUTE!r}")
+_ARC_HC_GATE_MIN_ROWS = 33  # hc_combine_split's limit is 32 rows
+
+
+class _ArcHcGate(NamedTuple):
+    """A mix's residuals plus the gate hc_gate is computing for its combine on the side stream."""
+
+    hyper_input: torch.Tensor
+    hyper_input_normed: torch.Tensor
+    gate: torch.Tensor
+
+
 class Qwen4ExpLayerExtensionMixin:
     def _init_qwen4_exp_layer_extensions(
         self,
@@ -1471,6 +1494,11 @@ class Qwen4ExpLayerExtensionMixin:
         self._qwen4_mnnvl_hc_stream = (
             get_stream("qwen4_mnnvl_hc_gate")
             if requested_mnnvl_hc and torch.cuda.is_available()
+            else None
+        )
+        self._arc_hc_gate_stream = (
+            get_stream("arc_hc_gate")
+            if _ARC_HC_GATE_PRECOMPUTE != "0" and torch.cuda.is_available()
             else None
         )
         self._qwen4_mnnvl_hc_enabled = (
@@ -1570,6 +1598,68 @@ class Qwen4ExpLayerExtensionMixin:
         hyper_input_normed.record_stream(gate_stream)
         return hyper_input, hyper_input_normed, gate
 
+    def _arc_hc_gate_active(self, rows: int, forward_batch: ForwardBatch) -> bool:
+        if self._arc_hc_gate_stream is None or self._qwen4_mnnvl_hc_enabled:
+            return False
+        if rows < _ARC_HC_GATE_MIN_ROWS:
+            return False
+        mode = forward_batch.forward_mode
+        return mode.is_decode() or mode.is_target_verify()
+
+    def _arc_hc_precompute(self, hyper_connection, residuals) -> _ArcHcGate:
+        hyper_input, hyper_input_normed = residuals
+        weight = hyper_connection.block_inject_weight.weight
+        # the split is only the same bytes as the combine it replaces when that combine is hc_combine
+        if not (
+            hyper_connection._jit_combine_ok
+            and hyper_input.is_cuda
+            and hyper_input.dtype in (torch.bfloat16, torch.float16)
+            and hyper_input_normed.dtype == hyper_input.dtype
+            and weight.dtype == hyper_input.dtype
+        ):
+            raise RuntimeError(
+                "ARC_HC_GATE_PRECOMPUTE needs the hc_combine path (jit shapes, bf16/fp16 CUDA residuals), got "
+                f"jit_ok={hyper_connection._jit_combine_ok} {hyper_input.dtype}/{hyper_input_normed.dtype}/{weight.dtype}"
+            )
+        current_stream = torch.cuda.current_stream()
+        gate_stream = self._arc_hc_gate_stream
+        gate_stream.wait_stream(current_stream)
+        with torch.cuda.stream(gate_stream):
+            from sglang.kernels.ops.elementwise.hc_gate import hc_gate
+
+            gate = hc_gate(
+                hyper_input_normed,
+                weight,
+                self.hc_count,
+                self.hidden_size,
+            )
+        # read on gate_stream, still live in the tuple (as _qwen4_mnnvl_hc_precompute_gate)
+        hyper_input_normed.record_stream(gate_stream)
+        return _ArcHcGate(hyper_input, hyper_input_normed, gate)
+
+    def _arc_hc_apply(self, hyper_connection, block_output: torch.Tensor, pending: _ArcHcGate) -> torch.Tensor:
+        if block_output.dtype != pending.hyper_input.dtype:
+            raise RuntimeError(
+                f"ARC_HC_GATE_PRECOMPUTE: block output {block_output.dtype} vs residual {pending.hyper_input.dtype}"
+            )
+        current_stream = torch.cuda.current_stream()
+        current_stream.wait_stream(self._arc_hc_gate_stream)
+        pending.gate.record_stream(current_stream)
+        from sglang.kernels.ops.elementwise.hc_gate import hc_apply
+
+        out = hc_apply(
+            block_output, pending.hyper_input, pending.gate, self.hc_count, self.hidden_size
+        )
+        if _ARC_HC_GATE_PRECOMPUTE == "check":
+            ref = hyper_connection.combine(
+                block_output, (pending.hyper_input, pending.hyper_input_normed)
+            )
+            torch._assert_async(
+                torch.eq(out.view(torch.int16), ref.view(torch.int16)).all(),
+                "ARC_HC_GATE_PRECOMPUTE=check: hc_gate + hc_apply != hc_combine",
+            )
+        return out
+
     def _prepare_qwen4_exp_attn(
         self,
         hidden_states: torch.Tensor,
@@ -1603,6 +1693,8 @@ class Qwen4ExpLayerExtensionMixin:
         hidden_states, residual = self.attn_hyper_connection.mix(hidden_states)
         if self._qwen4_mnnvl_hc_should_precompute(hidden_states, forward_batch):
             residual = self._qwen4_mnnvl_hc_precompute_gate(residual)
+        elif self._arc_hc_gate_active(hidden_states.shape[0], forward_batch):
+            residual = self._arc_hc_precompute(self.attn_hyper_connection, residual)
         return hidden_states, residual
 
     def _prepare_qwen4_exp_mlp(
@@ -1611,6 +1703,13 @@ class Qwen4ExpLayerExtensionMixin:
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ):
+        if isinstance(residual, _ArcHcGate):
+            hidden_states = attn_tp_all_reduce(hidden_states)
+            hidden_states = self._arc_hc_apply(self.attn_hyper_connection, hidden_states, residual)
+            hidden_states, residual = self.mlp_hyper_connection.mix(hidden_states)
+            if self._arc_hc_gate_active(hidden_states.shape[0], forward_batch):
+                residual = self._arc_hc_precompute(self.mlp_hyper_connection, residual)
+            return hidden_states, residual
         has_precomputed_gate = isinstance(residual, tuple) and len(residual) == 3
         if has_precomputed_gate:
             hyper_input, hyper_input_normed, gate = residual
@@ -1699,6 +1798,8 @@ class Qwen4ExpLayerExtensionMixin:
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ):
+        if isinstance(residual, _ArcHcGate):
+            return self._arc_hc_apply(self.mlp_hyper_connection, hidden_states, residual), None
         hidden_states = self.mlp_hyper_connection.combine(hidden_states, residual)
         return hidden_states, None
 
