@@ -522,7 +522,9 @@ def _breakdown(
                 raise RuntimeError(f"graph kernel {name[:80]} in an extend window: analyze the eager arm first, pass --map")
             elif name not in name_map:
                 unmapped[_short(name)] += d
-                parts = {"unmapped (graph kernel)": 1.0}
+                # cuBLAS picks other tiles at the padded bucket M than eager at the real M, so the
+                # replay's bf16 GEMMs often have no eager twin: count them as one bucket
+                parts = {"dense GEMM (graph, unattributed)" if re.search(r"nvjet|cublas|gemm", name) else "unmapped (graph kernel)": 1.0}
             else:
                 parts = name_map[name]
                 if len(parts) > 1:
@@ -548,7 +550,7 @@ def _breakdown(
     return {
         "window_ms": (hi - lo) / 1e3,
         "busy_ms": busy / 1e3,
-        "kernels": dict(sorted(per_kernel.items(), key=lambda kv: -kv[1][0])[:60]),
+        "kernels": dict(sorted(per_kernel.items(), key=lambda kv: -kv[1][0])),
         "idle_ms": (hi - lo - busy) / 1e3,
         "kernel_sum_ms": sum(v["us"] for v in cats.values()) / 1e3,
         "graph_ms": graph_us / 1e3,
@@ -777,9 +779,15 @@ def roofline_ms(spec: List[Tuple[int, int, int]], tp: int = 2) -> Dict[str, Tupl
     gdn_core_bytes = T * (2 * 16 * 128 + 2 * 48 * 128 + 2 * 48) // tp * BF16 + T * 16384 // tp * BF16 * 2
     gdn_core_flops = T * (48 // tp) * 2 * (3 * 128 * 128 + 64 * 256)
     out["GDN core"] = (L_GDN * t(gdn_core_flops, gdn_core_bytes, "bf16"), "chunked delta rule + conv1d, activations once")
+    # per HC block (2 per layer, replicated) as implemented for extend: hc_norm (read + write the
+    # 4-wide [T, 10240] stream), mix GEMM down (read), GEMM up (write), the compiled sigmoid*normed
+    # mean (read 2), hc_combine (read R and normed, write) = ~9.5 passes; a fused block needs ~3
     hc_flops = 2 * T * (2 * 10240 * 320) * 2
-    hc_bytes = 2 * 3 * T * 10240 * BF16
-    out["HC/layer level + norm"] = (LAYERS * t(hc_flops, hc_bytes, "bf16"), "2 HC blocks/layer, replicated: low-rank mix GEMMs; 4-wide stream read twice + written once")
+    hc_bytes = 2 * 9.5 * T * 10240 * BF16
+    out["HC/layer level + norm"] = (
+        LAYERS * t(hc_flops, hc_bytes, "bf16"),
+        f"2 HC blocks/layer, ~9.5 passes over the 4-wide stream each (fused ~3: {LAYERS * 2 * 3 * T * 10240 * BF16 / B200['hbm'] * 1e3:.1f} ms)",
+    )
     ar = T * H * BF16
     out["allreduce"] = (
         (2 * LAYERS + 1) * (ar / B200["nvlink"]) * 1e3,
@@ -817,6 +825,7 @@ _GROUPS = [
     ("allreduce", lambda c: c == "allreduce"),
     ("PLE", lambda c: c == "PLE"),
     ("LM head/logits", lambda c: c in ("LM head/logits", "sampling", "embedding")),
+    ("dense GEMM (graph, unattr.)", lambda c: c == "dense GEMM (graph, unattributed)"),
     ("ViT/mm embed", lambda c: c == "ViT/mm embed"),
     ("other", lambda c: True),
 ]
@@ -845,6 +854,7 @@ KEY_KERNELS = [
     ("MoE routing", r"routingIndices"),
     ("HC combine", r"hc_combine"),
     ("all-reduce (TP0 incl. wait)", _ALLREDUCE.pattern),
+    ("bf16 dense GEMM, all (nvjet)", r"^nvjet|cublas"),
     ("GDN chunk (flashinfer)", r"gated_delta_net|flashinfergdn"),
     ("causal conv1d", r"causal_conv1d"),
 ]
