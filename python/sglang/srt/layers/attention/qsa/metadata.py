@@ -6,7 +6,7 @@ contains only fields and transforms consumed by the indexer.
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import msgspec
 import torch
@@ -116,6 +116,9 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     # batches; None otherwise).
     prefill_compressed_locs: Optional[torch.Tensor] = None
     max_position_cpu: Optional[int] = None
+    # Extend forwards: the scheduler's host lengths per sequence (ARC_QSA_INDEXER_LOCAL tiles).
+    prefill_extend_lens_cpu: Optional[List[int]] = None
+    prefill_seq_lens_cpu: Optional[List[int]] = None
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.sequence_lengths.to(torch.int32)

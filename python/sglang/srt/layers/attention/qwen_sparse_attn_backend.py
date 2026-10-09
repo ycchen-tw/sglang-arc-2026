@@ -1208,8 +1208,15 @@ class QwenSparseAttnBackend(AttentionBackend):
         # h15: what the indexer's extend path read back per layer, from host lengths
         prefill_compressed_locs = None
         max_position_cpu = None
+        prefill_extend_lens_cpu = None
+        prefill_seq_lens_cpu = None
         if not decode_like and forward_batch.seq_lens_cpu is not None:
             host_lengths = [int(x) for x in forward_batch.seq_lens_cpu[:batch_size]]
+            if forward_batch.extend_seq_lens_cpu is not None:
+                prefill_seq_lens_cpu = host_lengths
+                prefill_extend_lens_cpu = [
+                    int(x) for x in forward_batch.extend_seq_lens_cpu[:batch_size]
+                ]
             prefill_compressed_locs = self._prefill_compressed_locs(
                 token_slot_table, host_lengths
             )
@@ -1254,6 +1261,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             hisparse=hisparse,
             prefill_compressed_locs=prefill_compressed_locs,
             max_position_cpu=max_position_cpu,
+            prefill_extend_lens_cpu=prefill_extend_lens_cpu,
+            prefill_seq_lens_cpu=prefill_seq_lens_cpu,
         )
         return QwenSparseAttnMetadata(
             sequence_lengths=sequence_lengths,
