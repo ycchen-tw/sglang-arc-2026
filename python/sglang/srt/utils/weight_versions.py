@@ -50,6 +50,26 @@ def record_weight_version_events(reqs: Iterable[Req], old_version: str) -> int:
     return num_recorded
 
 
+def record_forward_weight_version(req: Req, forward_version: str) -> None:
+    """Commit the target distribution's version with its accepted output tokens.
+
+    Pending old overlap results can extend the old span past a weight-update
+    event. Consecutive forwards coalesce, so storage grows with updates rather
+    than decode iterations. EOS/abort visibility is clamped by span computation.
+    """
+    if forward_version is None:
+        raise RuntimeError("generated output lacks its target forward weight version")
+    end = len(req.output_ids)
+    if not end:
+        return
+    event = WeightVersionEvent(old_version=forward_version, num_output_tokens=end)
+    events = req.weight_version_events
+    if events and events[-1].old_version == forward_version:
+        events[-1] = event
+    else:
+        events.append(event)
+
+
 def truncate_weight_version_events(
     events: List[WeightVersionEvent], num_kept_tokens: int
 ) -> List[WeightVersionEvent]:
