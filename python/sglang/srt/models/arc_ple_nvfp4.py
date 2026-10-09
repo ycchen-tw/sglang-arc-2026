@@ -31,6 +31,7 @@ import os
 import torch
 
 ENV = "ARC_PLE_NVFP4"
+NAME = "NVFP4"
 BLOCK = 16
 E2M1_MAX = 6.0
 # e2m1 magnitudes are [0, .5, 1, 1.5, 2, 3, 4, 6] for codes 0..7; these are the decision boundaries between them

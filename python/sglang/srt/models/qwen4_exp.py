@@ -57,7 +57,7 @@ from sglang.srt.model_executor.forward_context import (
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models import arc_ple_nvfp4
+from sglang.srt.models import arc_ple_int5, arc_ple_nvfp4
 from sglang.srt.models.qwen3_5 import (
     Qwen3_5AttentionDecoderLayer,
     Qwen3_5ForCausalLM,
@@ -753,9 +753,10 @@ def _gather_ple_embedding_from_pinned_kernel(
     embedding_dim,
     tp_vocab_start,
     tp_vocab_end,
-    nvfp4_row_bytes,
+    packed_row_bytes,
     is_fp8: tl.constexpr,
     is_nvfp4: tl.constexpr,
+    is_int5: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     row_id = tl.program_id(0)
@@ -764,11 +765,33 @@ def _gather_ple_embedding_from_pinned_kernel(
     local_idx = tl.where(in_range, global_idx - tp_vocab_start, 0)
     offsets = tl.arange(0, BLOCK_D)
     mask = offsets < embedding_dim
-    if is_nvfp4:
-        # arc_ple_nvfp4: a row is d/2 code bytes (element 2j in the low nibble of
-        # byte j), then d/16 e4m3 scales: nvfp4_row_bytes
+    if is_int5:
+        # arc_ple_int5: a row is d*5/8 code bytes (element i is the 5-bit field at
+        # bit 5*i, little-endian, stored as code + 16), then d/16 e4m3 scales:
+        # packed_row_bytes
         row_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8)) + (
-            local_idx.to(tl.int64) * nvfp4_row_bytes
+            local_idx.to(tl.int64) * packed_row_bytes
+        )
+        bit = offsets * 5
+        lo = tl.load(row_ptr + (bit >> 3), mask=mask, other=0).to(tl.int32)
+        # the field straddles two bytes at most; the byte after the last code byte
+        # is the first scale byte of the same row, so the read never leaves the row
+        hi = tl.load(row_ptr + (bit >> 3) + 1, mask=mask, other=0).to(tl.int32)
+        unsigned = ((lo | (hi << 8)) >> (bit & 7)) & 0x1F
+        scale = (
+            tl.load(
+                row_ptr + embedding_dim * 5 // 8 + offsets // 16, mask=mask, other=0
+            )
+            .to(tl.float8e4nv, bitcast=True)
+            .to(tl.float32)
+        )
+        # |code| <= 15 (4 bits) x e4m3 (4 bits): at most 8 significant bits, exact in bf16
+        values = ((unsigned - 16).to(tl.float32) * scale).to(tl.bfloat16)
+    elif is_nvfp4:
+        # arc_ple_nvfp4: a row is d/2 code bytes (element 2j in the low nibble of
+        # byte j), then d/16 e4m3 scales: packed_row_bytes
+        row_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8)) + (
+            local_idx.to(tl.int64) * packed_row_bytes
         )
         byte = tl.load(row_ptr + offsets // 2, mask=mask, other=0).to(tl.int32)
         code = (byte >> ((offsets & 1) * 4)) & 0xF
@@ -808,9 +831,10 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
 
     The table stays in its checkpoint storage dtype (fp8 with a per-tensor
     weight_scale for fp8 checkpoints, bf16 otherwise); gathers emit bf16.
-    With ARC_PLE_NVFP4=1 (arc_ple_nvfp4) an fp8 table is stored as NVFP4
-    instead: ``weight`` is [rows, arc_ple_nvfp4.row_bytes(d)] uint8 (codes and
-    block scales of a row together), and rows go in through ``load_rows``.
+    With ARC_PLE_NVFP4=1 (arc_ple_nvfp4) or ARC_PLE_INT5=1 (arc_ple_int5) an
+    fp8 table is stored in that codec instead: ``weight`` is [rows,
+    codec.row_bytes(d)] uint8 (codes and block scales of a row together), and
+    rows go in through ``load_rows``.
     """
 
     _COPIED_ATTRIBUTES = (
@@ -865,21 +889,34 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             f"rows{self.shard_indices.org_vocab_start_index}"
             f"-{self.shard_indices.org_vocab_end_index}"
         )
-        self.nvfp4 = arc_ple_nvfp4.enabled()
-        if self.nvfp4:
-            arc_ple_nvfp4.check_table(backend, source_weight.dtype, self.embedding_dim)
+        # the packed-table codec (a module with the arc_ple_* interface), or None
+        # for a table kept in its checkpoint dtype; int5.enabled() raises when
+        # both ARC_PLE_INT5 and ARC_PLE_NVFP4 are set
+        if arc_ple_int5.enabled():
+            self.packed_codec = arc_ple_int5
+        elif arc_ple_nvfp4.enabled():
+            self.packed_codec = arc_ple_nvfp4
+        else:
+            self.packed_codec = None
+        self.packed = self.packed_codec is not None
+        self.nvfp4 = self.packed_codec is arc_ple_nvfp4
+        self.int5 = self.packed_codec is arc_ple_int5
+        if self.packed:
+            self.packed_codec.check_table(
+                backend, source_weight.dtype, self.embedding_dim
+            )
             host_table = allocate_ple_host_table(
                 shape=(
                     int(source_weight.shape[0]),
-                    arc_ple_nvfp4.row_bytes(self.embedding_dim),
+                    self.packed_codec.row_bytes(self.embedding_dim),
                 ),
                 dtype=torch.uint8,
                 backend=backend,
                 table_dir=table_dir,
                 tag=tag,
             )
-            self.nvfp4_rows_loaded = 0
-            self.nvfp4_subnormal_blocks = 0
+            self.packed_rows_loaded = 0
+            self.packed_subnormal_blocks = 0
         else:
             host_table = allocate_ple_host_table(
                 shape=source_weight.shape,
@@ -905,7 +942,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self._block_d = triton.next_power_of_2(self.embedding_dim)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-        if not self.nvfp4:
+        if not self.packed:
             return super().weight_loader(param, loaded_weight)
         # a whole (unsharded) table: global rows [0, n)
         self.load_rows(loaded_weight, 0)
@@ -919,42 +956,46 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         ov_end = min(row_end, tp_end)
         if ov_start >= ov_end:
             return
-        if not self.nvfp4:
-            raise RuntimeError("load_rows is the NVFP4 path; fp8/bf16 rows use weight_loader")
+        if not self.packed:
+            raise RuntimeError(
+                "load_rows is the packed (NVFP4/INT5) path; fp8/bf16 rows use weight_loader"
+            )
         local_start = ov_start - tp_start
         src = loaded_weight[ov_start - row_start : ov_end - row_start]
         if src.dtype != torch.float8_e4m3fn:
             raise TypeError(
-                f"{arc_ple_nvfp4.ENV}=1 quantizes fp8 PLE rows only, got {src.dtype}"
+                f"{self.packed_codec.ENV}=1 quantizes fp8 PLE rows only, got {src.dtype}"
             )
         device = torch.device("cuda", torch.cuda.current_device())
-        for r in range(0, src.shape[0], arc_ple_nvfp4.CHUNK_ROWS):
-            chunk = src[r : r + arc_ple_nvfp4.CHUNK_ROWS].to(device)
-            packed, scales, subnormal = arc_ple_nvfp4.quantize_rows(chunk)
+        codec = self.packed_codec
+        for r in range(0, src.shape[0], codec.CHUNK_ROWS):
+            chunk = src[r : r + codec.CHUNK_ROWS].to(device)
+            packed, scales, subnormal = codec.quantize_rows(chunk)
             dst = slice(local_start + r, local_start + r + chunk.shape[0])
-            self.weight.data[dst].copy_(arc_ple_nvfp4.pack_rows(packed, scales))
-            self.nvfp4_rows_loaded += chunk.shape[0]
-            self.nvfp4_subnormal_blocks += subnormal
+            self.weight.data[dst].copy_(codec.pack_rows(packed, scales))
+            self.packed_rows_loaded += chunk.shape[0]
+            self.packed_subnormal_blocks += subnormal
 
-    def finish_nvfp4_load(self) -> None:
+    def finish_packed_load(self) -> None:
         expected = (
             self.shard_indices.org_vocab_end_index
             - self.shard_indices.org_vocab_start_index
         )
-        if self.nvfp4_rows_loaded != expected:
+        if self.packed_rows_loaded != expected:
             raise RuntimeError(
-                f"{arc_ple_nvfp4.ENV}: quantized {self.nvfp4_rows_loaded} PLE rows, "
+                f"{self.packed_codec.ENV}: quantized {self.packed_rows_loaded} PLE rows, "
                 f"this rank's vocabulary has {expected}"
             )
         nbytes = self.weight.numel() * self.weight.element_size()
         logger.info(
-            "%s: PLE table NVFP4, %d rows, %.2f GiB host (fp8 would be %.2f GiB); "
+            "%s: PLE table %s, %d rows, %.2f GiB host (fp8 would be %.2f GiB); "
             "%d blocks with a subnormal scale",
-            arc_ple_nvfp4.ENV,
+            self.packed_codec.ENV,
+            self.packed_codec.NAME,
             expected,
             nbytes / 2**30,
             self.weight.shape[0] * self.embedding_dim / 2**30,
-            self.nvfp4_subnormal_blocks,
+            self.packed_subnormal_blocks,
         )
 
     def allocate_output(
@@ -1002,9 +1043,10 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 embedding_dim=self.embedding_dim,
                 tp_vocab_start=self.shard_indices.org_vocab_start_index,
                 tp_vocab_end=self.shard_indices.org_vocab_end_index,
-                nvfp4_row_bytes=self.weight.shape[1] if self.nvfp4 else 0,
+                packed_row_bytes=self.weight.shape[1] if self.packed else 0,
                 is_fp8=self.weight.dtype == torch.float8_e4m3fn,
                 is_nvfp4=self.nvfp4,
+                is_int5=self.int5,
                 BLOCK_D=self._block_d,
             )
         return output
@@ -2147,7 +2189,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             tp_end = emb.shard_indices.org_vocab_end_index
             ov_start = max(row_start, tp_start)
             ov_end = min(row_end, tp_end)
-            if isinstance(emb, Qwen4ExpPinnedHostEmbedding) and emb.nvfp4:
+            if isinstance(emb, Qwen4ExpPinnedHostEmbedding) and emb.packed:
                 emb.load_rows(loaded_weight, row_start)
                 return
             if ov_start < ov_end:
@@ -2177,7 +2219,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if (
                 loaded_weight.dtype == torch.float8_e4m3fn
                 and emb.weight.dtype != torch.float8_e4m3fn
-                and not (isinstance(emb, Qwen4ExpPinnedHostEmbedding) and emb.nvfp4)
+                and not (isinstance(emb, Qwen4ExpPinnedHostEmbedding) and emb.packed)
             ):
                 if isinstance(emb, Qwen4ExpPinnedHostEmbedding):
                     # offload gathers from pinned host memory; a swapped-in
@@ -2406,8 +2448,8 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         loaded_params.update(loaded_buffers)
         loaded_params.update(loaded_shard_params)
         for module in self.modules():
-            if isinstance(module, Qwen4ExpPinnedHostEmbedding) and module.nvfp4:
-                module.finish_nvfp4_load()
+            if isinstance(module, Qwen4ExpPinnedHostEmbedding) and module.packed:
+                module.finish_packed_load()
 
         if skipped_visual_count > 0:
             logger.info(

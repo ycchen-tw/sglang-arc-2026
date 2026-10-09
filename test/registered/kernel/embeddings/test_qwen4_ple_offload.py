@@ -295,8 +295,8 @@ def test_qwen4_ple_nvfp4_gather_matches_reference(monkeypatch, vocab_start):
     # two checkpoint shards, as the Qwen4-Exp loader hands them over
     offloaded.load_rows(rows[:5], 0)
     offloaded.load_rows(rows[5:], 5)
-    offloaded.finish_nvfp4_load()
-    assert offloaded.nvfp4_subnormal_blocks == (1 if vocab_start <= 2 else 0)
+    offloaded.finish_packed_load()
+    assert offloaded.packed_subnormal_blocks == (1 if vocab_start <= 2 else 0)
 
     packed, scales, _ = arc_ple_nvfp4.quantize_rows(rows)
     reference = arc_ple_nvfp4.dequantize_rows(packed, scales).to(torch.bfloat16)
@@ -349,9 +349,132 @@ def test_qwen4_ple_nvfp4_refusals(monkeypatch):
         offloaded.load_rows(torch.zeros((8, 32), dtype=torch.bfloat16), 0)
     offloaded.load_rows(_fp8_rows(8, 32)[:6], 0)
     with pytest.raises(RuntimeError, match="quantized 6 PLE rows"):
-        offloaded.finish_nvfp4_load()
+        offloaded.finish_packed_load()
     monkeypatch.setenv("ARC_PLE_NVFP4", "yes")
     with pytest.raises(ValueError, match="expected 0 or 1"):
+        Qwen4ExpPinnedHostEmbedding(
+            _make_source_embedding(dtype=torch.float8_e4m3fn, embedding_dim=32)
+        )
+
+
+def _int5_edge_rows(n, d, seed=0):
+    """fp8 rows with the edge cases: all zero, all +-448, tiny (subnormal / flushed scale)."""
+    rows = _fp8_rows(n, d, seed).float()
+    rows[3] = 448.0 * torch.where(torch.arange(d, device="cuda") % 3 == 0, -1.0, 1.0)
+    rows[4] = 0.0
+    rows[5, :16] = 448.0
+    rows[5, 16:32] = 0.01
+    rows[6, 48:64] = 2.0**-9  # the smallest e4m3 subnormal: amax / 15 rounds to a zero scale
+    return rows.to(torch.float8_e4m3fn)
+
+
+@pytest.mark.parametrize("vocab_start", [0, 4])
+def test_qwen4_ple_int5_gather_matches_reference(monkeypatch, vocab_start):
+    from sglang.srt.models import arc_ple_int5
+
+    monkeypatch.setenv("ARC_PLE_INT5", "1")
+    monkeypatch.setattr(arc_ple_int5, "CHUNK_ROWS", 3)  # several chunks per load
+    embedding_dim = 160
+    offloaded = Qwen4ExpPinnedHostEmbedding(
+        _make_source_embedding(
+            dtype=torch.float8_e4m3fn,
+            embedding_dim=embedding_dim,
+            vocab_start=vocab_start,
+            vocab_end=8,
+            org_vocab_size=8,
+            tp_size=1 if vocab_start == 0 else 2,
+        )
+    )
+    assert offloaded.weight.dtype == torch.uint8
+    assert offloaded.weight.shape == (8 - vocab_start, 110)  # 100 code + 10 scale bytes
+    assert offloaded.weight.is_pinned()
+    rows = _int5_edge_rows(8, embedding_dim)
+    # two checkpoint shards, as the Qwen4-Exp loader hands them over
+    offloaded.load_rows(rows[:5], 0)
+    offloaded.load_rows(rows[5:], 5)
+    offloaded.finish_packed_load()
+    # blocks whose amax / 15 < 2^-6: row 2 (0.05), row 5 (0.01), row 6 (2^-9, scale flushed to zero)
+    assert offloaded.packed_subnormal_blocks == sum(
+        1 for r in (2, 5, 6) if r >= vocab_start
+    )
+
+    packed, scales, _ = arc_ple_int5.quantize_rows(rows)
+    reference = arc_ple_int5.dequantize_rows(packed, scales).to(torch.bfloat16)
+    ids = torch.tensor([[0, 7, 3], [4, 1, 2], [-1, 8, 6], [5, 4, 3]], device="cuda")
+    expected = torch.zeros((*ids.shape, embedding_dim), dtype=torch.bfloat16, device="cuda")
+    for i in range(ids.shape[0]):
+        for j in range(ids.shape[1]):
+            k = int(ids[i, j])
+            if vocab_start <= k < 8:
+                expected[i, j] = reference[k]
+    out = torch.full_like(expected, torch.nan)  # tp_size 2 would allocate symmetric memory
+    torch.testing.assert_close(offloaded.gather(ids, out=out), expected, rtol=0, atol=0)
+    assert torch.all(reference[4] == 0)  # all-zero row
+    assert torch.all(reference[1, :16] == 0)  # all-zero block
+    assert torch.all(reference[6, 48:64] == 0)  # scale rounded to zero
+    stored = offloaded.weight.cuda()
+    torch.testing.assert_close(
+        stored, arc_ple_int5.pack_rows(packed, scales)[vocab_start:], rtol=0, atol=0
+    )
+
+    # 5-bit rounding error only: ~4 % relative RMS on the gaussian rows (0 and 7)
+    f = rows[[0, 7]].float()
+    rel = (arc_ple_int5.dequantize_rows(packed, scales)[[0, 7]] - f).norm() / f.norm()
+    assert 0.03 < float(rel) < 0.055
+
+
+@pytest.mark.parametrize("embedding_dim", [16, 48, 144, 176])
+def test_qwen4_ple_int5_gather_other_widths(monkeypatch, embedding_dim):
+    from sglang.srt.models import arc_ple_int5
+
+    monkeypatch.setenv("ARC_PLE_INT5", "1")
+    offloaded = Qwen4ExpPinnedHostEmbedding(
+        _make_source_embedding(dtype=torch.float8_e4m3fn, embedding_dim=embedding_dim)
+    )
+    assert offloaded.weight.shape == (8, embedding_dim * 5 // 8 + embedding_dim // 16)
+    rows = _fp8_rows(8, embedding_dim, seed=embedding_dim)
+    offloaded.load_rows(rows, 0)
+    offloaded.finish_packed_load()
+    packed, scales, _ = arc_ple_int5.quantize_rows(rows)
+    reference = arc_ple_int5.dequantize_rows(packed, scales).to(torch.bfloat16)
+    ids = torch.arange(8, device="cuda").flip(0).view(2, 4)
+    torch.testing.assert_close(
+        offloaded.gather(ids), reference[ids.flatten()].view(2, 4, embedding_dim), rtol=0, atol=0
+    )
+
+
+def test_qwen4_ple_int5_refusals(monkeypatch):
+    monkeypatch.setenv("ARC_PLE_INT5", "1")
+    with pytest.raises(TypeError, match="needs an fp8 PLE table"):
+        Qwen4ExpPinnedHostEmbedding(_make_source_embedding(embedding_dim=160))
+    for bad_width in (24, 8, 170):
+        with pytest.raises(ValueError, match="divisible by 16"):
+            Qwen4ExpPinnedHostEmbedding(
+                _make_source_embedding(dtype=torch.float8_e4m3fn, embedding_dim=bad_width)
+            )
+    with pytest.raises(ValueError, match="pinned only"):
+        Qwen4ExpPinnedHostEmbedding(
+            _make_source_embedding(dtype=torch.float8_e4m3fn, embedding_dim=32),
+            backend="file",
+            table_dir="/nonexistent-never-touched",
+        )
+    offloaded = Qwen4ExpPinnedHostEmbedding(
+        _make_source_embedding(dtype=torch.float8_e4m3fn, embedding_dim=32)
+    )
+    with pytest.raises(TypeError, match="fp8 PLE rows only"):
+        offloaded.load_rows(torch.zeros((8, 32), dtype=torch.bfloat16), 0)
+    offloaded.load_rows(_fp8_rows(8, 32)[:6], 0)
+    with pytest.raises(RuntimeError, match="quantized 6 PLE rows"):
+        offloaded.finish_packed_load()
+    monkeypatch.setenv("ARC_PLE_INT5", "yes")
+    with pytest.raises(ValueError, match="expected 0 or 1"):
+        Qwen4ExpPinnedHostEmbedding(
+            _make_source_embedding(dtype=torch.float8_e4m3fn, embedding_dim=32)
+        )
+    # the two packed formats are exclusive
+    monkeypatch.setenv("ARC_PLE_INT5", "1")
+    monkeypatch.setenv("ARC_PLE_NVFP4", "1")
+    with pytest.raises(ValueError, match="both set"):
         Qwen4ExpPinnedHostEmbedding(
             _make_source_embedding(dtype=torch.float8_e4m3fn, embedding_dim=32)
         )
