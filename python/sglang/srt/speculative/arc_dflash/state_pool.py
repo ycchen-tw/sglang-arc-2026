@@ -28,6 +28,15 @@ from .ring_attention import RingWindow
 from .sampling import Proposal, distribution, sample_index
 
 
+# arc-forge ARC_DFLASH_BATCHED_COMMIT (opt-in, default 0): RingStatePool._step commits the block's K/V of all layers
+# with one index_put each (stacked over layers) and every layer's four conv boundaries with one gather / where /
+# index_put over the stacked rows, instead of 2 + 4 x 4 small kernels per layer. Same values to the same places
+# (bitwise: scripts/arc/dflash_propose_bench.py state).
+BATCHED_COMMIT = os.environ.get("ARC_DFLASH_BATCHED_COMMIT", "0")
+if BATCHED_COMMIT not in ("0", "1"):
+    raise ValueError(f"ARC_DFLASH_BATCHED_COMMIT must be 0 or 1, got {BATCHED_COMMIT!r}")
+
+
 @torch.no_grad()
 def fast_propose(model, hidden, anchor, temperature):
     """sampling.propose_path with the top-16 taken on the BF16 logits: casting [rows, vocab] to FP32 first is a
@@ -375,6 +384,21 @@ class RingStatePool(StatePool):
         # the scratch slot's window "ends" at position 0, the cursor every padding row carries
         self.positions[self.scratch, 0] = 0
 
+    def _commit_batched(self, block, idx, rows, col, last, has):
+        """ARC_DFLASH_BATCHED_COMMIT: the per-layer commit loop of _step with the layers stacked."""
+        layers = block.layers
+        if len(layers) != self.c.num_layers:
+            raise RuntimeError(f"block has {len(layers)} layers, the pool {self.c.num_layers}")
+        layer_ids = torch.arange(len(layers), device=self.device)[:, None, None]
+        # pool [L, slots, Hkv, columns, D] indexed on (layer, slot, column): the value is [L, B, n, Hkv, D]
+        keys = torch.stack([layer.key for layer in layers]).transpose(2, 3)
+        values = torch.stack([layer.value for layer in layers]).transpose(2, 3)
+        self.key[layer_ids, rows[None], :, col[None]] = keys
+        self.value[layer_ids, rows[None], :, col[None]] = values
+        fresh = torch.stack([b.gather(1, last.expand(-1, 1, b.shape[-1])) for layer in layers for b in layer.boundaries])
+        fresh = fresh.view(len(layers), 4, *fresh.shape[1:])  # [L, 4, B, 1, H]
+        self.boundary[:, :, idx] = torch.where(has, fresh, self.boundary[:, :, idx])
+
     def write_request(self, rid, request):
         if request.pending is not None:
             raise RuntimeError("prefill state carries no pending commit")
@@ -456,12 +480,15 @@ class RingStatePool(StatePool):
         self.positions[rows, col] = torch.where(committed, positions, torch.full_like(positions, -1))
         last = (length - 1).clamp(min=0)[:, None, None]
         has = (length > 0)[:, None, None]
-        for i, layer in enumerate(block.layers):
-            self.key[i][rows, :, col] = layer.key.transpose(1, 2)
-            self.value[i][rows, :, col] = layer.value.transpose(1, 2)
-            for j in range(4):
-                fresh = layer.boundaries[j].gather(1, last.expand(-1, 1, layer.boundaries[j].shape[-1]))
-                self.boundary[i, j][idx] = torch.where(has, fresh, self.boundary[i, j][idx])
+        if BATCHED_COMMIT == "1":
+            self._commit_batched(block, idx, rows, col, last, has)
+        else:
+            for i, layer in enumerate(block.layers):
+                self.key[i][rows, :, col] = layer.key.transpose(1, 2)
+                self.value[i][rows, :, col] = layer.value.transpose(1, 2)
+                for j in range(4):
+                    fresh = layer.boundaries[j].gather(1, last.expand(-1, 1, layer.boundaries[j].shape[-1]))
+                    self.boundary[i, j][idx] = torch.where(has, fresh, self.boundary[i, j][idx])
         self.positions[:, w] = -1
         self.pending_length.index_fill_(0, idx, 0)
         proposal = fast_propose(model, proposal_hidden, self.anchor[:batch], self.temperature[:batch])
