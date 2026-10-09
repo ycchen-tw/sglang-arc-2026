@@ -304,6 +304,24 @@ def drive(args) -> None:
     print(f"wrote {os.path.join(args.out_dir, 'drive.json')}")
 
 
+def capture(args) -> None:
+    """A torch-profiler window of --seconds on a server under load (the decode cycle), both ranks'
+    traces checked whole."""
+    url = args.url.rstrip("/")
+    os.makedirs(args.out_dir, exist_ok=True)
+    log = _Log(args.log)
+    chk._post(
+        f"{url}/start_profile",
+        {"output_dir": args.out_dir, "activities": ["CPU", "GPU"], "profile_prefix": args.prefix,
+         "with_stack": True, "record_shapes": False},
+    )
+    time.sleep(args.seconds)
+    log.mark()
+    chk._post(f"{url}/stop_profile", None)
+    for f in _wait_traces(log, args.out_dir, args.prefix):
+        print(f"{f} {os.path.getsize(f) / 1e6:.0f} MB")
+
+
 # ---------------------------------------------------------------------------------------------------
 # trace analysis
 
@@ -382,8 +400,12 @@ def _load(path: str) -> list:
     return json.load(gzip.open(path))["traceEvents"]
 
 
-def _launch_stacks(events: list) -> Dict[int, str]:
-    """correlation id -> the launch's module path (nn.Module classes and record_function names)."""
+_PY_FRAME = re.compile(r"\): (\w+)$")
+
+
+def _launch_stacks(events: list, frames: Optional[re.Pattern] = None) -> Dict[int, str]:
+    """correlation id -> the launch's module path (nn.Module classes and record_function names, and
+    "~function" for python frames whose function name matches `frames`)."""
     by_tid: Dict[Tuple[int, int], list] = collections.defaultdict(list)
     for e in events:
         cat = e.get("cat")
@@ -391,6 +413,10 @@ def _launch_stacks(events: list) -> Dict[int, str]:
             name = e["name"]
             if name.startswith("nn.Module: "):
                 by_tid[(e["pid"], e["tid"])].append((e["ts"], 0, -(e["ts"] + e["dur"]), _MODULE_SUFFIX.sub("", name[11:])))
+            elif frames is not None:
+                m = _PY_FRAME.search(name)
+                if m and frames.search(m.group(1)):
+                    by_tid[(e["pid"], e["tid"])].append((e["ts"], 0, -(e["ts"] + e["dur"]), "~" + m.group(1)))
         elif cat == "user_annotation":
             name = e["name"]
             if name.startswith("## Call CompiledFxGraph"):
@@ -801,7 +827,48 @@ def roofline_ms(spec: List[Tuple[int, int, int]], tp: int = 2) -> Dict[str, Tupl
     return out
 
 
+def decode_roofline_ms(bs: int, ctx: int, k: int = 4, tp: int = 2) -> Dict[str, Tuple[float, str]]:
+    """{category: (ms, note)} per decode cycle of bs requests (verify of bs * k rows), per rank."""
+    rows = bs * k
+
+    def t(flops, nbytes):
+        return max(flops / B200["bf16"], nbytes / B200["hbm"]) * 1e3
+
+    out = {}
+    local = 512 // tp
+    e_act = local * (1 - np.exp(-rows * 10 / 512))
+    w = 3 * 640 * H
+    out["MoE routed"] = (LAYERS * e_act * w * FP8 / B200["hbm"] * 1e3,
+                         f"{e_act:.0f} of {local} local experts active: all expert weights once ({LAYERS * e_act * w / 1e9:.0f} GB)")
+    gdn = H * (10240 + 6144 + 96) // tp + 6144 // tp * H
+    qsa = H * (12288 + 1024) // tp + 6144 // tp * H + 640 * H
+    sh = H * 1280 // tp + 640 // tp * H + 512 * H + H
+    lm = 248320 // tp * H
+    dense = L_GDN * gdn + L_QSA * qsa + LAYERS * sh + lm
+    out["dense GEMM (bf16)"] = (t(2 * rows * dense, dense * BF16), f"{dense * BF16 / 1e9:.2f} GB bf16 weights incl. lm_head {lm * BF16 / 1e9:.2f} GB")
+    hc_w = 2 * (2 * 320 * 10240 + 4 * 10240)
+    out["HC"] = (t(2 * rows * hc_w * LAYERS, LAYERS * (hc_w * BF16 + 2 * 9.5 * rows * 10240 * BF16)),
+                 f"low-rank weights {LAYERS * hc_w * BF16 / 1e9:.2f} GB + ~9.5 passes over the 4-wide stream per block")
+    state = (48 // tp) * 128 * 128 * BF16
+    out["GDN verify (incl. ReplaySSM)"] = (L_GDN * bs * 2 * state / B200["hbm"] * 1e3, f"bf16 state read + write once per request ({state / 1e6:.2f} MB/layer)")
+    kc = ctx / 4
+    qsa_b = bs * (kc * 128 * BF16 + 2048 * 2 * 256 * FP8) + rows * kc * 4 * 2
+    out["QSA (indexer/gather/attention)"] = (L_QSA * qsa_b / B200["hbm"] * 1e3, "compressed keys + 2048 selected K/V once per request, fp32 scores")
+    out["allreduce"] = ((2 * LAYERS + 1) * 8e-3, f"{2 * LAYERS + 1} x ~8 us latency ({rows * H * BF16 / 1e6:.1f} MB each)")
+    d_layer = H * (12288 + 1024) + 6144 * H + 3 * H * 10240
+    out["drafter propose"] = (t(2 * rows * (5 * d_layer + lm), (5 * d_layer + lm) * BF16), "5 bf16 layers + lm_head shard")
+    out["post: RS / sampling + logprobs"] = (3 * rows * 248320 * 4 / B200["hbm"] * 1e3, "fp32 vocab rows read ~3x")
+    return out
+
+
 def roofline(args) -> None:
+    if args.decode_bs:
+        r = decode_roofline_ms(args.decode_bs, args.decode_ctx)
+        print(f"== decode cycle: bs {args.decode_bs} (verify {4 * args.decode_bs} rows), context {args.decode_ctx}")
+        for k, (ms, note) in sorted(r.items(), key=lambda kv: -kv[1][0]):
+            print(f"   {ms:7.2f} ms  {k:32s} {note}")
+        print(f"   {sum(v[0] for v in r.values()):7.2f} ms  total")
+        return
     for shape in args.shapes.split(","):
         spec = SHAPES[shape]
         r = roofline_ms(spec)
@@ -877,6 +944,176 @@ def _key_kernels(an: dict) -> Dict[str, Tuple[float, float, str]]:
             calls.append(c)
         out[label] = (float(np.mean(ms)), float(np.mean(calls)), names.most_common(1)[0][0] if names else "")
     return out
+
+
+# ---------------------------------------------------------------------------------------------------
+# decode cycle (DFlash spec v2): run_batch = draft (drafter propose) -> step[VERIFY bs=N] (target
+# verify forward, a CUDA-graph replay) -> post (sampling / RS, mamba commit, logprobs, eager) ->
+# draft_extend (drafter commit); the next cycle's run_batch starts the next window
+
+DECODE_FRAMES = re.compile(
+    r"eagle_sample|rejection|reject_sampl|chain_speculative|verify_tree|compute_spec_logprobs|logprob|"
+    r"commit_mamba_states|routed|capture|fill_bonus|move_accept|sampl|prepare_for_verify|eagle_prepare|"
+    r"_draft_extend_for_decode|draft$|init_forward_metadata|load_batch|copy_result|process_batch_result"
+)
+# verify-graph kernels by name (the replay launches them from cudaGraphLaunch: no module path)
+DECODE_RULES: List[Tuple[str, str]] = [
+    ("allreduce", _ALLREDUCE.pattern),
+    ("MoE routed", r"^bmm_|moe::dev|routingIndices|finalizeKernel|activationDeepSeek|per_token_group_quant"),
+    ("QSA (indexer/gather/attention)", r"qsa|sparse_gqa|compact_kv|fast_topk|^kernel_kernel$|expand_qsa|fmha|flash_?attn|paged|decode_attn|trtllm"),
+    ("GDN verify (incl. ReplaySSM)", r"gdn|gated_delta|recurrent|replay|causal_conv|mamba|ssm|fused_qkv_split|l2norm|selective"),
+    ("HC", r"hc_combine|hc_mix|hc_|fused_mean_mul_sigmoid|mean_mul_sigmoid"),
+    ("norm", r"rmsnorm|layer_norm|layernorm|_norm"),
+    ("dense GEMM (bf16)", r"nvjet|cutlass|gemm|Gemm|cublas|splitK|tgv"),
+    ("PLE", r"ple|ngram"),
+    ("rope/gate/elementwise", r"rope|sigmoid|silu|act_and_mul|elementwise|triton_poi|triton_red|fused"),
+    ("copy/fill/index", r"Memcpy|Memset|copy|fill|index|gather|scatter|cat"),
+]
+_DECODE_RULES = [(c, re.compile(r)) for c, r in DECODE_RULES]
+
+
+def _decode_kernel_cat(name: str) -> str:
+    for c, r in _DECODE_RULES:
+        if r.search(name):
+            return c
+    return "other"
+
+
+def _post_cat(path: str, name: str) -> str:
+    """Eager kernels between the verify forward and the drafter commit, by python frame."""
+    if _ALLREDUCE.search(name):
+        return "post: allreduce"
+    for label, pat in (
+        ("post: logprobs", r"~compute_spec_logprobs|~\w*logprob"),
+        ("post: RS / sampling", r"~eagle_sample|~\w*reject|~chain_speculative|~verify_tree|~\w*sampl"),
+        ("post: mamba commit", r"~commit_mamba_states"),
+        ("post: routed experts", r"~\w*routed|~\w*capture"),
+        ("post: accept bookkeeping", r"~fill_bonus|~move_accept"),
+    ):
+        if re.search(pat, path):
+            return label
+    tail = [x for x in path.split("/") if x][-2:]
+    return "post: other " + "/".join(tail)
+
+
+def _merged_all(spans: list) -> List[Tuple[float, float]]:
+    return _merged(spans, float("-inf"), float("inf"))
+
+
+def decode(args) -> dict:
+    events = _load(args.trace)
+    ops = _gpu_ops(events)
+    starts = [e["ts"] for e in ops]
+    paths = _launch_stacks(events, DECODE_FRAMES)
+    ann = [e for e in events if e.get("cat") == "gpu_user_annotation"]
+    by_name = collections.defaultdict(list)
+    for e in ann:
+        by_name[e["name"]].append(e)
+    runs = _merged_all(by_name.get("scheduler.run_batch", []))
+    verify = []
+    for n, v in by_name.items():
+        if n.startswith("step[VERIFY"):
+            bs = int(re.search(r"bs=(\d+)", n).group(1))
+            verify += [(w, bs) for w in _merged_all(v)]
+    verify.sort()
+    extends = [w for n, v in by_name.items() if n.startswith("step[EXTEND") for w in _merged_all(v)]
+    drafts = _merged_all(by_name.get("draft", []))
+    dexts = _merged_all(by_name.get("draft_extend", []))
+    cycles = []
+    skipped = collections.Counter()
+
+    def verifies(run):
+        return [(w, bs) for w, bs in verify if run[0] <= w[0] < run[1]]
+
+    for i in range(len(runs) - 1):
+        lo, hi = runs[i][0], runs[i + 1][0]
+        v = verifies(runs[i])
+        if len(v) != 1:
+            skipped["not a decode run_batch"] += 1
+            continue
+        # decode-to-decode only: the next run_batch is a decode cycle too (an extend in between, or after,
+        # belongs to the extend's cost, measured separately)
+        if len(verifies(runs[i + 1])) != 1 or any(lo <= w[0] < runs[i + 1][1] for w in extends):
+            skipped["followed by an extend"] += 1
+            continue
+        (vw, bs), = v
+        d = [w for w in drafts if lo <= w[0] < vw[0]]
+        x = [w for w in dexts if vw[1] <= w[0] < hi]
+        if len(d) != 1 or len(x) != 1:
+            raise RuntimeError(f"decode cycle at {lo}: {len(d)} draft and {len(x)} draft_extend spans")
+        cycles.append({"bs": bs, "win": (lo, hi), "draft": d[0], "verify": vw, "post": (vw[1], x[0][0]),
+                       "commit": x[0], "tail": (x[0][1], hi)})
+    if not cycles:
+        raise RuntimeError(f"no decode-to-decode cycles in the trace ({dict(skipped)})")
+    out = []
+    kernel_tot: Dict[Tuple[str, str], List[float]] = collections.defaultdict(lambda: [0.0, 0])
+    for c in cycles:
+        lo, hi = c["win"]
+        win = _in(ops, starts, lo, hi)
+        rec = {"bs": c["bs"], "window_ms": (hi - lo) / 1e3, "phases": {}, "cats": collections.defaultdict(float)}
+        busy_all = []
+        for phase in ("draft", "verify", "post", "commit", "tail"):
+            a, b = c[phase]
+            iv = []
+            for e in win:
+                s0 = max(e["ts"], a)
+                s1 = min(e["ts"] + e["dur"], b)
+                if s1 <= s0:
+                    continue
+                iv.append((s0, s1))
+                d = (s1 - s0) / 1e3
+                name = e["name"]
+                if phase == "draft":
+                    cat = "drafter propose"
+                elif phase == "commit":
+                    cat = "drafter commit"
+                elif phase == "verify":
+                    cat = _decode_kernel_cat(name)
+                elif phase == "post":
+                    cat = _post_cat(paths.get(e.get("args", {}).get("correlation"), ""), name)
+                else:
+                    cat = "tail (result copy / next prep)"
+                rec["cats"][cat] += d
+                k = kernel_tot[(f"{phase}: {cat}", _short(name))]
+                k[0] += d
+                k[1] += 1
+            busy = _union(iv) / 1e3
+            busy_all += iv
+            rec["phases"][phase] = {"span_ms": (b - a) / 1e3, "busy_ms": busy}
+        rec["busy_ms"] = _union(busy_all) / 1e3
+        rec["idle_ms"] = rec["window_ms"] - rec["busy_ms"]
+        rec["cats"] = dict(rec["cats"])
+        out.append(rec)
+    n = len(out)
+    res = {"trace": args.trace, "cycles": out, "skipped": dict(skipped),
+           "verify_kernels": {f"{c} | {k}": [v[0] / n, v[1] / n] for (c, k), v in sorted(kernel_tot.items(), key=lambda kv: -kv[1][0])}}
+    _print_decode(res)
+    if args.out:
+        json.dump(res, open(args.out, "w"), indent=1)
+    return res
+
+
+def _print_decode(res: dict) -> None:
+    cyc = res["cycles"]
+    q = lambda xs, p: float(np.percentile(xs, p))  # noqa: E731
+    w = [c["window_ms"] for c in cyc]
+    b = [c["busy_ms"] for c in cyc]
+    bs = [c["bs"] for c in cyc]
+    print(f"== {res['trace']}: {len(cyc)} decode-to-decode cycles (skipped {res['skipped']}), bs {min(bs)}-{max(bs)} (median {int(np.median(bs))})")
+    print(f"   window (start-to-start, profiler on) median {q(w, 50):.2f} p90 {q(w, 90):.2f} ms; busy median {q(b, 50):.2f} p90 {q(b, 90):.2f}; idle median {q([c['idle_ms'] for c in cyc], 50):.2f}")
+    for ph in ("draft", "verify", "post", "commit", "tail"):
+        sp = [c["phases"][ph]["span_ms"] for c in cyc]
+        bu = [c["phases"][ph]["busy_ms"] for c in cyc]
+        print(f"   {ph:7s} span median {q(sp, 50):6.2f} p90 {q(sp, 90):6.2f} | busy median {q(bu, 50):6.2f} p90 {q(bu, 90):6.2f}")
+    cats = sorted({k for c in cyc for k in c["cats"]}, key=lambda k: -np.median([c["cats"].get(k, 0.0) for c in cyc]))
+    print("   per cycle (median / p90 ms):")
+    for k in cats:
+        xs = [c["cats"].get(k, 0.0) for c in cyc]
+        print(f"     {q(xs, 50):7.3f} {q(xs, 90):7.3f}  {k}")
+    for ph, top in (("verify", 45), ("draft", 15), ("post", 15), ("commit", 5)):
+        print(f"   top {ph} kernels (mean ms / calls per cycle):")
+        for k, (ms, calls) in [kv for kv in res["verify_kernels"].items() if kv[0].startswith(ph + ": ")][:top]:
+            print(f"     {ms:7.3f} {calls:6.1f}  {k[len(ph) + 2:][:150]}")
 
 
 def table(args) -> None:
@@ -966,8 +1203,19 @@ def main() -> int:
     a.add_argument("--map")
     a.add_argument("--no-spec", action="store_true", help="a SPEC=none trace: the step span alone, no refresh")
     a.add_argument("--out")
+    cp = sub.add_parser("capture")
+    cp.add_argument("--url", required=True)
+    cp.add_argument("--log", required=True)
+    cp.add_argument("--out-dir", required=True)
+    cp.add_argument("--prefix", required=True)
+    cp.add_argument("--seconds", type=float, default=2.0)
+    dc = sub.add_parser("decode")
+    dc.add_argument("trace")
+    dc.add_argument("--out")
     r = sub.add_parser("roofline")
     r.add_argument("--shapes", default=DEFAULT_SHAPES)
+    r.add_argument("--decode-bs", type=int, default=0)
+    r.add_argument("--decode-ctx", type=int, default=15000)
     t = sub.add_parser("table")
     t.add_argument("arm_dirs", nargs="+")
     args = p.parse_args()
@@ -977,6 +1225,10 @@ def main() -> int:
         analyze(args)
     elif args.cmd == "roofline":
         roofline(args)
+    elif args.cmd == "capture":
+        capture(args)
+    elif args.cmd == "decode":
+        decode(args)
     else:
         table(args)
     return 0
