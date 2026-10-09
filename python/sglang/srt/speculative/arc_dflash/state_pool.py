@@ -25,6 +25,13 @@ from .ring_attention import RingWindow
 from .sampling import Proposal, distribution, sample_index
 
 
+# arc-forge ARC_DFLASH_FUSED_PROPOSE (opt-in, default 0): the selector chain below as one Triton kernel
+# (fused_propose.py); a different but identically distributed draw, q still the draw's exact distribution
+FUSED_PROPOSE = os.environ.get("ARC_DFLASH_FUSED_PROPOSE", "0")
+if FUSED_PROPOSE not in ("0", "1"):
+    raise ValueError(f"ARC_DFLASH_FUSED_PROPOSE must be 0 or 1, got {FUSED_PROPOSE!r}")
+
+
 # arc-forge ARC_DFLASH_BATCHED_COMMIT (opt-in, default 0): RingStatePool._step commits the block's K/V of all layers
 # with one index_put each (stacked over layers) and every layer's four conv boundaries with one gather / where /
 # index_put over the stacked rows, instead of 2 + 4 x 4 small kernels per layer. Same values to the same places
@@ -43,6 +50,10 @@ def fast_propose(model, hidden, anchor, temperature):
     unary, candidates = model.lm_head.topk(hidden, selector.top_k)
     unary = unary.float()
     projected = selector.hidden_projection(hidden)
+    if FUSED_PROPOSE == "1":
+        from .fused_propose import chain
+
+        return chain(selector, unary, candidates, projected, anchor, temperature)
     successor = selector.successor_codebook[candidates]
     ones = torch.ones_like(temperature)
     keep = torch.full_like(temperature, -1, dtype=torch.long)
