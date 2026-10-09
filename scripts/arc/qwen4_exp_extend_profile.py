@@ -1116,6 +1116,128 @@ def _print_decode(res: dict) -> None:
             print(f"     {ms:7.3f} {calls:6.1f}  {k[len(ph) + 2:][:150]}")
 
 
+# ---------------------------------------------------------------------------------------------------
+# A/B of decode cycles from ARC_SPEC_PHASE_TIMING (CUDA events per cycle, no profiler)
+
+PHASE_KEYS = ("total", "draft", "verify", "post", "extend")
+
+
+def _phase_rows(arm_dir: str, rank: int = 0) -> Dict[int, dict]:
+    d = json.load(open(os.path.join(arm_dir, f"phase_timing.rank{rank}.json")))
+    return {int(k): v for k, v in d["batch"].items()}
+
+
+def _fit(rows: Dict[int, dict], lo: int, hi: int, key: str) -> Tuple[float, float, int]:
+    sel = [(bs, v) for bs, v in rows.items() if lo <= bs <= hi and v["cycles"] > 0]
+    x = np.array([bs for bs, _ in sel], dtype=float)
+    w = np.array([v["cycles"] for _, v in sel], dtype=float)
+    y = np.array([v[f"{key}_ms"] for _, v in sel], dtype=float)
+    a = np.vstack([np.ones_like(x), x]).T * np.sqrt(w)[:, None]
+    c, *_ = np.linalg.lstsq(a, y * np.sqrt(w), rcond=None)
+    return float(c[0]), float(c[1]), int(w.sum())
+
+
+def _log_window(arm_dir: str, skip_s: float, until_s: Optional[float]) -> dict:
+    """Decode lines (running, accept, gen throughput) and extend telemetry share of wall in the arm's
+    server.log, from skip_s after the first prefill to until_s (None: the end)."""
+    import datetime
+
+    log = os.path.join(arm_dir, "serve", "server.log")
+    ts = lambda m: datetime.datetime.strptime(m, "%Y-%m-%d %H:%M:%S").timestamp()  # noqa: E731
+    first = None
+    dec, tel = [], []
+    for line in open(log, errors="replace"):
+        m = re.match(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) TP0", line)
+        if not m:
+            continue
+        t = ts(m.group(1))
+        if first is None and "Prefill batch" in line:
+            first = t
+        if first is None or t < first + skip_s or (until_s is not None and t > first + until_s):
+            continue
+        if "Decode batch" in line:
+            dec.append((int(re.search(r"#running-req: (\d+)", line).group(1)),
+                        float(re.search(r"accept len: ([\d.]+)", line).group(1)),
+                        float(re.search(r"gen throughput \(token/s\): ([\d.]+)", line).group(1))))
+        elif "ARC extend telemetry" in line:
+            wall = float(re.search(r"\[([\d.]+) s\]", line).group(1))
+            share = float(re.search(r"target\+refresh gpu ([\d.]+)% of wall", line).group(1))
+            tel.append((wall, share))
+    if not dec:
+        raise RuntimeError(f"no decode lines in {log} in the window")
+    wall = sum(w for w, _ in tel)
+    return {
+        "decode_lines": len(dec),
+        "running": float(np.mean([d[0] for d in dec])),
+        "accept": float(np.mean([d[1] for d in dec])),
+        "gen_tps": float(np.mean([d[2] for d in dec])),
+        "extend_share": (sum(w * s for w, s in tel) / wall / 100) if wall else float("nan"),
+    }
+
+
+def phase_compare(args) -> None:
+    lo, hi = args.bs_lo, args.bs_hi
+    arms = {"A": args.a, "B": args.b}
+    rows = {k: _phase_rows(v) for k, v in arms.items()}
+    print(f"== decode cycles bs {lo}-{hi} (ARC_SPEC_PHASE_TIMING rank0, no profiler): A {args.a}  B {args.b}")
+    for key in PHASE_KEYS:
+        fa = _fit(rows["A"], lo, hi, key)
+        fb = _fit(rows["B"], lo, hi, key)
+        mid = (lo + hi) / 2
+        print(f"   {key:7s} A {fa[0]:6.2f} + {fa[1] * 1e3:6.1f} us/req (n={fa[2]})  B {fb[0]:6.2f} + {fb[1] * 1e3:6.1f} us/req (n={fb[2]})"
+              f"  at bs {mid:.0f}: A {fa[0] + fa[1] * mid:6.2f} B {fb[0] + fb[1] * mid:6.2f} ({fb[0] + fb[1] * mid - fa[0] - fa[1] * mid:+.2f} ms)")
+    # paired by bs: mean difference of the per-bs means, weighted by the smaller cycle count
+    common = [bs for bs in rows["A"] if bs in rows["B"] and lo <= bs <= hi]
+    w = np.array([min(rows["A"][b]["cycles"], rows["B"][b]["cycles"]) for b in common], dtype=float)
+    for key in PHASE_KEYS:
+        dif = np.array([rows["B"][b][f"{key}_ms"] - rows["A"][b][f"{key}_ms"] for b in common])
+        print(f"   paired by bs ({len(common)} sizes): {key:7s} B - A {np.average(dif, weights=w):+.3f} ms")
+    for k, v in arms.items():
+        lw = _log_window(v, args.skip, args.until)
+        print(f"   {k} server.log [{args.skip:.0f}s, {args.until or 'end'}]: running {lw['running']:.1f}, accept {lw['accept']:.3f}, "
+              f"gen {lw['gen_tps']:.0f} tok/s (logged), extend share of wall {100 * lw['extend_share']:.1f}% ({lw['decode_lines']} decode lines)")
+
+
+def ledger_check(args) -> None:
+    """Sampled-token logprobs of a ledger: presence, NaN / inf, distribution."""
+    import base64
+    import glob as _glob
+
+    vals, n_ev, n_tok, missing, errors = [], 0, 0, 0, collections.Counter()
+    temps = collections.Counter()
+    files = sorted(_glob.glob(os.path.join(args.ledger, "**", "events.*.jsonl"), recursive=True))
+    if not files:
+        raise RuntimeError(f"no events.*.jsonl under {args.ledger}")
+    for f in files:
+        for line in open(f, errors="replace"):
+            if '"ev": "append"' not in line and '"ev":"append"' not in line:
+                continue
+            ev = json.loads(line)
+            if ev.get("ev") != "append":
+                continue
+            n_ev += 1
+            gen = np.frombuffer(base64.b64decode(ev["gen"]), dtype="<i4")
+            n_tok += len(gen)
+            temps[str((ev.get("sampling") or {}).get("temperature"))] += 1
+            if ev.get("logprobs_error"):
+                errors[ev["logprobs_error"].split(" ")[-1]] += 1
+            if ev.get("logprobs") is None:
+                missing += 1
+                continue
+            lp = np.frombuffer(base64.b64decode(ev["logprobs"]), dtype="<f4")
+            if len(lp) != len(gen):
+                errors["length"] += 1
+            vals.append(lp)
+    v = np.concatenate(vals) if vals else np.zeros(0, np.float32)
+    bad = ~np.isfinite(v)
+    fin = v[~bad]
+    print(f"== {args.ledger}: {len(files)} files, {n_ev} appends, {n_tok} generated tokens, {len(v)} logprobs "
+          f"({missing} appends without logprobs, errors {dict(errors)}), temperatures {dict(temps.most_common(4))}")
+    print(f"   non-finite {int(bad.sum())}; > 0: {int((fin > 1e-4).sum())}; mean {fin.mean():.4f} "
+          f"quantiles 1/10/50/90 {np.percentile(fin, [1, 10, 50, 90]).round(4).tolist()}; "
+          f"share == 0 (argmax-certain) {np.mean(fin > -1e-6):.4f}; share < -5 {np.mean(fin < -5):.4f}")
+
+
 def table(args) -> None:
     """Per shape: telemetry (no profiler) and the trace's grouped kernel time per arm, next to the
     roofline. all-reduce: kernel time on TP0 and the paired transfer estimate."""
@@ -1212,6 +1334,15 @@ def main() -> int:
     dc = sub.add_parser("decode")
     dc.add_argument("trace")
     dc.add_argument("--out")
+    pc = sub.add_parser("phase-compare")
+    pc.add_argument("a")
+    pc.add_argument("b")
+    pc.add_argument("--bs-lo", type=int, default=80)
+    pc.add_argument("--bs-hi", type=int, default=128)
+    pc.add_argument("--skip", type=float, default=180.0)
+    pc.add_argument("--until", type=float)
+    lc = sub.add_parser("ledger-check")
+    lc.add_argument("ledger")
     r = sub.add_parser("roofline")
     r.add_argument("--shapes", default=DEFAULT_SHAPES)
     r.add_argument("--decode-bs", type=int, default=0)
@@ -1229,6 +1360,10 @@ def main() -> int:
         capture(args)
     elif args.cmd == "decode":
         decode(args)
+    elif args.cmd == "phase-compare":
+        phase_compare(args)
+    elif args.cmd == "ledger-check":
+        ledger_check(args)
     else:
         table(args)
     return 0
