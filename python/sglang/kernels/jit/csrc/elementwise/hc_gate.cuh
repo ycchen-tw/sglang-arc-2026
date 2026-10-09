@@ -129,4 +129,101 @@ struct HcGateKernel {
   }
 };
 
+struct HcApplyParams {
+  const void* block_output;  // [M, H]
+  const void* residual;      // [M, HC * H]
+  const float* gate;         // [M, HC], hc_gate's output
+  void* output;              // [M, HC * H]
+};
+
+// arc-forge (ARC_HC_GATE_PRECOMPUTE): hc_combine_kernel's phase 2 with the gate read
+// from hc_gate's output instead of computed in phase 1. Same row-per-CTA mapping,
+// same vector loads and the same fp32 expression per element, so with hc_gate's
+// bit-identical gate the output is bit-identical to hc_combine's.
+template <int64_t kHcCount, int64_t kHiddenSize, bool kUsePDL, typename Float>
+__global__ __launch_bounds__(256) void hc_apply_kernel(const HcApplyParams __grid_constant__ params) {
+  using namespace device;
+  using Float2 = packed_t<Float>;
+  using Storage = AlignedVector<Float2, 4>;  // 8 elements, 16 bytes
+  constexpr uint32_t kVecLen = 8;
+  constexpr uint32_t kNumThreads = 256;
+  constexpr int64_t kRowSize = kHcCount * kHiddenSize;
+  constexpr uint32_t kVecsPerRow = kRowSize / kVecLen;
+  constexpr uint32_t kVecsPerThread = kVecsPerRow / kNumThreads;
+  constexpr uint32_t kVecsPerBranch = kHiddenSize / kVecLen;
+
+  const auto gmem = tile::Memory<Storage>::cta(kNumThreads);
+  const uint32_t m = blockIdx.x;
+
+  const auto y_ptr = pointer::offset<Float>(params.block_output, static_cast<int64_t>(m) * kHiddenSize);
+  const auto r_ptr = pointer::offset<Float>(params.residual, static_cast<int64_t>(m) * kRowSize);
+  const auto out_ptr = pointer::offset<Float>(params.output, static_cast<int64_t>(m) * kRowSize);
+
+  PDLWaitPrimary<kUsePDL>();
+
+  __shared__ float a_shared[kHcCount];
+  if (threadIdx.x < kHcCount) {
+    a_shared[threadIdx.x] = params.gate[static_cast<int64_t>(m) * kHcCount + threadIdx.x];
+  }
+  __syncthreads();
+
+#pragma unroll
+  for (uint32_t j = 0; j < kVecsPerThread; ++j) {
+    const uint32_t vec_idx = threadIdx.x + j * kNumThreads;
+    const uint32_t branch = vec_idx / kVecsPerBranch;
+    const uint32_t col_in_branch = (vec_idx % kVecsPerBranch) * kVecLen;
+    const float a = a_shared[branch];
+
+    const Storage r_vec = gmem.load(r_ptr, j);
+    Storage y_vec;
+    y_vec.load(y_ptr, col_in_branch / kVecLen);
+    Storage out_vec;
+#pragma unroll
+    for (uint32_t i = 0; i < kVecLen / 2; ++i) {
+      const auto [rx, ry] = cast<fp32x2_t>(r_vec[i]);
+      const auto [yx, yy] = cast<fp32x2_t>(y_vec[i]);
+      out_vec[i] = cast<Float2>(fp32x2_t{rx + a * yx, ry + a * yy});
+    }
+    gmem.store(out_ptr, out_vec, j);
+  }
+
+  PDLTriggerSecondary<kUsePDL>();
+}
+
+template <int64_t kHcCount, int64_t kHiddenSize, bool kUsePDL, typename DType>
+struct HcApplyKernel {
+  static_assert(sizeof(DType) == 2, "HcApply only supports 2-byte dtypes");
+  static_assert(kHcCount > 0);
+  static_assert(kHiddenSize > 0 && kHiddenSize % 8 == 0);
+  static_assert((kHcCount * kHiddenSize) % (256 * 8) == 0);
+  static constexpr auto kernel = hc_apply_kernel<kHcCount, kHiddenSize, kUsePDL, DType>;
+
+  static void run(const tvm::ffi::TensorView block_output,
+                  const tvm::ffi::TensorView residual,
+                  const tvm::ffi::TensorView gate,
+                  const tvm::ffi::TensorView output) {
+    using namespace host;
+    auto M = SymbolicSize{"num_tokens"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({M, kHiddenSize}).with_dtype<DType>().with_device(device).verify(block_output);
+    TensorMatcher({M, kHcCount * kHiddenSize})
+        .with_dtype<DType>()
+        .with_device(device)
+        .verify(residual)
+        .verify(output);
+    TensorMatcher({M, kHcCount}).with_dtype<fp32_t>().with_device(device).verify(gate);
+
+    const auto params = HcApplyParams{
+        .block_output = block_output.data_ptr(),
+        .residual = residual.data_ptr(),
+        .gate = static_cast<const float*>(gate.data_ptr()),
+        .output = output.data_ptr(),
+    };
+    LaunchKernel(static_cast<uint32_t>(M.unwrap()), 256, device.unwrap())
+        .enable_pdl(kUsePDL)(kernel, params);
+  }
+};
+
 }  // namespace sglang
