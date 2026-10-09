@@ -134,3 +134,26 @@
       - TP2 FP8 SPEC=none（s4）：capture 10.5 s，每張卡 3.60 GB；56 個 prefill batch 全部走 graph。A1 對 A2、A1 對 B1 的 37 個 gate case 全部逐位相同，包括：extend 內有新圖（`mm_exact_1024`）；舊圖在 cached 1024 的 prefix、extend 是純文字（`mm_prefix_text_512`，G1 被擋的就是這種）；cached prefix 之後再來一張新圖（`mm_prefix_img_1024`）；一張圖被 8192 的 chunk 邊界切開（`mm_chunked_8704`，兩個 chunk 都走 graph）；一條帶圖請求和兩條文字請求同批補滿 768（`isomm_704_fill2` 及其 follow-up）。padding 的 `mm_pad_700`（只報）也逐位相同；isolation 的帶圖版逐位相同。`mm_pair_2048` 只報：帶圖的請求前端處理較慢，晚到 scheduler，三個 arm 都拆成 1000 與 1048 兩個 batch。
       - TP2 FP8 DFlash K4、兩邊 `--random-seed 1234`（s4d＋s4dc：`r6-tp2-dA`、`dB`、`dA2`、`dB2`）：capture 10.2 s，每張卡 4.13 GB；全部走 graph。dA 對 dB、dA 對 dA2、dB 對 dB2、dA2 對 dB2 的 target 端（prompt logprob、top-5、prompt 那幾列的 routing、cached、extend 給的第一個 token）35 個 gate 全部逐位相同。decode 每組都有一個 follow-up 不同，eager 對 eager、graph 對 graph 也一樣，所以固定 seed 也不能讓 DFlash 的 decode 重現；spec server 的 `compare` 因此只 gate target 端、decode 只報。
     - 媒體（ViT＋merge）的成本（`vittel`，DFlash arm 的 extend telemetry，CUDA event，沒有 profiler；2048-token 的 extend，每種 8 個；`r6-tp2-dA2`／`dB2`／`dAv`／`dBv`）：eager 純文字 83–84 ms；有新圖（1 或 4 張 512²、或 1 張 1024²）多 15–19 ms。graph 純文字 59 ms（少 24 ms，−29%）；有新圖多 17–22 ms，約佔帶新圖 extend 的 22–27%。張數和尺寸幾乎沒有影響（launch-bound）。同一張圖第二次出現時命中 embedding cache，只多 1–4 ms。ViT 的 graph 化還沒做。torch profiler（`vitcost`）下兩邊都被放大：mm embedding 36–45 ms，language model 157–178 ms。
+- **大 extend batch 的 kernel 分解**（2026-10-08／09，`RUN=r3`；TP2 FP8 DFlash K4、H1 B 的部署旗標、LEDGER=0、不開確定性旗標；工具 `scripts/arc/qwen4_exp_extend_profile.py`＋`.sh`，結果 `qwen38fn_b200_perf/20261008-xprof-r3-{eA,eB,eC}/` 與 `20261008-xprof-r3-table.txt`）：
+  - 做法：每個形狀一次 /generate 送 4 條請求，每條接在自己已 cache 的 prefix 後面（每批都檢查是一個 prefill batch、cached_tokens 等於 prefix）。先跑一批暖身不計，再 6 批量 extend telemetry（CUDA event，沒有 profiler），再 2 批開 torch profiler 拆 kernel。eager 的 kernel 依 launch 的 module stack 歸類，graph replay 的 kernel 用 eager 臂同形狀的「kernel 名稱 → 類別」比例分攤；all-reduce 把 TP0、TP1 第 k 次配對，取 min 當傳輸，其餘算等另一個 rank。三臂：eA eager、eB BCG、eC＝eB＋`ARC_DFLASH_EXACT_PREFILL=1 ARC_DFLASH_REFRESH_ASYNC=1`。
+  - H1 B 的 k4+/<4096 batch 平均 4.9 條、2,885 new token、cached prefix **整批合計** 43.7k（每條約 9k），target 88.8 ms GPU；`p10k`（4×704 new，每條 prefix 10240）就是這個形狀。
+  - 結論：p10k 在 BCG 下 target 78.2 ms GPU，其中 kernel 約 70.7 ms、空隙加等待 7.5 ms；roofline 只有約 17 ms。每條帶一張新圖時 99.2 ms。生產每條請求平均 1.37 張新圖，88.8 ms 落在兩者之間。
+  - p10k、BCG（eB）的分項（每 rank、每次 extend；roofline 取 FLOPs／峰值與 bytes／HBM 的較大者）：
+
+    | 項目 | 實測 ms | roofline ms | 偏離的原因 |
+    |---|---|---|---|
+    | MoE routed | 17.7 | 8.6 | FC1＋FC2 10.8，約是讀權重下限的 80%（256 個本地 expert 全被打到，每層 1.26 GB FP8）；activation 4.2、finalize 1.4、routing 1.1 是額外的 |
+    | QSA sparse prefill（`_sparse_gqa_chunk_prefill`） | 13.4 | 0.38 | 每條 query 各自 gather 自己選中的 2051 個 key，query 之間不共用：每層 2.95 GB，實際約 2.6 TB/s。和 prefix 長度無關 |
+    | bf16 dense GEMM（全部 nvjet） | 13.5 | 約 5.5 | checkpoint 的 `modules_to_not_convert` 讓非 expert 的線性層全是 bf16；cuBLAS 在 M≈3k 約半峰；BCG 墊到 3072 bucket |
+    | HC＋norm（GEMM 以外） | 11.7 | 未融合約 5、融合約 2 | 每個 HC block 對 4 倍寬的 stream 讀寫約 9.5 遍；`hc_combine` 每次 53 µs |
+    | all-reduce | 7.4 | 1.55 | 傳輸 3.7，另 3.7 是等另一個 rank（eager 臂的等待是 68 ms：CPU 下發慢的那個 rank 讓另一個空等） |
+    | GDN core | 5.3 | 0.6 | chunk kernel 1.2、conv 1.0，其餘約 3 是 state 的 gather／copy |
+    | QSA indexer | 4.8 | 0.15 | TileLang score kernel 的 grid 只有「列數／32」個 CTA；隨總 prefix 長大：pmix 15.2、p45k 23.4 |
+    | 其他（PLE 等） | 約 2.5 | | |
+
+  - target GPU ms（eA eager／eB BCG）：cold 79.9／62.9，p10k 76.5／78.2，pmix（總 prefix 107k）89.7／90.4，p45k（總 prefix 184k）99.2／100.0，4×352 81.6／53.2，4×512 82.4／59.3，4×1408 128.3／133.4，p10k 帶 4 張新圖 101.4／99.2。eager 在 1.4k–2.8k token 都是 76–82 ms：CPU 下發 kernel 本身就要 74–82 ms。BCG 只在小 batch 省 GPU 時間，到 p10k GPU 本身的工作量已經有 67–71 ms，BCG 沒有空間可省（H1／H2 吞吐 +2.3%／+4.0% 與此一致）。
+  - drafter refresh：eB 的 refresh CPU 65.3 ms、GPU 16.5 ms，refresh 區間內 8 次 `cudaStreamSynchronize` 共 27.6 ms（p45k 42 ms、4×1408 77 ms），是在等 target 的 GPU 尾巴（BCG 下 target 的 CPU 28.5 ms 就結束，GPU 要 78 ms）。eC 的 refresh 區間 0 次 sync，target 不變（77.7 ms）；refresh GPU 16.5→15.1 ms、CPU 65.3→55.4 ms（各形狀 GPU 少 1.4–5.5 ms、CPU 少約 10 ms）。剩下的 CPU 等待不是 host 讀取，推測是 refresh 約 1500 次 eager launch 排在 target 的 GPU 工作後面、launch queue 滿了（未驗證）。driver 的請求不是 session，EXACT_PREFILL 下每條都從自己的 chunk 重建 window，refresh 的 token 數和 eB 相同，差只反映拿掉 host 讀取；吞吐要看 BCG 下的 A/B。
+  - 候選（依收益÷風險）：(1) BCG 在 2048–4096 之間加 bucket（只改旗標；p10k 墊到 3072 時 BCG 的 kernel 時間比 eager 多 4 ms，落在 2048 bucket 時沒差）；(2) QSA indexer 的 TileLang kernel 也沿 key 切開成 2D grid、拿掉整張 `torch.zeros`、把除法併進 kernel（p10k 約 −2、pmix 約 −11、p45k 約 −18 ms）；(3) ViT／mm 的 CUDA graph（BCG 下每批 4 張圖多 21 ms，ViT 本身的 kernel 約 6 ms）；(4) QSA sparse prefill 重寫成相鄰 query 一起讀選中 block 的聯集（−8～11 ms）；(5) HC prefill 融合（−6～8 ms）；(6) MoE activation＋finalize（flashinfer 內部，約 −3 ms）；(7) drafter refresh 本身（sm80 cutlass SDPA 3.1 ms、copy／fill 約 725 次 launch 2.9 ms）；(8) EXACT＋ASYNC 的吞吐 A/B；(9) GDN core 周邊的 state copy（約 −2 ms）。
+  - 不必做（量過了）：
+    - MoE 的 autotune tactic：2,816 token 落在沒有快取的 3072 bucket、走 flashinfer 預設 tactic，但選到的 FC1／FC2 kernel 和 2048 調好的 tactic 同名（同一個 t128x64x128 tile）；eager 的 FC1 在 2048／2816／5632 token 是 5.28／6.56／11.54 ms，隨 token 數連續成長，沒有跳階。
+    - QSA sparse prefill 的 Triton 配置：`_get_best_config` 在 B200 落到 L20 表（BLOCK_N=16、1 warp）；microbench（`20261008-xprof-r3-sparse_prefill_cfg_bench.py`，p10k 形狀）重現每層 1128 µs，掃 8 組 BLOCK_N／warps／stages 全部 1169–1744 µs，沒有一組更快。瓶頸是每條 query 各自 gather，不是 tile。
