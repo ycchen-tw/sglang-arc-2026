@@ -149,6 +149,17 @@ class BaseTpWorker(ABC):
         )
         return success, message
 
+    def update_weights_from_disk_keep_identity(
+        self, recv_req: UpdateWeightFromDiskReqInput
+    ) -> Tuple[bool, str, bool]:
+        """(success, message, weights_touched); see
+        WeightUpdater.update_weights_from_disk_keep_identity."""
+        return self.model_runner.weight_updater.update_weights_from_disk_keep_identity(
+            recv_req.model_path,
+            recv_req.load_format,
+            recapture_cuda_graph=recv_req.recapture_cuda_graph,
+        )
+
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         success, message = self.model_runner.weight_updater.init_weights_update_group(
             recv_req.master_address,

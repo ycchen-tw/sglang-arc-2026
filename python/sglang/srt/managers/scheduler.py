@@ -2954,6 +2954,18 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        if (poisoned := self.weight_updater.poisoned) is not None:
+            # arc-forge keep_identity: the TokenizerManager refuses these first;
+            # this catches any request that reaches the scheduler another way.
+            req.set_finish_with_abort(
+                f"Weights poisoned: {poisoned}",
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                err_type="ServiceUnavailableError",
+            )
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
         if self.spec_algorithm.is_dflash_family():
             error_msg = validate_dflash_request(req, self.enable_overlap)
             if error_msg is not None:

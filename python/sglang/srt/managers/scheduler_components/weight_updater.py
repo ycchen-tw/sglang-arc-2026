@@ -19,6 +19,7 @@ from sglang.srt.constants import (
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     ChecksumInfo,
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
@@ -60,6 +61,20 @@ def _get_draft_model_runner(draft_worker):
     return None
 
 
+def _dflash_draft(draft_worker) -> bool:
+    """Whether the scheduler's draft worker is EAGLEWorkerV2 running the arc
+    DFlash drafter (``ARC_DFLASH_DRAFTER``). A keep_identity update then loads
+    the target only: the drafter's own weights come from its export and are
+    never in a target delta (the target's load plan refuses names it cannot
+    place), and it reads the target's embedding and lm_head by reference
+    (``arc_dflash.heads``), so an in-place target write reaches it too. Its
+    window states keep the GR the old weights produced; that steers proposals
+    only, and rejection sampling keeps the output the new target's."""
+    from sglang.srt.speculative.arc_dflash.worker import DFlashDraftWorker
+
+    return isinstance(getattr(draft_worker, "_draft_worker", None), DFlashDraftWorker)
+
+
 def _merge_checksum_payloads(target: Dict, draft: Dict) -> Dict:
     merged_checksums = dict(target["checksums"])
     for name, chk in draft["checksums"].items():
@@ -85,6 +100,11 @@ class SchedulerWeightUpdaterManager:
     metrics_collector: Optional[Any] = None
     offload_tags: set = field(default_factory=set)
     stashed_model_static_state: Any = None
+    # Why the served weights cannot be trusted -- a keep_identity load failed
+    # after it started writing -- or None. While set, generate requests are
+    # refused (here and in the TokenizerManager); a keep_identity update that
+    # succeeds clears it.
+    poisoned: Optional[str] = None
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
@@ -101,6 +121,33 @@ class SchedulerWeightUpdaterManager:
                     time.perf_counter() - t0, source
                 )
 
+    @contextmanager
+    def _fenced_weight_write(self, source: str) -> Iterator[None]:
+        """Write weights only while no forward runs.
+
+        Under the overlap scheduler, the batch launched before a
+        ``pause_generation(mode="in_place")`` can still be on the forward stream
+        when the update arrives, and the update writes the weights from the
+        schedule stream (or a loader's own): a device-wide sync first keeps that
+        forward entirely on the old weights. The sync after keeps the next
+        forward off weights a loader is still writing on another stream. Both
+        cost microseconds next to a load.
+        """
+        torch.get_device_module().synchronize()
+        with self._observe_weight_load(source):
+            yield
+        torch.get_device_module().synchronize()
+
+    def _on_every_rank(self, ok: bool) -> bool:
+        """Whether ``ok`` holds on every rank of the TP group. A keep_identity
+        decision (refuse, poison, succeed) is taken by all ranks together, or
+        ranks would serve different weights."""
+        flag = torch.tensor([int(ok)], dtype=torch.int32)
+        torch.distributed.all_reduce(
+            flag, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group
+        )
+        return bool(flag.item())
+
     def flush_cache_after_weight_update(self, recv_req) -> None:
         if recv_req.flush_cache:
             flush_cache_success = self.flush_cache(
@@ -113,20 +160,132 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
-        with self._observe_weight_load("disk"):
+        if recv_req.keep_identity:
+            return self.update_weights_from_disk_keep_identity(recv_req)
+        with self._fenced_weight_write("disk"):
             success, message = self.tp_worker.update_weights_from_disk(recv_req)
             tp_success = success
             if success and self.draft_worker is not None:
                 success, message = self.draft_worker.update_weights_from_disk(recv_req)
-            if tp_success:
-                self.flush_cache_after_weight_update(recv_req)
+            if (
+                tp_success
+                and recv_req.flush_cache
+                and not self.flush_cache(empty_cache=recv_req.torch_empty_cache)
+            ):
+                # Not an assert: a weight update sent while requests run (e.g.
+                # under pause_generation(mode="in_place")) must not kill the
+                # scheduler. The new weights stay loaded; the version and the
+                # model path are not advanced.
+                success, message = False, (
+                    "Weights were loaded from disk but the cache was not flushed "
+                    "(requests are running, queued or paused in place); the weight "
+                    "version and model path were not updated."
+                )
             if success:
                 self.record_weight_version_after_update(recv_req.weight_version)
             else:
                 logger.error(message)
             return UpdateWeightFromDiskReqOutput(
-                success=success, message=message, num_paused_requests=0
+                success=success,
+                message=message,
+                num_paused_requests=0,
+                weights_poisoned=self.poisoned,
             )
+
+    def update_weights_from_disk_keep_identity(
+        self, recv_req: UpdateWeightFromDiskReqInput
+    ) -> UpdateWeightFromDiskReqOutput:
+        """arc-forge RL weight sync: load ``recv_req.model_path`` (any subset of
+        the model's tensors) into the serving model, keeping the server's
+        identity, with no rollback.
+
+        - Refused, nothing loaded, poisoned state unchanged: under speculative
+          decoding with any draft but the arc DFlash drafter (a draft runner
+          would reload and re-postprocess its own weights from a delta that
+          does not carry them; DFlash loads the target only, see
+          ``_dflash_draft``), or with ``flush_cache`` while the scheduler is
+          not fully idle on every rank.
+          Without ``flush_cache`` there is no idle requirement: the mid-flight
+          sync is ``pause_generation(mode="in_place")`` -> this ->
+          ``continue_generation``, and the paused requests go on with the new
+          weights over their cached (old-weight) KV.
+        - A load that fails on any rank after it started writing poisons the
+          weights on every rank: every request is aborted and generate is
+          refused until a later keep_identity update succeeds (it must write
+          every tensor the failed one may have written -- true for merged
+          exports, which always carry the same keys).
+        - Success clears the poisoned state and records ``weight_version``
+          (tokens of requests alive across the update are attributed per span;
+          under the overlap scheduler the batch in flight at the pause samples
+          one more token per request with the old weights -- under speculative
+          decoding one verify step, up to the verify width -- which is
+          attributed to the new version).
+        """
+
+        def refuse(message: str) -> UpdateWeightFromDiskReqOutput:
+            logger.error(message)
+            return UpdateWeightFromDiskReqOutput(
+                success=False, message=message, weights_poisoned=self.poisoned
+            )
+
+        if self.draft_worker is not None and not _dflash_draft(self.draft_worker):
+            return refuse(
+                "keep_identity: speculative decoding is supported with the arc "
+                "DFlash drafter only (another draft would reload and re-postprocess "
+                "its weights from a delta that does not carry them); nothing was "
+                "loaded."
+            )
+        if recv_req.flush_cache and not self._on_every_rank(self.is_fully_idle()):
+            return refuse(
+                "keep_identity with flush_cache needs an idle scheduler (requests "
+                "are running, queued or paused in place); nothing was loaded. "
+                "Retry when idle, or sync mid-flight with flush_cache=false."
+            )
+        with self._fenced_weight_write("disk"):
+            success, message, touched = (
+                self.tp_worker.update_weights_from_disk_keep_identity(recv_req)
+            )
+            if not self._on_every_rank(success):
+                if self._on_every_rank(not touched):
+                    return refuse(
+                        "keep_identity: the update failed before any weight was "
+                        f"written on any rank; nothing changed. This rank: {message}"
+                    )
+                return self._poison(
+                    f"the update from {recv_req.model_path} failed on a TP rank "
+                    f"after loading started. This rank: {message}"
+                )
+            if recv_req.flush_cache and not self.flush_cache(
+                empty_cache=recv_req.torch_empty_cache
+            ):
+                # Idle was checked above and nothing ran since: a server bug.
+                return self._poison(
+                    f"the cache flush failed after loading {recv_req.model_path} "
+                    "although the scheduler was idle"
+                )
+        self.poisoned = None
+        self.record_weight_version_after_update(recv_req.weight_version)
+        logger.info(
+            "keep_identity weight update from %s done (weight_version=%s)",
+            recv_req.model_path,
+            recv_req.weight_version,
+        )
+        return UpdateWeightFromDiskReqOutput(
+            success=True, message=message, weights_poisoned=None
+        )
+
+    def _poison(self, reason: str) -> UpdateWeightFromDiskReqOutput:
+        self.poisoned = reason
+        message = f"Weights poisoned: {reason}"
+        logger.error(
+            "%s. Aborting every request; generate is refused until a "
+            "keep_identity update succeeds.",
+            message,
+        )
+        self.scheduler.abort_request(AbortReq(abort_all=True, abort_message=message))
+        return UpdateWeightFromDiskReqOutput(
+            success=False, message=message, weights_poisoned=reason
+        )
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         """Initialize the online model parameter update group."""
@@ -146,7 +305,7 @@ class SchedulerWeightUpdaterManager:
         recv_req: UpdateWeightsFromDistributedReqInput,
     ) -> Tuple[bool, str]:
         """Update the online model parameter."""
-        with self._observe_weight_load("distributed"):
+        with self._fenced_weight_write("distributed"):
             success, message = self.tp_worker.update_weights_from_distributed(recv_req)
             if success:
                 self.flush_cache_after_weight_update(recv_req)
@@ -159,7 +318,7 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors."""
-        with self._observe_weight_load("tensor"):
+        with self._fenced_weight_write("tensor"):
             if recv_req.disable_draft_model:
                 worker = self.tp_worker
             else:
@@ -175,7 +334,7 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
-        with self._observe_weight_load("ipc"):
+        with self._fenced_weight_write("ipc"):
             success, message = self.tp_worker.update_weights_from_ipc(recv_req)
             tp_success = success
             if success and self.draft_worker is not None:

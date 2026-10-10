@@ -1757,6 +1757,13 @@ class ModelRunner:
             else contextlib.nullcontext()
         )
 
+        if (
+            not self.is_draft_worker
+            and (experts_capturer := get_global_experts_capturer()) is not None
+        ):
+            # Rows a capture site skips in this forward read back as unwritten.
+            experts_capturer.on_forward_begin(forward_batch)
+
         with (
             canary_ctx,
             step_span_ctx,

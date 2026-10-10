@@ -1815,6 +1815,14 @@ class UpdateWeightFromDiskReqInput(BaseReq, kw_only=True):
     flush_cache: bool = True
     # Tensor metadata from the JSON request body, so it is already msgpack-native.
     manifest: Optional[Dict[str, Any]] = None
+    # arc-forge RL weight sync: load model_path (a delta of some tensors) into the
+    # serving model but keep the server's identity -- served_model_name, model_path
+    # and model_config.model_path stay the launch values -- and never "roll back"
+    # by reloading: a load that fails after it started writing marks the weights
+    # poisoned (generate is refused until a keep_identity update succeeds). Needs an
+    # idle scheduler and flush_cache; refused with speculative decoding. See
+    # SchedulerWeightUpdaterManager.update_weights_from_disk_keep_identity.
+    keep_identity: bool = False
 
 
 class UpdateWeightFromDiskReqOutput(BaseReq, kw_only=True):
@@ -1822,6 +1830,9 @@ class UpdateWeightFromDiskReqOutput(BaseReq, kw_only=True):
     message: str
     # Number of paused requests during weight sync.
     num_paused_requests: int = 0
+    # Why the served weights cannot be trusted (a keep_identity load failed
+    # after it started writing), or None: the scheduler's state after this update.
+    weights_poisoned: Optional[str] = None
 
 
 class UpdateWeightsFromDistributedReqInput(BaseReq, kw_only=True):

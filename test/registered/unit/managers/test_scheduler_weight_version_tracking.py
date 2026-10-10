@@ -124,6 +124,7 @@ class TestRecordWeightVersionAfterUpdate(CustomTestCase):
             weight_version="v2",
             flush_cache=True,
             torch_empty_cache=False,
+            keep_identity=False,
             **fields,
         )
 

@@ -482,6 +482,7 @@ def _make_tm_for_generate(case) -> TokenizerManager:
     tm.is_pause_cond = asyncio.Condition()
     tm.model_update_lock = Mock()
     tm.model_update_lock.reader_lock = _DummyAsyncCM()
+    tm.weights_poisoned = None
     tm._validate_and_resolve_lora = AsyncMock(return_value=None)
     return tm
 

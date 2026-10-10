@@ -28,6 +28,7 @@ ScheduleBatch -> ForwardBatch
 from __future__ import annotations
 
 import hashlib
+import os
 import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
@@ -67,6 +68,10 @@ from sglang.srt.utils import (
     support_triton,
 )
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
+
+# ARC: ARC_MROPE_DECODE_PAGEABLE=1 restores the upstream pageable (stream-synchronous) copy of the
+# per-request mrope deltas in multimodal decode; only for A/B. Default 0 = pinned, non_blocking.
+_ARC_MROPE_DECODE_PAGEABLE = {"0": False, "1": True}[os.environ.get("ARC_MROPE_DECODE_PAGEABLE", "0")]
 
 if TYPE_CHECKING:
     from sglang.srt.layers.cp.base import BaseContextParallelMetadata
@@ -1276,10 +1281,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # precomputed MRoPE positions. In this case, positions cannot be
         # reconstructed only from mrope_position_delta and need the original
         # per-request computation path.
+        # ARC: host ints, not a 0-d tensor compare per request per decode step.
+        seq_lens_host = seq_lens_cpu.tolist()
         has_precomputed_mrope = any(
             mm is not None
             and mm.mrope_positions is not None
-            and mm.mrope_positions.shape[1] >= seq_lens_cpu[i]
+            and mm.mrope_positions.shape[1] >= seq_lens_host[i]
             for i, mm in enumerate(mm_inputs)
         )
         has_multimodal_input = any(mm is not None for mm in mm_inputs)
@@ -1295,9 +1302,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             deltas_list = [0] * batch_size
             for i, mm in enumerate(mm_inputs):
                 deltas_list[i] = mm.mrope_position_delta.item() if mm is not None else 0
-            deltas = torch.tensor(
-                deltas_list, dtype=torch.int64, device=model_runner.device
-            )
+            if _ARC_MROPE_DECODE_PAGEABLE:
+                deltas = torch.tensor(
+                    deltas_list, dtype=torch.int64, device=model_runner.device
+                )
+            else:
+                # ARC: a pageable list -> device copy is synchronous on the forward stream: every
+                # multimodal decode step waited for the previous batch's forward, which turned the
+                # overlap scheduler into lockstep (B200 RL rollout, py-spy: 63-70% of the TP
+                # schedulers' main thread). Pinned + non_blocking; same values.
+                deltas = torch.tensor(
+                    deltas_list, dtype=torch.int64, pin_memory=True
+                ).to(model_runner.device, non_blocking=True)
             positions_1d = (deltas - 1) + seq_lens_int64
             self.mrope_positions = positions_1d.unsqueeze(0).repeat(3, 1)
             return

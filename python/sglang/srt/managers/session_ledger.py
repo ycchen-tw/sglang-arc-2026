@@ -11,7 +11,11 @@ intake (after tokenization, before the scheduler)
     split the model sampled), so the model always sees its own ids. The request
     is then an *extension* (its ids start with S) or a *branch* (they do not:
     compaction dropped the head, the parser rewrote a broken tool call, a client
-    changed history, a retry of an earlier turn).
+    changed history, a retry of an earlier turn). With ``--session-replay-empty-think``
+    a previous assistant turn whose thinking the model left empty in a non-canonical
+    way (``<think>\n</think>\n\n``, or ``<think>\n`` straight into the answer) also
+    counts as the same message when the client renders it canonically
+    (``<think>\n\n</think>\n\n``): see ``EmptyThink``.
 
 finish
     An extension appends ``tail`` (the ids after S) and ``gen`` (the sampled ids,
@@ -30,6 +34,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+import functools
 import hashlib
 import json
 import logging
@@ -50,6 +55,10 @@ logger = logging.getLogger(__name__)
 
 LEDGER_VERSION = 1
 REPLAY_END_TOKEN = "<|im_end|>"
+THINK_START_TOKEN = "<think>"
+THINK_END_TOKEN = "</think>"
+EMPTY_THINK_TEXT = "<think>\n\n</think>\n\n"  # the chat template's assistant turn with empty reasoning
+ASSISTANT_HEADER_TEXT = "<|im_start|>assistant\n"
 IMAGE_PAD_TOKEN = "<|image_pad|>"
 VIDEO_PAD_TOKEN = "<|video_pad|>"
 MM_UNSUPPORTED = ("vision_position_ids", "media_nums_per_sample", "visible_frame_counts", "token_type_ids")
@@ -94,6 +103,80 @@ class ReplayResult:
     spans: List[Dict[str, int]] = field(default_factory=list)
     skip: Optional[str] = None  # why it stopped before the record's end, None if it did not
     lcp0: int = 0  # first divergence before replay (len(record) or more: none)
+
+
+@dataclass(frozen=True)
+class EmptyThink:
+    """How a previous assistant turn with empty thinking looks: the canonical rendering the client sends
+    (``<|im_start|>assistant\n<think>\n\n</think>\n\n`` before the answer) and what the model may have
+    sampled instead. ``replay_ids`` treats the two as the same message (``_empty_think_end``)."""
+
+    header: Tuple[int, ...]  # <|im_start|>assistant\n
+    canonical: Tuple[int, ...]  # <think>\n\n</think>\n\n
+    think_start: int
+    think_end: int
+    is_space: Callable[[int], bool]  # the token decodes to whitespace only (and to something)
+
+    @classmethod
+    def from_tokenizer(cls, tokenizer, decode: Callable[[List[int]], str]) -> "EmptyThink":
+        ids = {}
+        for name in (THINK_START_TOKEN, THINK_END_TOKEN):
+            t = tokenizer.convert_tokens_to_ids(name)
+            if not isinstance(t, int) or tokenizer.convert_ids_to_tokens(t) != name:
+                raise ValueError(f"--session-replay-empty-think: the tokenizer has no single {name} token (got {t!r})")
+            ids[name] = int(t)
+        start, end = ids[THINK_START_TOKEN], ids[THINK_END_TOKEN]
+
+        @functools.lru_cache(maxsize=None)
+        def is_space(t: int) -> bool:
+            text = decode([int(t)])
+            return bool(text) and not text.strip()
+
+        header = tuple(int(t) for t in tokenizer.encode(ASSISTANT_HEADER_TEXT, add_special_tokens=False))
+        canonical = tuple(int(t) for t in tokenizer.encode(EMPTY_THINK_TEXT, add_special_tokens=False))
+        # <think>, whitespace, </think>, whitespace: the shape _empty_think_end relies on
+        k = canonical.index(end) if end in canonical else -1
+        if (len(canonical) < 3 or canonical[0] != start or canonical.count(start) != 1 or k < 2
+                or canonical.count(end) != 1 or not all(is_space(t) for i, t in enumerate(canonical) if i not in (0, k))
+                or decode(list(canonical)) != EMPTY_THINK_TEXT or decode(list(header)) != ASSISTANT_HEADER_TEXT):
+            raise ValueError(f"--session-replay-empty-think: {EMPTY_THINK_TEXT!r} tokenizes to {canonical}, "
+                             f"not <think> whitespace </think> whitespace")
+        return cls(header=header, canonical=canonical, think_start=start, think_end=end, is_space=is_space)
+
+
+def _empty_think_end(toks: np.ndarray, new: np.ndarray, lcp: int, start: int, rec_end: int, key_end: int,
+                     et: EmptyThink, decode: Callable[[List[int]], str]) -> Optional[int]:
+    """Where the record's empty-thinking block ends, if the request's message [start, key_end) is the
+    record's [start, rec_end) with only that block rendered canonically; else None.
+
+    The request diverges inside its canonical block ``<think>\n\n</think>\n\n``, which opens an
+    assistant message (right after ``<|im_start|>assistant\n``, inside the message). The record has
+    ``<think>`` there, then whitespace-only tokens, then either ``</think>`` and whitespace-only tokens,
+    or directly something else -- and then no ``</think>`` in the rest of the message (the model never
+    thought: reasoning that ends in a later ``</think>`` is not empty). After the two blocks the texts
+    are the same. Anything else -- non-empty reasoning, another divergence -- is not equivalent."""
+    C, H = et.canonical, et.header
+    t = next((t for t in range(max(lcp - len(C) + 1, start + len(H)), lcp)
+              if new[t] == et.think_start and tuple(new[t:t + len(C)].tolist()) == C
+              and tuple(new[t - len(H):t].tolist()) == H), None)
+    if t is None or key_end < t + len(C):
+        return None
+    # new[:lcp] == toks[:lcp] and t < lcp: the record has the header and <think> at t too
+    i = t + 1
+    while i < rec_end and et.is_space(int(toks[i])):
+        i += 1
+    if i < rec_end and toks[i] == et.think_end:
+        i += 1
+        while i < rec_end and et.is_space(int(toks[i])):
+            i += 1
+    elif (toks[i:rec_end] == et.think_end).any():
+        return None  # text before a </think>: the model did think
+    if lcp > i:
+        return None  # the record's block ended before the divergence: it is in the answer
+    rest = decode(toks[i:rec_end].tolist())
+    if rest != decode(new[t + len(C):key_end].tolist()) or "\ufffd" in rest:
+        return None
+    return i
 
 
 def _replay_blocker(tok, start: int) -> Optional[str]:
@@ -156,6 +239,7 @@ def replay_ids(
     replay_end: int,
     decode: Callable[[List[int]], str],
     max_input_len: int,
+    empty_think: Optional[EmptyThink] = None,
 ) -> ReplayResult:
     """Put the record's sampled ids back into a tokenized request (h14 replay, ported).
 
@@ -168,6 +252,10 @@ def replay_ids(
     inputs the processor's ``input_ids``/``padded_input_ids``, later image offsets and
     M-RoPE positions, and a ``logprob_start_len`` past a replaced message -- change in
     place. A replayed message may not touch an image.
+
+    With ``empty_think``, a message whose text differs only because the record's leading
+    empty thinking is non-canonical (``_empty_think_end``) is replayed the same way, as a
+    span with ``"kind": "empty_think"``.
     """
     if not isinstance(max_input_len, int) or max_input_len < 1:
         raise ValueError(f"max_input_len must be a positive int, got {max_input_len!r}")
@@ -221,9 +309,13 @@ def replay_ids(
                 res.skip = "mm_overlap"
                 break
         text = decode(toks[start:rec_end].tolist())
+        kind = None
         if text != decode(new[start:key_end].tolist()) or "�" in text:
-            res.skip = "text_differs"
-            break
+            if empty_think is None or _empty_think_end(toks, new, lcp, start, rec_end, key_end, empty_think,
+                                                       decode) is None:
+                res.skip = "text_differs"
+                break
+            kind = "empty_think"
         delta = rec_end - key_end
         if pos is not None and delta:
             seg = pos[:, start:key_end]
@@ -246,7 +338,8 @@ def replay_ids(
         new = np.concatenate((new[:start], toks[start:rec_end], new[key_end:]))
         if logprob is not None and logprob >= key_end:
             logprob += delta
-        spans.append({"s": start, "lcp": lcp, "rec_end": rec_end, "key_end": key_end, "delta": delta})
+        spans.append({"s": start, "lcp": lcp, "rec_end": rec_end, "key_end": key_end, "delta": delta,
+                      **({"kind": kind} if kind is not None else {})})
         nxt = _lcp(new, toks)
         if nxt < rec_end:
             raise RuntimeError(f"{tok.rid}: replayed message [{start}, {rec_end}) still diverges at {nxt}")
@@ -348,6 +441,11 @@ class _Writer:
         self.rt_f = open(os.path.join(root, f"routing.{self.rt_idx}.bin"), "ab")
         self.media_written: set = set(n for n in os.listdir(os.path.join(root, "media")))
         self.bytes_written = 0
+        # event lines queued (dropped puts excluded; the writer's own lossy markers included) and event lines
+        # flushed to events.*.jsonl after their media and routing: both monotonic, written <= enqueued, equal once
+        # the writer has drained
+        self.enqueued_events = 0
+        self.written_events = 0
         self.lossy = 0
         self.lossy_unreported = 0
         self.error: Optional[str] = None
@@ -357,21 +455,33 @@ class _Writer:
         self.thread = threading.Thread(target=self._run, name="session-ledger-writer", daemon=True)
         self.thread.start()
 
+    def _enqueue(self, job: tuple, block: bool) -> None:
+        # counted before the put, so that written_events never runs ahead of enqueued_events
+        self.enqueued_events += 1
+        try:
+            if block:
+                self.q.put(job)
+            else:
+                self.q.put_nowait(job)
+        except BaseException:
+            self.enqueued_events -= 1
+            raise
+
     def put(self, event: dict, media: Sequence[Tuple[str, bytes]] = (), routing: Optional[bytes] = None) -> None:
         if self.error is not None:
             raise RuntimeError(f"session ledger writer died: {self.error}")
         if self.blocking:
             if self.lossy_unreported:
-                self.q.put(({"ev": "lossy", "t": time.time(), "dropped": self.lossy_unreported}, (), None))
+                self._enqueue(({"ev": "lossy", "t": time.time(), "dropped": self.lossy_unreported}, (), None), True)
                 self.lossy_unreported = 0
-            self.q.put((event, media, routing))
+            self._enqueue((event, media, routing), True)
             return
         try:
             if self.lossy_unreported:
                 # the drop itself goes on disk as soon as there is room again
-                self.q.put_nowait(({"ev": "lossy", "t": time.time(), "dropped": self.lossy_unreported}, (), None))
+                self._enqueue(({"ev": "lossy", "t": time.time(), "dropped": self.lossy_unreported}, (), None), False)
                 self.lossy_unreported = 0
-            self.q.put_nowait((event, media, routing))
+            self._enqueue((event, media, routing), False)
         except queue.Full:
             self.lossy += 1
             self.lossy_unreported += 1
@@ -430,6 +540,7 @@ class _Writer:
         self.ev_f.write(line)
         self.ev_f.flush()
         self.bytes_written += len(line)
+        self.written_events += 1
 
 
 # ----------------------------------------------------------------------------- ledger
@@ -505,6 +616,7 @@ class SessionLedger:
         tokenizer_worker_num: int,
         server_meta: Dict[str, Any],
         port: int,
+        empty_think: bool = False,
     ):
         if tokenizer is None:
             raise ValueError("--session-replay needs the tokenizer (do not use --skip-tokenizer-init)")
@@ -527,6 +639,7 @@ class SessionLedger:
         self.eos = np.array(sorted(set(eos)), dtype=np.int64)
         self.stop = np.array(sorted({self.replay_end, *eos}), dtype=np.int64)
         self.decode = lambda ids: tokenizer.decode(ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+        self.empty_think = EmptyThink.from_tokenizer(tokenizer, self.decode) if empty_think else None
         pads = {}
         for name in (IMAGE_PAD_TOKEN, VIDEO_PAD_TOKEN):
             t = tokenizer.convert_tokens_to_ids(name)
@@ -560,14 +673,15 @@ class SessionLedger:
             meta.update(instance=self.instance, v=LEDGER_VERSION, t=time.time(), host=socket.gethostname(),
                         pid=os.getpid(), port=port, replay_end=self.replay_end, eos=self.eos.tolist(),
                         image_pad=self.image_pad, video_pad=self.video_pad,
-                        ledger={"all": record_all, "logprobs": logprobs, "routing": routing, "max_bytes": max_bytes})
+                        ledger={"all": record_all, "logprobs": logprobs, "routing": routing, "max_bytes": max_bytes,
+                                "empty_think": empty_think})
             with open(os.path.join(self.root, "server.json"), "w") as f:
                 json.dump(meta, f, indent=1, sort_keys=True, default=str)
             self.writer = _Writer(self.root)
             self.writer.put({"ev": "start", "v": LEDGER_VERSION, "instance": self.instance, "t": time.time()})
             atexit.register(self.shutdown)
-        logger.info("SESSION_LEDGER on: replay=1 dir=%s all=%d logprobs=%d routing=%d",
-                    self.root, record_all, logprobs, routing)
+        logger.info("SESSION_LEDGER on: replay=1 empty_think=%d dir=%s all=%d logprobs=%d routing=%d",
+                    empty_think, self.root, record_all, logprobs, routing)
 
     # ------------------------------------------------------------------ intake
 
@@ -584,10 +698,14 @@ class SessionLedger:
         res = ReplayResult(lcp0=0)
         if sess is not None:
             self.sessions.move_to_end(sid)
-            res = replay_ids(tok, sess.S.astype(np.int64), self.stop, self.replay_end, self.decode, max_input_len)
+            res = replay_ids(tok, sess.S.astype(np.int64), self.stop, self.replay_end, self.decode, max_input_len,
+                             self.empty_think)
             if res.spans:
                 self.counters["replay"] += 1
                 self.counters["replay_messages"] += len(res.spans)
+                think = sum(s.get("kind") == "empty_think" for s in res.spans)
+                if think:
+                    self.counters["replay_empty_think"] += think
             if res.skip is not None:
                 self.counters[f"replay_skip_{res.skip}"] += 1
         key64 = _i64(tok.input_ids)
@@ -780,6 +898,10 @@ class SessionLedger:
                        if k2 in meta_info} or None,
               "replay": {"spans": p.replay.spans, "skip": p.replay.skip, "lcp0": p.replay.lcp0},
               "media": media, "logprobs": None, "routing": None}
+        ev["weight_versions"], why = _weight_versions(meta_info, len(gen))
+        if why is not None:
+            self.counters["weight_versions_error"] += 1
+            ev["weight_versions_error"] = why
         if self.logprobs:
             vals = [float(v) for v in state.output_token_logprobs_val]
             if len(vals) != len(gen):
@@ -789,12 +911,19 @@ class SessionLedger:
                 ev["logprobs"] = _b64_f32(vals)
         routing_bytes = None
         if self.routing:
-            routing_bytes, info = _routing_bytes(meta_info, p.routing_start, len(p.key) + len(gen) - 1 - p.routing_start)
-            if routing_bytes is None:
-                self.counters["routing_missing"] += 1
-                ev["routing_error"] = info
+            server_error = meta_info.get("routed_experts_error")
+            if server_error is not None:
+                # the scheduler refused the rows (unwritten sentinel / all-zero)
+                self.counters["routing_invalid"] += 1
+                ev["routing_error"] = server_error
             else:
-                ev["routing"] = info
+                routing_bytes, info = _routing_bytes(meta_info, p.routing_start,
+                                                     len(p.key) + len(gen) - 1 - p.routing_start)
+                if routing_bytes is None:
+                    self.counters["routing_missing"] += 1
+                    ev["routing_error"] = info
+                else:
+                    ev["routing"] = info
         self.writer.put(ev, p.media_blobs, routing_bytes)
 
     # ------------------------------------------------------------------ sessions
@@ -850,6 +979,8 @@ class SessionLedger:
                 "pending": len(self.pending), "bytes": self.bytes, "max_bytes": self.max_bytes,
                 "queue": self.writer.depth() if self.writer else 0,
                 "written_bytes": self.writer.bytes_written if self.writer else 0,
+                "enqueued_events": self.writer.enqueued_events if self.writer else 0,
+                "written_events": self.writer.written_events if self.writer else 0,
                 "lossy": self.writer.lossy if self.writer else 0,
                 "writer_error": self.writer.error if self.writer else None,
                 "logprobs": self.logprobs, "routing": self.routing, "all": self.record_all,
@@ -886,6 +1017,27 @@ def _routing_bytes(meta_info: dict, routing_start: int, n_expected: int):
                       f"{len(raw)} bytes for {shape} {dtype}")
     return raw, {"file": None, "offset": None, "nbytes": len(raw), "start": start, "n_tokens": shape[0],
                  "shape": shape, "dtype": dtype}
+
+
+def _weight_versions(meta_info: dict, n_gen: int):
+    """(spans, None) or (None, why): the weight version each generated token was sampled with.
+
+    ``meta_info["weight_versions"]`` (the scheduler's per-request spans) as
+    ``[{"version": str, "start": int, "end": int}, ...]``: half-open, in gen coordinates, tiling
+    ``[0, len(gen))`` in order (one span unless a weight update happened while the request ran)."""
+    spans = meta_info.get("weight_versions")
+    if not spans:
+        return None, f"meta_info weight_versions is {spans!r}"
+    out, pos = [], 0
+    for s in spans:
+        version, start, end = s["version"], s["start"], s["end"]
+        if not isinstance(version, str) or start != pos or end < start:
+            return None, f"weight_versions {spans} do not tile [0, {n_gen})"
+        out.append({"version": version, "start": int(start), "end": int(end)})
+        pos = end
+    if pos != n_gen:
+        return None, f"weight_versions {spans} do not tile [0, {n_gen})"
+    return out, None
 
 
 MODEL_FILES = ("config.json", "generation_config.json", "tokenizer.json", "tokenizer_config.json",

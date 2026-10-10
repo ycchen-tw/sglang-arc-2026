@@ -233,6 +233,19 @@ _INCREMENTAL_STREAMING_META_INFO_KEYS = (
 )
 
 
+class WeightsPoisonedError(ValueError):
+    """A keep_identity weight update failed after it started writing: generate
+    is refused (503) until a later keep_identity update succeeds."""
+
+    status_code = HTTPStatus.SERVICE_UNAVAILABLE
+
+    def __init__(self, reason: str):
+        super().__init__(
+            f"Weights poisoned: {reason}. Generate requests are refused until a "
+            "keep_identity weight update succeeds."
+        )
+
+
 @dataclasses.dataclass
 class ReqState:
     """Store the state a request."""
@@ -547,6 +560,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         serving = get_serving()
         self.session_ledger = None
         if not serving.session_replay:
+            if serving.session_replay_empty_think:
+                raise ValueError("--session-replay-empty-think needs --session-replay")
             if (
                 serving.session_ledger_dir is not None
                 or serving.session_ledger_all
@@ -580,6 +595,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             tokenizer_worker_num=serving.tokenizer_worker_num,
             server_meta=server_meta(self.server_args),
             port=self.server_args.port,
+            empty_think=serving.session_replay_empty_think,
         )
 
     def _session_ledger_intake(self, obj, tokenized_obj) -> None:
@@ -779,6 +795,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.model_update_tmp: List[UpdateWeightFromDiskReqOutput] = []
         self.is_pause = False
         self.is_pause_cond = asyncio.Condition()
+        # Where the served weights were last loaded from (a keep_identity update
+        # moves this, not model_path), and the schedulers' poisoned state: while
+        # set, generate requests are refused (WeightsPoisonedError).
+        self.weights_source: str = self.model_path
+        self.weights_poisoned: Optional[str] = None
 
     def init_lora(self):
         # LoRA
@@ -950,6 +971,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
             async with self.model_update_lock.reader_lock:
+                if self.weights_poisoned is not None:
+                    raise WeightsPoisonedError(self.weights_poisoned)
                 await self._validate_and_resolve_lora(obj)
 
                 # Tokenize the request and send it to the scheduler
@@ -2209,6 +2232,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
 
+        if obj.keep_identity and get_serving().tokenizer_worker_num != 1:
+            raise ValueError(
+                "keep_identity needs --tokenizer-worker-num 1: the poisoned-weights "
+                "gate lives in one TokenizerManager"
+            )
         if obj.load_format is None:
             obj.load_format = self.config_value("load_format")
         logger.info("Start update_weights. Load format=%s", obj.load_format)
@@ -2279,6 +2307,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.model_path = model_path
         self.record_config_updates("tokenizer.update_weights", load_format=load_format)
 
+    def _record_weights_after_disk_update(
+        self,
+        obj: UpdateWeightFromDiskReqInput,
+        results: List[UpdateWeightFromDiskReqOutput],
+    ) -> None:
+        """The served identity (unless keep_identity), where the weights now come
+        from, and the schedulers' poisoned state, for /model_info and the
+        generate gate."""
+        if all(r.success for r in results):
+            if not obj.keep_identity:
+                self._update_model_path_info(obj.model_path, obj.load_format)
+            self.weights_source = obj.model_path
+        poisoned = [r.weights_poisoned for r in results if r.weights_poisoned]
+        self.weights_poisoned = " | ".join(poisoned) if poisoned else None
+
     async def _wait_for_model_update_from_disk(
         self, obj: UpdateWeightFromDiskReqInput
     ) -> Tuple[bool, str]:
@@ -2289,15 +2332,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self._dispatch_to_scheduler(obj)
         if expected_workers == 1:
             result = await self.model_update_result
-            if result.success:
-                self._update_model_path_info(obj.model_path, obj.load_format)
+            self._record_weights_after_disk_update(obj, [result])
             return result.success, result.message, result.num_paused_requests
         else:
             result = await self.model_update_result
 
             all_success = all([r.success for r in result])
-            if all_success is True:
-                self._update_model_path_info(obj.model_path, obj.load_format)
+            self._record_weights_after_disk_update(obj, result)
             all_message = [r.message for r in result]
             all_message = " | ".join(all_message)
             all_paused_requests = [r.num_paused_requests for r in result]
@@ -2534,6 +2575,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
                     meta_info["routed_experts"] = val
                     meta_info["routed_experts_meta"] = routed_meta
+                elif (
+                    recv_obj.routed_experts_meta is not None
+                    and (routed_meta := recv_obj.routed_experts_meta[i]) is not None
+                ):
+                    # The scheduler refused this request's rows (unwritten or
+                    # all-zero): no payload, the reason instead.
+                    meta_info["routed_experts_error"] = routed_meta["error"]
             if getattr(recv_obj, "indexer_topk", None):
                 val = recv_obj.indexer_topk[i]
                 if val is not None:
@@ -2678,6 +2726,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if state.ledger_routing:  # recorded; the client did not ask for it
                         meta_info.pop("routed_experts", None)
                         meta_info.pop("routed_experts_meta", None)
+                        meta_info.pop("routed_experts_error", None)
                 if self.enable_metrics:
                     scheduler_time_stats = (
                         recv_obj.time_stats[i]
