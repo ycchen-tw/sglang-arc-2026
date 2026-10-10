@@ -743,6 +743,20 @@ def eagle_sample(
 
     sanitize_nan_logits(next_token_logits, "verify: target model logits")
 
+    if logits_output.next_token_logits_vocab_start is not None:
+        # arc-forge ARC_SHARDED_VERIFY: the target-verify LogitsProcessor kept this
+        # rank's vocab shard. Sample from the shards, or gather them for the stock
+        # path below when the batch needs it.
+        from sglang.srt.speculative.arc_dflash import sharded_verify
+
+        if SIMULATE_ACC_LEN > 0:
+            raise RuntimeError("ARC_SHARDED_VERIFY does not support SGLANG_SIMULATE_ACC_LEN")
+        sharded = sharded_verify.sample(verify_input, batch, logits_output, grammar_mask)
+        if sharded is not None:
+            predict, num_correct_drafts, accept_index = sharded
+            return predict, num_correct_drafts + 1, accept_index
+        next_token_logits = logits_output.next_token_logits
+
     # Apply penalty
     # This is a relaxed version of penalties for speculative decoding.
     if sampling_info.acc_additive_penalties is not None:

@@ -380,6 +380,13 @@ class DFlashDraftWorker:
             raise ValueError(f"max_running_requests {total} does not split over attention DP {dp}")
         self.max_running_requests = total // dp
         self.use_rejection_sampling = bool(spec.speculative_use_rejection_sampling)
+        from sglang.srt.runtime_context import get_parallel
+        from sglang.srt.speculative.arc_dflash import sharded_verify
+
+        self.sharded_verify = sharded_verify.enabled()
+        if self.sharded_verify and not (get_parallel().enable_dp_lm_head and get_parallel().attn_tp_size > 1):
+            raise RuntimeError("ARC_SHARDED_VERIFY=1 needs --enable-dp-lm-head with attention TP > 1 (vocab-sharded "
+                               "LM head on the attention-TP group)")
         self.check_agree = os.environ.get("ARC_DFLASH_CHECK_AGREE") == "1"
         directory = Path(drafter_dir())
         raw = json.loads((directory / "config.json").read_text())
@@ -686,12 +693,18 @@ class DFlashDraftWorker:
             if not all(torch.equal(both[0], both[r]) for r in range(1, self.group.world_size)):
                 raise RuntimeError(f"DFlash: attention-TP group {list(self.group.ranks)} proposed different tokens "
                                    f"at cycle {self.cycle}")
-        return build_eagle_verify_input(
+        verify_input = build_eagle_verify_input(
             batch, draft_input, self.parents[:bs], self.score_index[:bs], tokens.clone(),
             probs if self.use_rejection_sampling else None,
             target_worker=self.target_worker, topk=1, num_steps=self.steps, num_draft_tokens=self.width,
             tree_mask_mode=self.tree_mask_mode, device=self.device,
         )
+        if self.sharded_verify:
+            # q's support (the selector candidates) for sharded_verify; the dense probs stay for batches that fall back
+            candidates = self.pool.cand_out[:bs]
+            verify_input.arc_q_ids = candidates
+            verify_input.arc_q_probs = probs.gather(2, candidates)
+        return verify_input
 
     def _timing(self, start, end, bs):
         """GPU ms of each draft step and of each whole cycle (draft start to the next draft start), averaged over
