@@ -515,7 +515,9 @@ def _rs_row_softmax_stats_kernel(
         x = tl.load(base + v_offsets * stride_l_v, mask=v_offsets < VOCAB_SIZE, other=-float("inf"))
         x = tl.math.div_rn(x, t)
         new_m = tl.maximum(m, tl.max(x, axis=0))
-        s = s * tl.exp(m - new_m) + tl.sum(tl.exp(x - new_m), axis=0)
+        # while every logit so far is -inf (a masked row: ARC_THINK_BUDGET forcing </think>, a vocab mask), new_m is
+        # -inf and exp(-inf - -inf) is NaN; nothing has been summed yet, so the sum stays 0
+        s = tl.where(new_m > -float("inf"), s * tl.exp(m - new_m) + tl.sum(tl.exp(x - new_m), axis=0), 0.0)
         m = new_m
     tl.store(RowMax + row, m)
     tl.store(RowSum + row, s)

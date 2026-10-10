@@ -222,3 +222,48 @@ def test_grammar_requests_are_left_alone(tokenizer, budget_cls):
     req.output_ids.extend(range(1000, 1000 + state.budget))
     assert state.select(SimpleNamespace(reqs=[req], req_pool_indices=torch.tensor([7]))) == []
     assert req.arc_think_open is False and not req.arc_think_armed
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the rejection-sampling kernels are Triton")
+@pytest.mark.parametrize("fused", [True, False])
+@pytest.mark.parametrize("token", [198, 151667, 248069, 248319])
+def test_rejection_sampling_commits_a_forced_row(fused, token):
+    """A forced row (one finite logit, -inf elsewhere) through the deployed verify kernels: the committed token is the
+    forced one whether the draft matches it or not, wherever it sits in the vocab. (The fused kernel's softmax stats
+    used to turn a row into NaN when a whole leading 4096-block was -inf: </think> came out as vocab_size - 1.)"""
+    from sglang.kernels.ops.speculative.reject_sampling import (
+        chain_speculative_sampling_sparse_q_from_logits,
+        chain_speculative_sampling_sparse_q_triton,
+    )
+
+    torch.manual_seed(token)
+    bs, k, vocab, support = 8, 4, 248320, 16
+    dev = "cuda"
+    logits = torch.randn(bs, k, vocab, device=dev) * 3
+    logits[:, 0, :] = float("-inf")
+    logits[:, 0, token] = 0.0
+    candidates = torch.randint(0, vocab, (bs, k), device=dev)
+    match = torch.arange(bs, device=dev) % 2 == 0  # half the drafts propose the forced token
+    candidates[:, 1] = torch.where(match, torch.full_like(candidates[:, 1], token), (token + 1) % vocab)
+    draft_ids = torch.randint(0, vocab, (bs, k - 1, support), device=dev)
+    draft_ids[:, :, 0] = candidates[:, 1:]
+    draft_q = torch.softmax(torch.randn(bs, k - 1, support, device=dev), dim=-1)
+    retrive_index = torch.arange(bs * k, device=dev).view(bs, k)
+    temps = torch.full((bs, 1), 0.7, device=dev)
+    for _ in range(20):
+        predicts = torch.zeros(bs * k, dtype=torch.int32, device=dev)
+        accept_index = torch.full((bs, k), -1, dtype=torch.int32, device=dev)
+        accept_num = torch.zeros(bs, dtype=torch.int32, device=dev)
+        coins = torch.rand(bs, k, device=dev)
+        final = torch.rand(bs, device=dev)
+        common = dict(predicts=predicts, accept_index=accept_index, accept_token_num=accept_num,
+                      candidates=candidates, retrive_index=retrive_index, uniform_samples=coins,
+                      uniform_samples_for_final_sampling=final, draft_ids=draft_ids, draft_q=draft_q)
+        if fused:
+            chain_speculative_sampling_sparse_q_from_logits(logits=logits, temperatures=temps, **common)
+        else:
+            chain_speculative_sampling_sparse_q_triton(target_probs=torch.softmax(logits / temps[:, :, None], -1),
+                                                       **common)
+        first = predicts.view(bs, k)[:, 0]
+        assert torch.equal(first, torch.full_like(first, token)), first.tolist()
+        assert torch.equal(accept_num.bool(), match), (accept_num.tolist(), match.tolist())
