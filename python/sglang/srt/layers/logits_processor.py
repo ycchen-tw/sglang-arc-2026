@@ -466,10 +466,12 @@ class LogitsProcessor(nn.Module):
         # attention-TP group (dp-lm-head); eagle_sample samples from the shards.
         from sglang.srt.speculative.arc_dflash import sharded_verify as _arc_sv
 
+        # dp-lm-head (the attention-TP group's vocab shards) or pure TP (no attention
+        # DP: the TP group is the attention-TP group)
         self._arc_shard_verify = (
             _arc_sv.enabled()
-            and self.use_attn_tp_group
             and self.do_tensor_parallel_all_gather
+            and (self.use_attn_tp_group or get_parallel().attn_dp_size == 1)
         )
         if self._arc_shard_verify:
             _arc_sv.require_supported(self)
@@ -925,10 +927,11 @@ class LogitsProcessor(nn.Module):
         logits = self._compute_lm_head(hidden_states, lm_head)
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
-        if logits.shape[-1] * self.attn_tp_size != self.vocab_size:
+        n = get_parallel().attn_tp_size
+        if logits.shape[-1] * n != self.vocab_size:
             raise RuntimeError(
-                f"ARC_SHARDED_VERIFY: local logits width {logits.shape[-1]} x "
-                f"{self.attn_tp_size} ranks != vocab {self.vocab_size} (padded shard)"
+                f"ARC_SHARDED_VERIFY: local logits width {logits.shape[-1]} x {n} "
+                f"ranks != vocab {self.vocab_size} (padded shard)"
             )
         return logits, get_parallel().attn_tp_rank * logits.shape[-1]
 

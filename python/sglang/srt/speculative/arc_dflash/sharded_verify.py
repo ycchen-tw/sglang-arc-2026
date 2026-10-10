@@ -1,6 +1,6 @@
 """Exact chain rejection sampling on vocab-sharded verify logits (ARC_SHARDED_VERIFY=1).
 
-With --enable-dp-lm-head every attention-TP rank holds the logits of its vocab shard. Stock verify gathers them
+With --enable-dp-lm-head (or pure TP, no attention DP) every attention-TP rank holds the logits of its vocab shard. Stock verify gathers them
 ([rows, vocab] bf16 per rank: 24-32 MB at 96-128 rows on L4, 5.8-19.8 ms of host-mapped gather per verify step on
 Runpod 10-08), copies them to FP32, softmaxes the whole vocabulary and runs the chain rejection-sampling kernel
 (kernels/ops/speculative/reject_sampling.py) on dense target and draft probabilities -- on every rank, after which rank
@@ -62,10 +62,17 @@ def require_supported(logits_processor) -> None:
         raise RuntimeError("ARC_SHARDED_VERIFY=1 needs the arc DFlash drafter (ARC_DFLASH_DRAFTER) in the EAGLE worker")
     if logits_processor.final_logit_softcapping:
         raise RuntimeError("ARC_SHARDED_VERIFY=1 does not apply final-logit softcapping on vocab shards")
+    from sglang.srt.runtime_context import get_parallel
+
+    ps = get_parallel()
+    if not logits_processor.use_attn_tp_group and ps.attn_tp_size != ps.tp_size:
+        raise RuntimeError(f"ARC_SHARDED_VERIFY: pure-TP vocab shards need attention TP == TP, got "
+                           f"{ps.attn_tp_size} vs {ps.tp_size}")
     if not _STATS.get("install_logged"):
         _STATS["install_logged"] = True
         logger.info("ARC_SHARDED_VERIFY installed: target-verify logits stay sharded over %d attention-TP ranks "
-                    "(vocab %d)", logits_processor.attn_tp_size, logits_processor.vocab_size)
+                    "(vocab %d, %s)", ps.attn_tp_size, logits_processor.vocab_size,
+                    "dp-lm-head" if logits_processor.use_attn_tp_group else "pure TP")
 
 
 @triton.jit

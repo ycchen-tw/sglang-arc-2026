@@ -384,9 +384,10 @@ class DFlashDraftWorker:
         from sglang.srt.speculative.arc_dflash import sharded_verify
 
         self.sharded_verify = sharded_verify.enabled()
-        if self.sharded_verify and not (get_parallel().enable_dp_lm_head and get_parallel().attn_tp_size > 1):
-            raise RuntimeError("ARC_SHARDED_VERIFY=1 needs --enable-dp-lm-head with attention TP > 1 (vocab-sharded "
-                               "LM head on the attention-TP group)")
+        ps_ = get_parallel()
+        if self.sharded_verify and not (ps_.attn_tp_size > 1 and (ps_.enable_dp_lm_head or ps_.attn_dp_size == 1)):
+            raise RuntimeError("ARC_SHARDED_VERIFY=1 needs the LM head vocab-sharded over attention TP > 1: "
+                               "--enable-dp-lm-head, or pure TP without attention DP")
         self.check_agree = os.environ.get("ARC_DFLASH_CHECK_AGREE") == "1"
         directory = Path(drafter_dir())
         raw = json.loads((directory / "config.json").read_text())
