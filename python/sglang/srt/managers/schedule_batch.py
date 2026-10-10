@@ -996,6 +996,14 @@ class Req(ReqDllmMixin):
         # full_untruncated_fill_ids from lengths alone, so in-place rewrites
         # that preserve length would silently corrupt fill_ids.
         self.output_ids = array("q")
+        # ARC_THINK_BUDGET (speculative/arc_think_budget.py), set only when it is on: is the thinking block open
+        # (None: not looked at yet), output_ids scanned so far, armed (budget reached, close being forced), the
+        # output length when armed, and the req_pool_idx its GPU "closed" flag was reset on
+        self.arc_think_open: Optional[bool] = None
+        self.arc_think_scan = 0
+        self.arc_think_armed = False
+        self.arc_think_armed_at = -1
+        self.arc_think_slot = -1
         # Full untruncated sequence: origin + output (+ DLLM mask block).
         # Kept in sync by _refresh_fill_ids; admission only updates
         # extend_range, never mutates this array's length.

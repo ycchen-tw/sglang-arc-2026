@@ -15,6 +15,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.speculative import arc_think_budget
 from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
@@ -606,6 +607,20 @@ def run_eagle_verify(
     # Sample
     maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
     maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
+    # ARC_THINK_BUDGET (opt-in, speculative/arc_think_budget.py): force the close of over-budget thinking blocks
+    think_budget = arc_think_budget.active()
+    think_handle = None
+    if think_budget is not None and not batch.forward_mode.is_idle():
+        think_rows = think_budget.select(batch)
+        if think_rows:
+            think_handle = think_budget.apply(
+                batch,
+                think_rows,
+                verify_input.draft_token,
+                logits_output.next_token_logits,
+                num_draft_tokens,
+                req_to_token_pool.req_to_token.shape[0],
+            )
     (
         predict,
         accept_lens,
@@ -617,6 +632,8 @@ def run_eagle_verify(
         grammar_mask,
         uno_target_max_top_k=uno_target_max_top_k,
     )
+    if think_handle is not None:
+        think_budget.commit(think_handle, predict, accept_index)
     coord = target_worker.model_runner.hisparse_coordinator
     if coord is not None:
         from sglang.srt.managers.qsa_hisparse_coordinator import QSAHiSparseCoordinator
