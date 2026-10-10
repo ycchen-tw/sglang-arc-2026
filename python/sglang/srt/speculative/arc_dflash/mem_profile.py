@@ -1,7 +1,8 @@
 """Runtime GPU memory profile of the serving (scheduler) process -- analysis runs only, it slows the host.
 
 `ARC_DFLASH_MEM_PROFILE=<dir>` makes DFlashDraftWorker call start(<dir>) at the end of its init (before the target
-sizes its pools, so the pools, graphs and every runtime allocation after that are recorded):
+sizes its pools, so the pools, graphs and every runtime allocation after that are recorded); each GPU writes to
+<dir>/cuda<device index>:
   - torch.cuda.memory._record_memory_history (python stacks) for every allocation and free;
   - an out-of-memory observer that dumps the snapshot at the failing allocation (oom-<t>.pickle);
   - a sampler thread: every 0.5 s one JSON line in memlog.jsonl (torch allocated / reserved, device used from
@@ -30,6 +31,9 @@ def start(directory: str, device, max_entries: int = 1_000_000) -> None:
     device = torch.device(device)  # the target model runner's device is the string "cuda"
     if device.index is None:  # cudaMemGetInfo / set_device in the sampler thread need the index
         device = torch.device("cuda", torch.cuda.current_device())
+    # one subdirectory per GPU: on a multi-rank host (L4 TP4) every scheduler process gets the same <dir>, and four
+    # samplers appending to one memlog.jsonl / replacing one peak.pickle would mix or tear them
+    directory = os.path.join(directory, f"cuda{device.index}")
     os.makedirs(directory, exist_ok=True)
     torch.cuda.memory._record_memory_history(max_entries=max_entries, context="all", stacks="python")
 
