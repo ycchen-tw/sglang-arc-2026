@@ -34,6 +34,10 @@ target's distribution after candidates[:, j]):
   commits exactly that token at that position (the draft if it matches, else the bonus).
 
 Only the rows of armed requests are touched; with nothing armed the hook is a Python loop over the batch.
+A ``<tool_call>`` inside the thinking block also ends it: the reasoning parser takes it as the end of reasoning,
+so the model is already acting; nothing is forced from there on (G4: one forced close cut a call it had started in
+its thinking, and the parser merged both halves into one call).
+
 When a request is armed, the step in flight is not in ``output_ids`` yet: its state starts from the last committed
 token alone (a word -> OK, ``</think>`` -> END, anything else -> WAIT). Known hole: a request that closes on its own
 inside that step with tokens after its ``</think>`` is taken as still thinking, so a ``\\n`` could be forced into its
@@ -119,6 +123,7 @@ class ThinkBudget:
         self.end_id = _single_id(tokenizer, "</think>", special=True)
         self.nl_id = _single_id(tokenizer, "\n", special=False)
         self.nn_id = _single_id(tokenizer, "\n\n", special=False)
+        self.tool_id = _single_id(tokenizer, "<tool_call>", special=True)
         self.cls: Optional[torch.Tensor] = None
         self.banned: Optional[torch.Tensor] = None  # [vocab] bool: not allowed right after a forced </think>\n\n
         self.state: Optional[torch.Tensor] = None  # [request pool] int8: ST_*
@@ -146,13 +151,20 @@ class ThinkBudget:
         end = len(out)
         if req.arc_think_open:
             for pos in range(req.arc_think_scan, end):
-                if out[pos] == self.end_id:
+                if out[pos] == self.end_id or out[pos] == self.tool_id:
                     req.arc_think_open = False
                     req.arc_think_end_at = pos
                     break
             req.arc_think_scan = end
         e = req.arc_think_end_at
-        if req.arc_think_armed and e >= 0 and end >= e + 3:
+        if not req.arc_think_armed or e < 0:
+            return
+        if out[e] == self.tool_id:
+            req.arc_think_armed = False
+            self.disarmed += 1
+            logger.info("ARC think budget: %s (session %s) ended its thinking with its own <tool_call> at output "
+                        "token %d (armed at %d)", req.rid, req.session_id, e, req.arc_think_armed_at)
+        elif end >= e + 3:
             req.arc_think_armed = False
             self.disarmed += 1
             logger.info("ARC think budget: %s (session %s) closed at output token %d (armed at %d), then %s",
@@ -163,6 +175,8 @@ class ThinkBudget:
         e = req.arc_think_end_at
         if e < 0:
             return -1
+        if req.output_ids[e] == self.tool_id:
+            return ST_DONE
         tail = req.output_ids[e + 1 : e + 3]
         if len(tail) == 0:
             return ST_END
@@ -212,10 +226,8 @@ class ThinkBudget:
 
     def _advance(self, st: torch.Tensor, tok: torch.Tensor) -> torch.Tensor:
         c = self.cls[tok]
-        thinking = torch.where(
-            tok == self.end_id, ST_END,
-            torch.where(c == CLS_NORMAL, ST_OK,
-                        torch.where((c == CLS_NL) & (st == ST_OK), ST_NLOK, ST_WAIT)))
+        word = torch.where(c == CLS_NORMAL, ST_OK, torch.where((c == CLS_NL) & (st == ST_OK), ST_NLOK, ST_WAIT))
+        thinking = torch.where(tok == self.end_id, ST_END, torch.where(tok == self.tool_id, ST_DONE, word))
         after_end = torch.where(tok == self.nn_id, ST_NN, ST_DONE)
         return torch.where(st <= ST_NLOK, thinking, torch.where(st == ST_END, after_end, ST_DONE))
 
@@ -249,7 +261,8 @@ class ThinkBudget:
             pos = (slots.unsqueeze(0) == fresh_t.unsqueeze(1)).to(torch.int64).argmax(dim=1)
             c0 = cand[pos, 0]
             from_c0 = torch.where(c0 == self.end_id, ST_END,
-                                  torch.where(self.cls[c0] == CLS_NORMAL, ST_OK, ST_WAIT))
+                                  torch.where(c0 == self.tool_id, ST_DONE,
+                                              torch.where(self.cls[c0] == CLS_NORMAL, ST_OK, ST_WAIT)))
             self.state.index_copy_(0, fresh_t, torch.where(val_t >= 0, val_t, from_c0).to(torch.int8))
         st = self.state[slots].to(torch.int64)
         states = [st]

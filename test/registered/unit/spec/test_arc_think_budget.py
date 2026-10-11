@@ -187,6 +187,38 @@ class Sim:
         return committed
 
 
+class ToolCallSim(Sim):
+    """a model that, while thinking, starts a tool call after ``at`` output tokens and never writes </think>; it never
+    writes a newline itself, so any \\n / </think> in the output was forced"""
+
+    def __init__(self, *a, at, **kw):
+        super().__init__(*a, **kw)
+        self.at = at
+
+    def natural(self, context):
+        if len(context) >= self.at and self.state.tool_id not in context:
+            return self.state.tool_id
+        return self.rng.choice(self.words)
+
+
+@pytest.mark.parametrize("at", [10, 23, 24, 26, 30])
+@pytest.mark.parametrize("lag", [0, 1])
+def test_a_tool_call_inside_thinking_ends_it(tokenizer, budget_cls, at, lag):
+    """the reasoning parser ends reasoning at <tool_call>: before the budget nothing is armed; after it, forcing stops
+    at the call; either way nothing is forced after the <tool_call>"""
+    state, cls, vocab = budget_cls
+    prompt = prompt_ids(tokenizer)
+    reqs = [make_req(f"t{i}", prompt, slot=20 + i) for i in range(4)]
+    sim = ToolCallSim(state, cls, vocab, k=4, rng=random.Random(at * 7 + lag), lag=lag, at=at)
+    committed = sim.run(reqs, steps=40)
+    for r in reqs:
+        toks = committed[r.rid]
+        assert state.tool_id in toks, toks[:40]
+        after = toks[toks.index(state.tool_id) + 1 :]
+        assert state.end_id not in after and state.nl_id not in after and state.nn_id not in after, after[:10]
+        assert not r.arc_think_armed
+
+
 def round_trips(tokenizer, toks, state, cls):
     """generated text == what the template renders (the session replay criterion): the reasoning ends in one newline
     after a non-whitespace character, and the close is followed by exactly one blank line and then something that
