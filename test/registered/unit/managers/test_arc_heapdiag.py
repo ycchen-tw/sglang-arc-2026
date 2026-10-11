@@ -30,12 +30,19 @@ def test_snapshot_and_deep_dump():
     # a CPU tensor small enough for glibc's brk heap (below the mmap threshold) and a big Python object
     keep = torch.ones(16, 1000)
     blob = [0] * 10000
+
+    class BadSizeof:  # the L4 tree holds an object whose __sizeof__ returns a non-int: counted, not fatal
+        def __sizeof__(self):
+            return "n/a"
+
+    bad = [BadSizeof() for _ in range(3)]
     out = arc_heapdiag.deep(libc, trim=True)
+    assert ["BadSizeof", 3] in out["py_objects_unsized"]
     json.dumps(out)  # one log line
     assert out["torch_cpu_in_heap"]["count"] >= 1 and out["torch_cpu_in_heap"]["bytes"] >= keep.numel() * 4
     assert any(t == "list" and n >= 1 and b >= 80000 for t, n, b in out["py_objects_ge_4k"])
     assert out["trim"]["after"]["heap_size"] > 0 and isinstance(out["trim"]["released"], bool)
-    del blob
+    del blob, bad
 
 
 def test_start_is_off_without_the_env(monkeypatch):

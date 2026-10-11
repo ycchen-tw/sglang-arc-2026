@@ -148,7 +148,7 @@ def deep(libc, trim: bool):
         return path or f"anon {(hi - lo) >> 20} MiB"
 
     torch = sys.modules.get("torch")
-    storages, by_type, seen = {}, {}, set()
+    storages, by_type, seen, unsized = {}, {}, set(), {}
 
     def count(o, size):
         e = by_type.setdefault(type(o).__name__, [0, 0])
@@ -165,15 +165,19 @@ def deep(libc, trim: bool):
                     if st.data_ptr():
                         storages.setdefault(st.data_ptr(), (st.nbytes(), list(o.shape), str(o.dtype)))
                 continue
-            size = sys.getsizeof(o)
-            if size >= BIG_OBJECT_BYTES:
+            size = sys.getsizeof(o, -1)  # -1: its __sizeof__ is missing or returns a non-int (seen on the L4 tree)
+            if size < 0:
+                unsized[type(o).__name__] = unsized.get(type(o).__name__, 0) + 1
+            elif size >= BIG_OBJECT_BYTES:
                 count(o, size)
         for i in range(0, len(objs), 20000):  # untracked referents: bytes, str, numpy arrays, ...
             for r in gc.get_referents(*objs[i:i + 20000]):
                 if gc.is_tracked(r) or id(r) in seen:
                     continue
-                size = sys.getsizeof(r)
-                if size >= BIG_OBJECT_BYTES:
+                size = sys.getsizeof(r, -1)
+                if size < 0:
+                    unsized[type(r).__name__] = unsized.get(type(r).__name__, 0) + 1
+                elif size >= BIG_OBJECT_BYTES:
                     seen.add(id(r))
                     count(r, size)
         n_objs = len(objs)
@@ -192,6 +196,7 @@ def deep(libc, trim: bool):
         "torch_cpu_by_region": sorted(([k, v[0], v[1]] for k, v in regions.items()), key=lambda x: -x[2])[:TOP],
         "torch_cpu_in_heap": {"count": len(in_heap), "bytes": sum(x[0] for x in in_heap), "top": in_heap[:TOP]},
         "py_objects_ge_4k": sorted(([k, v[0], v[1]] for k, v in by_type.items()), key=lambda x: -x[2])[:TOP],
+        "py_objects_unsized": sorted(([k, n] for k, n in unsized.items()), key=lambda x: -x[1])[:TOP],
         "walk_s": round(time.time() - t0, 2),
     })
     if trim:
