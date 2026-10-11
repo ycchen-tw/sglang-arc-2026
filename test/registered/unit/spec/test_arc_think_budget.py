@@ -91,7 +91,7 @@ def test_token_classes(tokenizer, budget_cls):
     assert cls[state.nl_id] == tb.CLS_NL
     for ws in ("\n\n", " ", "  ", "\t"):
         ids = enc(ws)
-        assert len(ids) == 1 and cls[ids[0]] == tb.CLS_WAIT, ws
+        assert len(ids) == 1 and cls[ids[0]] == tb.CLS_WS, ws
     for word in ("the", " level", ".", "0"):
         assert cls[enc(word)[-1]] == tb.CLS_NORMAL, word
 
@@ -111,15 +111,27 @@ class Sim:
         self.state, self.vocab, self.k, self.rng, self.lag = state, vocab, k, rng, lag
         self.cls = cls
         self.words = [i for i in range(1000, 60000) if cls[i] == tb.CLS_NORMAL][:2000]
-        self.ws = [i for i in range(vocab) if cls[i] == tb.CLS_WAIT][:50]
+        self.ws = [i for i in range(vocab) if cls[i] == tb.CLS_WS][:50]
         state.cls = torch.tensor(cls, dtype=torch.int8, device=DEVICE)
-        state.closed = torch.zeros(64, dtype=torch.bool, device=DEVICE)
+        state.banned = (state.cls == tb.CLS_NL) | (state.cls == tb.CLS_WS) | (state.cls == tb.CLS_PAD)
+        state.banned[[state.start_id, state.end_id]] = True
+        state.state = torch.zeros(64, dtype=torch.int8, device=DEVICE)
 
-    def natural(self, prev, closed):
-        """The 'model': keeps thinking (never closes on its own); after </think> it writes text."""
+    def natural(self, context):
+        """The 'model' at the position after ``context``: keeps thinking (never closes on its own); after a
+        </think> it writes a blank line and, 30% of the time, a second one (what forced closes did 0.5% of the time
+        on G4), then text."""
+        st = self.state
+        if st.end_id in context:
+            after = len(context) - 1 - context.index(st.end_id)
+            if after == 0:
+                return st.nn_id if self.rng.random() < 0.9 else self.rng.choice(self.words)
+            if after == 1 and context[-1] == st.nn_id and self.rng.random() < 0.3:
+                return st.nn_id
+            return self.rng.choice(self.words)
         r = self.rng.random()
         if r < 0.08:
-            return self.state.nl_id
+            return st.nl_id
         if r < 0.16:
             return self.rng.choice(self.ws)
         return self.rng.choice(self.words)
@@ -136,15 +148,16 @@ class Sim:
                 cand[i, 0] = last[r.rid]
                 for j in range(1, k):  # drafts: sometimes the very tokens the close needs
                     x = self.rng.random()
-                    cand[i, j] = (st.nl_id if x < 0.2 else st.end_id if x < 0.35
+                    cand[i, j] = (st.nl_id if x < 0.2 else st.end_id if x < 0.35 else st.nn_id if x < 0.5
                                   else self.rng.choice(self.words))
             logits = torch.zeros(bs * k, self.vocab, device=DEVICE)
             # the natural distribution of each row: one dominant token
-            closed_now = {r.rid: st.end_id in committed[r.rid] for r in reqs}
             nat = torch.zeros(bs, k, dtype=torch.int64)
             for i, r in enumerate(reqs):
                 for j in range(k):
-                    nat[i, j] = self.natural(int(cand[i, j]), closed_now[r.rid])
+                    # row j sees the committed tokens (ending in candidates[:, 0]) and the drafts up to j
+                    context = committed[r.rid] + [int(c) for c in cand[i, 1 : j + 1]]
+                    nat[i, j] = self.natural(context)
                     logits[i * k + j, nat[i, j]] += 100.0
             batch = SimpleNamespace(reqs=reqs, req_pool_indices=torch.tensor([r.kv.req_pool_idx for r in reqs],
                                                                              device=DEVICE))
@@ -174,14 +187,21 @@ class Sim:
         return committed
 
 
-def round_trips(tokenizer, toks, end_id):
-    """generated text == what the template renders from the parsed reasoning (the session replay criterion)"""
-    assert toks.count(end_id) == 1, f"{toks.count(end_id)} </think> in the output"
+def round_trips(tokenizer, toks, state, cls):
+    """generated text == what the template renders (the session replay criterion): the reasoning ends in one newline
+    after a non-whitespace character, and the close is followed by exactly one blank line and then something that
+    is not whitespace"""
+    assert toks.count(state.end_id) == 1, f"{toks.count(state.end_id)} </think> in the output"
     text = tokenizer.decode(toks, skip_special_tokens=False)
     reasoning, _, _ = text.partition("</think>")
     # the template renders "<think>\n" + reasoning|trim + "\n</think>"; the sim may start on whitespace, which is the
     # model's own business, so only the end is checked
-    return reasoning.endswith("\n") and len(reasoning) > 1 and reasoning[:-1] == reasoning[:-1].rstrip()
+    ok_reasoning = reasoning.endswith("\n") and len(reasoning) > 1 and reasoning[:-1] == reasoning[:-1].rstrip()
+    after = toks[toks.index(state.end_id) + 1 :]
+    assert len(after) >= 2, after
+    banned = {tb.CLS_NL, tb.CLS_WS, tb.CLS_PAD}
+    ok_after = after[0] == state.nn_id and cls[after[1]] not in banned and after[1] != state.start_id
+    return ok_reasoning and ok_after
 
 
 @pytest.mark.parametrize("seed", range(25))
@@ -195,7 +215,7 @@ def test_close_round_trips_once(tokenizer, budget_cls, seed, lag):
     committed = sim.run(reqs, steps=45)
     for r in reqs:
         toks = committed[r.rid]
-        assert round_trips(tokenizer, toks, state.end_id), tokenizer.decode(toks[-40:])
+        assert round_trips(tokenizer, toks, state, cls), tokenizer.decode(toks[-40:])
         cut = toks.index(state.end_id)
         assert state.budget <= cut <= state.budget + 4 * 8, cut  # a few steps for whitespace waits and the lag
         assert not r.arc_think_armed and r.arc_think_open is False
@@ -267,3 +287,46 @@ def test_rejection_sampling_commits_a_forced_row(fused, token):
         first = predicts.view(bs, k)[:, 0]
         assert torch.equal(first, torch.full_like(first, token)), first.tolist()
         assert torch.equal(accept_num.bool(), match), (accept_num.tolist(), match.tolist())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the rejection-sampling kernels are Triton")
+@pytest.mark.parametrize("fused", [True, False])
+def test_rejection_sampling_respects_a_masked_row(fused):
+    """The row after a forced </think>\\n\\n masks whitespace, <think>, </think>: never committed, even when the model
+    (and the draft) put almost all mass on a second blank line."""
+    from sglang.kernels.ops.speculative.reject_sampling import (
+        chain_speculative_sampling_sparse_q_from_logits,
+        chain_speculative_sampling_sparse_q_triton,
+    )
+
+    torch.manual_seed(1)
+    bs, k, vocab, support = 8, 4, 248320, 16
+    dev = "cuda"
+    banned = torch.tensor([198, 271, 220, 1022, 248068, 248069], device=dev)
+    logits = torch.randn(bs, k, vocab, device=dev)
+    logits[:, 0, 271] = 30.0  # the double blank line the model wanted
+    logits[:, 0, banned] = float("-inf")
+    candidates = torch.randint(0, vocab, (bs, k), device=dev)
+    candidates[:, 1] = 271  # and the drafter proposed it
+    draft_ids = torch.randint(0, vocab, (bs, k - 1, support), device=dev)
+    draft_ids[:, :, 0] = candidates[:, 1:]
+    draft_q = torch.softmax(torch.randn(bs, k - 1, support, device=dev), dim=-1)
+    retrive_index = torch.arange(bs * k, device=dev).view(bs, k)
+    temps = torch.full((bs, 1), 0.7, device=dev)
+    for _ in range(50):
+        predicts = torch.zeros(bs * k, dtype=torch.int32, device=dev)
+        accept_index = torch.full((bs, k), -1, dtype=torch.int32, device=dev)
+        accept_num = torch.zeros(bs, dtype=torch.int32, device=dev)
+        common = dict(predicts=predicts, accept_index=accept_index, accept_token_num=accept_num,
+                      candidates=candidates, retrive_index=retrive_index, uniform_samples=torch.rand(bs, k, device=dev),
+                      uniform_samples_for_final_sampling=torch.rand(bs, device=dev), draft_ids=draft_ids,
+                      draft_q=draft_q)
+        if fused:
+            chain_speculative_sampling_sparse_q_from_logits(logits=logits, temperatures=temps, **common)
+        else:
+            chain_speculative_sampling_sparse_q_triton(target_probs=torch.softmax(logits / temps[:, :, None], -1),
+                                                       **common)
+        first = predicts.view(bs, k)[:, 0].to(torch.int64)
+        assert not torch.isin(first, banned).any(), first.tolist()
+        assert (first < vocab - 1).all(), first.tolist()
+        assert not accept_num.any()
