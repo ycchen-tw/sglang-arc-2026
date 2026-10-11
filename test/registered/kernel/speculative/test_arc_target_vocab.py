@@ -57,6 +57,15 @@ def test_expand(tables):
         tv.expand(compact[:, :128], vocab)
 
 
+def test_zero_rows(tables):
+    """An attention-DP IDLE batch reaches the logits path with 0 rows: the pair's gathered [N, 0, w] shards reshape to
+    [0, N * w] (LogitsProcessor._get_logits, sharded_verify.gather_full) and expand to [0, vocab]."""
+    vocab, _ = tables
+    shards = torch.empty((2, 0, 128), dtype=torch.bfloat16, device="cuda")
+    full = tv.expand(shards.permute(1, 0, 2).reshape(0, 2 * 128), vocab)
+    assert full.shape == (0, vocab)
+
+
 def test_unaligned_list_refused():
     with pytest.raises(ValueError):
         tv.build_tables(_ids(1000, 200, 1), 1000, 2, 0, "cuda")  # 200 rows do not split into 2 x 64k

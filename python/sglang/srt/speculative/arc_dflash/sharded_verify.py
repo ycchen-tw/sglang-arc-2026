@@ -370,7 +370,7 @@ def gather_full(logits_output):
         raise RuntimeError(f"vocab shard {tuple(local.shape)} x {n} != {logits_output.next_token_logits_global_vocab_size}")
     shards = torch.empty((n, *local.shape), dtype=local.dtype, device=local.device)
     group.all_gather_into_tensor(shards, local.contiguous())
-    full = shards.permute(1, 0, 2).reshape(local.shape[0], -1)
+    full = shards.permute(1, 0, 2).reshape(local.shape[0], n * local.shape[-1])
     if target_vocab.active():  # compact shards -> full-width rows, -inf off the list
         full = target_vocab.expand(full, target_vocab.tables()["vocab"])
     full = full.float()

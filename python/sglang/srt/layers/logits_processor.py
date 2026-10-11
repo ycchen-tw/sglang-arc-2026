@@ -899,8 +899,9 @@ class LogitsProcessor(nn.Module):
                 dtype=logits.dtype,
             )
             attn_tp_all_gather_into_tensor(compact, logits.contiguous())
+            # explicit width: an attention-DP IDLE batch has 0 rows
             logits = self._arc_tv.expand(
-                compact.permute(1, 0, 2).reshape(logits.shape[0], -1),
+                compact.permute(1, 0, 2).reshape(logits.shape[0], n * logits.shape[-1]),
                 self.vocab_size,
             )
         elif self.do_tensor_parallel_all_gather:
