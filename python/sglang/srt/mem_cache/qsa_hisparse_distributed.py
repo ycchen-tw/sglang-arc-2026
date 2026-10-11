@@ -24,6 +24,19 @@ def tp4_attention_enabled() -> bool:
     return value == "1"
 
 
+def packed_gdn_state_admitted() -> bool:
+    """h24's packed GDN state (ARC_GDN_STATE_FMT; unset or empty is off, gdn_state_fmt.current() parses the rest)
+    on this shape only with ARC_GDN_STATE_FMT_DISTRIBUTED=1. Nothing here reads the state's format: snapshots, parks
+    and restores move a mamba slot's bytes as the pool lays them out (MambaPool.host_slot_layout follows the pool
+    tensors, the host admission prices host_slot_nbytes, the verify commit tracks into staging slots through
+    launch_track_packed) and the attention-TP consensus never looks at GDN state. But h24 has run with HiSparse on one
+    GPU (G4) and with TP2 off HiSparse (PC 2x4090) only, never on this shape: the flag is the run that validates it."""
+    value = os.environ.get("ARC_GDN_STATE_FMT_DISTRIBUTED", "0")
+    if value not in ("0", "1"):
+        raise ValueError(f"ARC_GDN_STATE_FMT_DISTRIBUTED must be 0 or 1, got {value!r}")
+    return os.environ.get("ARC_GDN_STATE_FMT", "") == "" or value == "1"
+
+
 def distributed_shape_needs(view) -> dict[str, bool]:
     """Admit h25 fallback or the explicitly gated h29 NEXTN3 shape."""
     user = json.loads(view.hisparse_config) if view.hisparse_config else {}
@@ -41,8 +54,8 @@ def distributed_shape_needs(view) -> dict[str, bool]:
         "ARC_HISPARSE_DISTRIBUTED: --mamba-ssm-dtype float16":
             view.mamba_ssm_dtype == "float16",
         "ARC_HISPARSE_DISTRIBUTED: --dtype bfloat16": view.dtype == "bfloat16",
-        "ARC_HISPARSE_DISTRIBUTED: no packed GDN state":
-            os.environ.get("ARC_GDN_STATE_FMT", "fp16") == "fp16",
+        "ARC_HISPARSE_DISTRIBUTED: no packed GDN state (ARC_GDN_STATE_FMT) unless ARC_GDN_STATE_FMT_DISTRIBUTED=1":
+            packed_gdn_state_admitted(),
         "ARC_HISPARSE_DISTRIBUTED: no ReplaySSM-spec":
             spec or not view.enable_linear_replayssm_spec,
         "ARC_HISPARSE_DISTRIBUTED: even --max-running-requests":

@@ -226,7 +226,16 @@ def quantize_scatter(x: torch.Tensor, pool: torch.Tensor, dst: torch.Tensor, fmt
 
 
 def check_server_args(cfg) -> None:
-    """Refuse every configuration h24 was not built for (called from attention_hook with h20's check)."""
+    """Refuse every configuration h24 was not built for (called from attention_hook with h20's check).
+
+    Tensor parallelism, with or without attention DP, is allowed: the GDN value and key heads are split over the
+    attention-TP ranks (Mamba2StateShape.create(tp_world_size=attn_tp_size), RadixLinearAttention's num_*_heads), and
+    a packed block is one (slot, head) with nothing shared between heads (per-head scales, Hadamard blocks inside a
+    head's value axis), so a rank's pool [layers, slots, HV / attn_tp, NB] is its heads' slice of the one-GPU pool and
+    every kernel touches its own heads only: a head-sliced run is bitwise the slice of the full run
+    (test/registered/attention/unittests/gdn/test_gdn_state_fmt_tp.py). Context parallelism splits one sequence's
+    state over ranks and was never run with a packed state. Distributed QSA HiSparse has its own gate
+    (qsa_hisparse_distributed.distributed_shape_needs)."""
     fmt = current()
     if fmt is None:
         return
@@ -234,7 +243,8 @@ def check_server_args(cfg) -> None:
         "ARC_GDN_FOLD_IN_VERIFY=1 (the h20 verify is the only kernel that folds a packed state)": os.environ.get(
             "ARC_GDN_FOLD_IN_VERIFY", "0") == "1",
         "--mamba-ssm-dtype float16 (the kernels' activation-side state dtype)": cfg.mamba_ssm_dtype == "float16",
-        "--tp-size 1": cfg.tp_size == 1,
+        "no context parallelism (--dcp-size 1 --attn-cp-size 1; never run with a packed state)": cfg.dcp_size == 1
+        and cfg.attn_cp_size == 1,
         "speculative decoding (every decode step is a ReplaySSM verify)": cfg.speculative_algorithm is not None,
         "no --enable-hierarchical-cache": not cfg.enable_hierarchical_cache,
         "no --enable-int8-mamba-checkpoint": not cfg.enable_int8_mamba_checkpoint,
