@@ -146,13 +146,21 @@ class SubsetPairHead(nn.Module):
         if rows < self.MIN_ROWS:
             raise RuntimeError(f"ARC_DFLASH_DRAFT_VOCAB: this rank holds {rows} of the {ids.numel()} draft ids "
                                f"(< {self.MIN_ROWS}); the list does not span the group's vocabulary shards")
-        self.register_buffer("sub", torch.cat(weights).contiguous(), persistent=False)
+        # Zero rows up to a multiple of 64, sliced off before the top-k: an odd row count (17,131 on an L4 pair rank)
+        # leaves the logits' row stride unaligned and cuBLAS falls back to an align1 kernel (L4 654 us per draft
+        # step; 4090 215 -> 138 us padded).
+        sub = torch.cat(weights)
+        self.rows = sub.shape[0]
+        pad = -self.rows % 64
+        if pad:
+            sub = torch.cat([sub, sub.new_zeros(pad, sub.shape[1])])
+        self.register_buffer("sub", sub.contiguous(), persistent=False)
         self.register_buffer("map", torch.cat(maps), persistent=False)
         self.vocab, self.group = vocab, group
 
     def topk(self, x, k: int):
         flat = x.reshape(-1, x.shape[-1])
-        v, local = F.linear(flat, self.sub).topk(k, -1)
+        v, local = F.linear(flat, self.sub)[:, : self.rows].topk(k, -1)
         i = self.map[local]
         if self.group.world_size > 1:
             v, i = self.group.all_gather(v.contiguous(), dim=-1), self.group.all_gather(i.contiguous(), dim=-1)
