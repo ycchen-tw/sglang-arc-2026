@@ -5,7 +5,8 @@ TP4 target, attention DP2, pairs): the target's lm_head is vocab-sharded over al
 rows of its counterparts in the other DP groups (read from the target checkpoint), takes the top-k of what it holds,
 and the group merges by all-gather: `PairHead`. Both expose topk(x, k) -> (values, ids) over the full vocabulary,
 which is all the proposal step (state_pool.fast_propose) reads. ARC_DFLASH_DRAFT_VOCAB restricts either to a fixed
-id list (`SubsetHead`, `SubsetPairHead`).
+id list (`SubsetHead`, `SubsetPairHead`). Under ARC_TARGET_VOCAB the target head holds a slice of a kept-id list
+(target_vocab.py) and the drafter's subset head takes its rows from that slice.
 """
 
 from __future__ import annotations
@@ -17,6 +18,8 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+from sglang.srt.speculative.arc_dflash import target_vocab
 
 
 # arc-forge ARC_DFLASH_FAST_TOPK (opt-in, default 0): the vocabulary top-k of TargetHead / PairHead by fast_topk
@@ -135,13 +138,17 @@ class SubsetPairHead(nn.Module):
     MIN_ROWS = 64  # every rank must hold at least the draft top-k
 
     def __init__(self, parts, ids: torch.Tensor, vocab: int, group):
+        """parts: (weight [rows, H], row_ids [rows] int64 vocabulary ids) this rank scores; the listed ids among them
+        are kept, in row order."""
         super().__init__()
         weights, maps = [], []
-        for w, first in parts:
-            sel = ids[(ids >= first) & (ids < first + w.shape[0])]
-            if sel.numel():
-                weights.append(w.index_select(0, sel - first))
-                maps.append(sel)
+        for w, row_ids in parts:
+            if row_ids.shape != (w.shape[0],):
+                raise ValueError(f"SubsetPairHead: weight {tuple(w.shape)} with row ids {tuple(row_ids.shape)}")
+            pos = torch.isin(row_ids, ids).nonzero().squeeze(1)
+            if pos.numel():
+                weights.append(w.index_select(0, pos))
+                maps.append(row_ids[pos])
         rows = sum(m.numel() for m in maps)
         if rows < self.MIN_ROWS:
             raise RuntimeError(f"ARC_DFLASH_DRAFT_VOCAB: this rank holds {rows} of the {ids.numel()} draft ids "
@@ -187,6 +194,8 @@ def build_head(target_model, model_dir: Path, device, vocab: int, hidden: int, g
     head = getattr(target_model, "lm_head", None)
     if head is None or head.weight.dtype != torch.bfloat16 or head.weight.shape[1] != hidden:
         raise RuntimeError(f"target lm_head is not a BF16 [*, {hidden}] matrix: {head}")
+    if target_vocab.is_pruned(head):
+        return _pruned_target_head(head, vocab, group)
     si = head.shard_indices
     own = (si.org_vocab_start_index, si.org_vocab_end_index)
     if own == (0, vocab):
@@ -228,4 +237,26 @@ def build_head(target_model, model_dir: Path, device, vocab: int, hidden: int, g
     if edge != vocab:
         raise RuntimeError(f"lm_head spans {spans} stop at {edge}, vocab {vocab}")
     ids = draft_vocab(vocab, device)
-    return PairHead(parts, vocab, group) if ids is None else SubsetPairHead(parts, ids, vocab, group)
+    if ids is None:
+        return PairHead(parts, vocab, group)
+    return SubsetPairHead([(w, torch.arange(first, first + w.shape[0], device=w.device)) for w, first in parts],
+                          ids, vocab, group)
+
+
+def _pruned_target_head(head, vocab: int, group):
+    """ARC_TARGET_VOCAB: the target head holds this rank's slice of the kept ids (target_vocab.prune_lm_head); the
+    draft vocabulary must lie inside the list, and each draft id is then on exactly one rank of the group."""
+    t = target_vocab.tables()
+    if group.world_size != t["n"] or group.rank_in_group != t["rank"]:
+        raise RuntimeError(f"ARC_TARGET_VOCAB: drafter group rank {group.rank_in_group}/{group.world_size}, target "
+                           f"head sliced for {t['rank']}/{t['n']}")
+    ids = draft_vocab(vocab, head.weight.device)
+    if ids is None:
+        raise RuntimeError("ARC_TARGET_VOCAB needs ARC_DFLASH_DRAFT_VOCAB (the drafter proposes inside the target list)")
+    off = ids[t["g2c"][ids] < 0]
+    if off.numel():
+        raise RuntimeError(f"ARC_DFLASH_DRAFT_VOCAB: {off.numel()} draft ids are not in ARC_TARGET_VOCAB, e.g. "
+                           f"{off[:5].tolist()}")
+    if head.weight.shape[0] != t["mine"].numel():
+        raise RuntimeError(f"ARC_TARGET_VOCAB: head {tuple(head.weight.shape)} vs {t['mine'].numel()} kept rows")
+    return SubsetPairHead([(head.weight, t["mine"])], ids, vocab, group)

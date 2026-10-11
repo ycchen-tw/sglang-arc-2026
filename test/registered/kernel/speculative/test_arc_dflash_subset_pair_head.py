@@ -21,7 +21,7 @@ def test_subset_pair_head_padding(n_ids):
     vocab, hidden = 1000, 256
     weight = torch.rand(vocab, hidden, generator=g, device="cuda").to(torch.bfloat16)
     ids = torch.randperm(vocab, generator=g, device="cuda")[:n_ids].sort().values
-    head = SubsetPairHead([(weight, 0)], ids, vocab, types.SimpleNamespace(world_size=1))
+    head = SubsetPairHead([(weight, torch.arange(vocab, device="cuda"))], ids, vocab, types.SimpleNamespace(world_size=1))
     assert head.sub.shape[0] % 64 == 0 and head.rows == n_ids
     x = -torch.rand(3, 5, hidden, generator=g, device="cuda").to(torch.bfloat16)  # every real logit < 0
     top, picked = head.topk(x, 64)

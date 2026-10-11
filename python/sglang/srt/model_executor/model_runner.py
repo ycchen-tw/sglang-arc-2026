@@ -1319,6 +1319,15 @@ class ModelRunner:
                 is_ep_joiner=get_exec().moe.is_ep_joiner,
             )
 
+        # arc-forge ARC_TARGET_VOCAB: restrict the target lm_head to a fixed output vocabulary, before CUDA graphs and
+        # the DFlash drafter (whose subset head reads this one)
+        from sglang.srt.speculative.arc_dflash import target_vocab as _arc_tv
+
+        if _arc_tv.path() is not None and not self.is_draft_worker:
+            from pathlib import Path
+
+            _arc_tv.prune_lm_head(self.model, Path(self.model_config.model_path), self.model_config.vocab_size)
+
         self._arc_drop_checkpoint_pages_after_load()
 
     def _arc_drop_checkpoint_pages_after_load(self):

@@ -27,6 +27,9 @@ broadcast as before.
 Batches this does not cover fall back to gathering the shards first (gather_full) and the stock path: greedy, top-k,
 top-p, min-p, penalties, logit bias, grammar, seeded sampling, logprobs, target-only verify, trees. The codex harness
 (/v1/responses with --sampling-defaults openai: temperature 0.7, top_p 1, no top_k) takes the sharded path.
+
+Under ARC_TARGET_VOCAB (target_vocab.py) the shards are a compact id space: sample maps the drafter's ids in (off the
+list -> -1, p = 0) and its draws back out, gather_full scatters the compact logits into full-width rows of -inf.
 """
 
 from __future__ import annotations
@@ -37,6 +40,8 @@ import os
 import torch
 import triton
 import triton.language as tl
+
+from sglang.srt.speculative.arc_dflash import target_vocab
 
 logger = logging.getLogger(__name__)
 
@@ -365,7 +370,10 @@ def gather_full(logits_output):
         raise RuntimeError(f"vocab shard {tuple(local.shape)} x {n} != {logits_output.next_token_logits_global_vocab_size}")
     shards = torch.empty((n, *local.shape), dtype=local.dtype, device=local.device)
     group.all_gather_into_tensor(shards, local.contiguous())
-    full = shards.permute(1, 0, 2).reshape(local.shape[0], -1).float()
+    full = shards.permute(1, 0, 2).reshape(local.shape[0], -1)
+    if target_vocab.active():  # compact shards -> full-width rows, -inf off the list
+        full = target_vocab.expand(full, target_vocab.tables()["vocab"])
+    full = full.float()
     logits_output.next_token_logits = full
     logits_output.next_token_logits_vocab_start = None
     logits_output.next_token_logits_global_vocab_size = None
@@ -399,6 +407,10 @@ def sample(verify_input, batch, logits_output, grammar_mask):
         raise RuntimeError(f"ARC_SHARDED_VERIFY: chain verify expects max_tree_depth {K}, got {verify_input.max_tree_depth}")
     candidates = verify_input.draft_token.reshape(bs, K).to(torch.int64).contiguous()
     q_ids = q_ids.contiguous()
+    pruned = target_vocab.active()
+    if pruned:  # ARC_TARGET_VOCAB: the shards are a compact id space; an id off the list becomes -1 (p = 0)
+        candidates = target_vocab.to_compact(candidates)
+        q_ids = target_vocab.to_compact(q_ids)
     q_probs = q_probs.float().contiguous()
     temps = batch.sampling_info.temperatures.view(-1).float().contiguous()
     mine = shard_summary(local, temps, candidates, q_ids, lo, vocab)
@@ -409,6 +421,8 @@ def sample(verify_input, batch, logits_output, grammar_mask):
     coin_final = torch.rand((bs,), dtype=torch.float32, device=candidates.device)
     predict, accept_index, num_correct = chain_verify(both, local.shape[-1], candidates, q_ids, q_probs,
                                                       verify_input.retrieve_index, coins, coin_final)
+    if pruned:
+        predict = target_vocab.to_vocab(predict)
     if group.world_size > 1:
         group.broadcast(predict, src=0)
         group.broadcast(accept_index, src=0)
