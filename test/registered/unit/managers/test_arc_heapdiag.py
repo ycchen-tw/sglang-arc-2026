@@ -36,13 +36,26 @@ def test_snapshot_and_deep_dump():
             return "n/a"
 
     bad = [BadSizeof() for _ in range(3)]
+    from torch._subclasses.fake_tensor import FakeTensorMode  # torch.compile leaves these: no data pointer
+
+    with FakeTensorMode():
+        fake = torch.empty(8, 8)
+    import weakref
+
+    class Target:
+        pass
+
+    gone = Target()
+    dead = [weakref.proxy(gone)]  # a dead proxy raises on any attribute, isinstance included
+    del gone
     out = arc_heapdiag.deep(libc, trim=True)
-    assert ["BadSizeof", 3] in out["py_objects_unsized"]
+    assert ["BadSizeof", 3] in out["py_objects_unsized"] and out["weakref_proxies_skipped"] >= 1
+    assert any(name == "FakeTensor" and n >= 1 for name, n in out["tensor_subclasses_skipped"])
     json.dumps(out)  # one log line
     assert out["torch_cpu_in_heap"]["count"] >= 1 and out["torch_cpu_in_heap"]["bytes"] >= keep.numel() * 4
     assert any(t == "list" and n >= 1 and b >= 80000 for t, n, b in out["py_objects_ge_4k"])
     assert out["trim"]["after"]["heap_size"] > 0 and isinstance(out["trim"]["released"], bool)
-    del blob, bad
+    del blob, bad, fake, dead
 
 
 def test_start_is_off_without_the_env(monkeypatch):

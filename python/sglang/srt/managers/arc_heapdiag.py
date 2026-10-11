@@ -30,6 +30,7 @@ import tempfile
 import threading
 import time
 import warnings
+import weakref
 import xml.etree.ElementTree as ET
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,8 @@ logger = logging.getLogger(__name__)
 TICK_S = 60
 TOP = 12
 BIG_OBJECT_BYTES = 4096
+# a weakref proxy forwards every attribute (isinstance's __class__, __sizeof__) to its referent and raises once that is gone
+_PROXIES = (weakref.ProxyType, weakref.CallableProxyType)
 _MI2_FIELDS = ("arena", "ordblks", "smblks", "hblks", "hblkhd", "usmblks", "fsmblks", "uordblks", "fordblks",
                "keepcost")
 _state = {"late_s": None, "t0": None}
@@ -148,10 +151,21 @@ def deep(libc, trim: bool):
         return path or f"anon {(hi - lo) >> 20} MiB"
 
     torch = sys.modules.get("torch")
-    storages, by_type, seen, unsized = {}, {}, set(), {}
+    storages, by_type, seen, unsized, subclass, proxies = {}, {}, set(), {}, {}, [0]
+    plain = () if torch is None else (torch.Tensor, torch.nn.Parameter)
+
+    def sized(o, t):
+        """sys.getsizeof by the object's type only: no attribute of o is read (proxies, compile leftovers)."""
+        if t in _PROXIES:
+            proxies[0] += 1
+            return -1
+        size = sys.getsizeof(o, -1)  # -1: its __sizeof__ is missing or returns a non-int (seen on the L4 tree)
+        if size < 0:
+            unsized[t.__name__] = unsized.get(t.__name__, 0) + 1
+        return size
 
     def count(o, size):
-        e = by_type.setdefault(type(o).__name__, [0, 0])
+        e = by_type.setdefault(type(o).__name__, [0, 0])  # type(): never reads o's attributes
         e[0] += 1
         e[1] += size
 
@@ -159,25 +173,24 @@ def deep(libc, trim: bool):
         warnings.simplefilter("ignore")
         objs = gc.get_objects()
         for o in objs:
-            if torch is not None and isinstance(o, torch.Tensor):
-                if o.device.type == "cpu" and o.layout == torch.strided:
+            t = type(o)
+            if torch is not None and issubclass(t, torch.Tensor):
+                if t not in plain:  # FakeTensor / FunctionalTensor (torch.compile leftovers) have no data pointer
+                    subclass[t.__name__] = subclass.get(t.__name__, 0) + 1
+                elif o.device.type == "cpu" and o.layout == torch.strided:
                     st = o.untyped_storage()
                     if st.data_ptr():
                         storages.setdefault(st.data_ptr(), (st.nbytes(), list(o.shape), str(o.dtype)))
                 continue
-            size = sys.getsizeof(o, -1)  # -1: its __sizeof__ is missing or returns a non-int (seen on the L4 tree)
-            if size < 0:
-                unsized[type(o).__name__] = unsized.get(type(o).__name__, 0) + 1
-            elif size >= BIG_OBJECT_BYTES:
+            size = sized(o, t)
+            if size >= BIG_OBJECT_BYTES:
                 count(o, size)
         for i in range(0, len(objs), 20000):  # untracked referents: bytes, str, numpy arrays, ...
             for r in gc.get_referents(*objs[i:i + 20000]):
                 if gc.is_tracked(r) or id(r) in seen:
                     continue
-                size = sys.getsizeof(r, -1)
-                if size < 0:
-                    unsized[type(r).__name__] = unsized.get(type(r).__name__, 0) + 1
-                elif size >= BIG_OBJECT_BYTES:
+                size = sized(r, type(r))
+                if size >= BIG_OBJECT_BYTES:
                     seen.add(id(r))
                     count(r, size)
         n_objs = len(objs)
@@ -197,6 +210,8 @@ def deep(libc, trim: bool):
         "torch_cpu_in_heap": {"count": len(in_heap), "bytes": sum(x[0] for x in in_heap), "top": in_heap[:TOP]},
         "py_objects_ge_4k": sorted(([k, v[0], v[1]] for k, v in by_type.items()), key=lambda x: -x[2])[:TOP],
         "py_objects_unsized": sorted(([k, n] for k, n in unsized.items()), key=lambda x: -x[1])[:TOP],
+        "tensor_subclasses_skipped": sorted(([k, n] for k, n in subclass.items()), key=lambda x: -x[1])[:TOP],
+        "weakref_proxies_skipped": proxies[0],
         "walk_s": round(time.time() - t0, 2),
     })
     if trim:
