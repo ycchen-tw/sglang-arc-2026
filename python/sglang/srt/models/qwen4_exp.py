@@ -1215,7 +1215,23 @@ class Qwen4ExpPLELayer(nn.Module):
 
         if batch.mode.is_target_verify():
             intermediate_cache = pool.short_conv_layer_intermediate_cache(self.layer_id)
-            if intermediate_cache is not None:
+            from sglang.kernels.ops.qwen4_ple import (
+                can_fuse_qwen4_short_conv_verify_window,
+                fused_qwen4_short_conv_verify_window,
+            )
+
+            if (
+                intermediate_cache is not None
+                and self.short_conv_state_len
+                and can_fuse_qwen4_short_conv_verify_window(
+                    conv_input, batch.valid_tokens, intermediate_cache, batch.row_width
+                )
+            ):
+                # One launch, same bytes as the chain below (L4 C96 verify: ~0.97 -> ~0.15 ms per step).
+                fused_qwen4_short_conv_verify_window(
+                    conv_input, batch.valid_tokens, intermediate_cache, batch.row_width
+                )
+            elif intermediate_cache is not None:
                 if self.short_conv_state_len:
                     intermediate_state = (
                         conv_input.unfold(2, self.short_conv_state_len, 1)[
