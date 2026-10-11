@@ -111,14 +111,17 @@ def _humming():
 class HummingW4A8Linear(nn.Module):
     """One drafter linear as Humming INT4 weights x per-token FP8 activations (ARC_DFLASH_W4A8).
 
-    Always on Humming's batch-invariant tuning (no stream-K, a fixed K reduction): an attention-TP group's ranks run the
-    replicated drafter ops each on their own and must propose the same tokens. Humming's default heuristic splits K
-    across CTAs (stream-K) for K > 1024, and its fix-up order varies run to run -- the L4 pair diverged within a minute
-    (ARC_SPEC_AGREE_DEVICE); on a 4090 the default gave 0/30 equal repeats for down_proj at M=48 and q_proj at M=384,
-    the batch-invariant configs 30/30 for every shape, at about the same speed for M <= 384.
+    batch_invariant selects Humming's batch-invariant tuning (no stream-K, a fixed K reduction), for a linear that
+    every rank of the attention-TP group computes on the same input (the replicated FFN): the ranks must propose the
+    same tokens, and Humming's default heuristic splits K across CTAs (stream-K) for K > 1024 with a fix-up order that
+    varies run to run -- the L4 pair diverged within a minute (ARC_SPEC_AGREE_DEVICE); on a 4090 the default gave 0/30
+    equal repeats for down_proj at M=48 and q_proj at M=384, the batch-invariant configs 30/30 for every shape. A
+    rank's own attention slice (q/k/v rows, o_proj columns) only feeds its part of the o_proj all-reduce, which every
+    rank receives whole, so it keeps the default heuristic: with every linear batch-invariant the L4 draft step was
+    0.86 ms slower than with FP8.
     """
 
-    def __init__(self, weight: torch.Tensor, spec):
+    def __init__(self, weight: torch.Tensor, spec, *, batch_invariant: bool):
         super().__init__()
         dtype, zero_point, group, _ = spec
         if weight.dtype != torch.bfloat16 or weight.ndim != 2 or weight.device.type != "cuda":
@@ -137,7 +140,8 @@ class HummingW4A8Linear(nn.Module):
         hm = hm.to(weight.device)
         hm.transform()
         self.hm = hm
-        self.tuning = json.dumps(HummingLayerMethod.get_default_tuning_configs(hm, use_batch_invariant=True))
+        self.batch_invariant = batch_invariant
+        self.tuning = json.dumps(HummingLayerMethod.get_default_tuning_configs(hm, use_batch_invariant=batch_invariant))
         self.in_features, self.out_features = k, n
 
     def forward(self, x):

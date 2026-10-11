@@ -37,10 +37,12 @@ def test_dequant_block_fp8():
 @pytest.mark.skipif(not torch.cuda.is_available() or not os.environ.get("ARC_HUMMING_DIR"),
                     reason="needs a GPU and ARC_HUMMING_DIR (unpacked humming-kernels)")
 @pytest.mark.parametrize("spec", [("int4", False, 128, "all"), ("uint4", True, 64, "all")])
-def test_humming_w4a8_linear(spec):
+@pytest.mark.parametrize("batch_invariant", [True, False])
+def test_humming_w4a8_linear(spec, batch_invariant):
     torch.manual_seed(0)
     weight = (torch.randn(1024, 2560, device="cuda") * 0.02).to(torch.bfloat16)
-    lin = fp8.HummingW4A8Linear(weight, spec)
+    lin = fp8.HummingW4A8Linear(weight, spec, batch_invariant=batch_invariant)
+    assert lin.batch_invariant is batch_invariant
     assert (lin.out_features, lin.in_features) == (1024, 2560)
     x = torch.randn(3, 128, 2560, device="cuda", dtype=torch.bfloat16)
     ref = x.float() @ weight.float().T
@@ -50,18 +52,19 @@ def test_humming_w4a8_linear(spec):
     assert err < 0.15, err  # INT4 RTN on Gaussian weights: ~0.11 at group 128
     assert lin(x[:0]).shape == (0, 128, 1024)
     with pytest.raises(ValueError, match="BF16"):
-        fp8.HummingW4A8Linear(weight.float(), spec)
+        fp8.HummingW4A8Linear(weight.float(), spec, batch_invariant=batch_invariant)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not os.environ.get("ARC_HUMMING_DIR"),
                     reason="needs a GPU and ARC_HUMMING_DIR (unpacked humming-kernels)")
 @pytest.mark.parametrize("n,k,m", [(2560, 10240, 48), (6144, 2560, 384), (10240, 2560, 512)])
 def test_humming_w4a8_is_deterministic_and_batch_invariant(n, k, m):
-    """The pair's two ranks compute the replicated drafter ops each on their own: every repeat must be bitwise equal
-    (Humming's default stream-K was not: down_proj K=10240 at M=48, q_proj at M=384), and a row's output must not
-    depend on the rows batched with it."""
+    """The pair's two ranks compute the replicated drafter ops (the FFN) each on their own: with batch_invariant every
+    repeat must be bitwise equal (Humming's default stream-K was not: down_proj K=10240 at M=48, q_proj at M=384), and a
+    row's output must not depend on the rows batched with it."""
     torch.manual_seed(0)
-    lin = fp8.HummingW4A8Linear((torch.randn(n, k, device="cuda") * 0.02).to(torch.bfloat16), ("int4", False, 128, "all"))
+    lin = fp8.HummingW4A8Linear((torch.randn(n, k, device="cuda") * 0.02).to(torch.bfloat16), ("int4", False, 128, "all"),
+                                batch_invariant=True)
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     ref = lin(x).clone()
     for _ in range(20):

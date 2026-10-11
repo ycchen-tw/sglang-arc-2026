@@ -289,7 +289,7 @@ def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, 
     model.embed_tokens = TargetEmbedding(target_model.get_input_embeddings())
     model.lm_head = nn.Module()  # replaced below
     model = model.to_empty(device=device).to(torch.bfloat16)
-    loaded, fp8_modules, served_fp8, w4a8_modules = set(), [], [], []
+    loaded, fp8_modules, served_fp8, w4a8_modules, w4a8_invariant = set(), [], [], [], []
     for filename in manifest["files"]:
         with safe_open(str(directory / filename), framework="pt", device=str(device)) as f:
             keys = set(f.keys())
@@ -314,8 +314,13 @@ def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, 
                         value, scale = narrow_fp8(value, scale, cut)
                     parent, _, child = name.rpartition(".")
                     if w4a8 is not None and (w4a8[3] == "all" or ".mlp.routed." in name):
-                        module = HummingW4A8Linear(dequant_block_fp8(value, scale), w4a8)
+                        # every rank computes a whole (unsliced) linear on the same input: bitwise equal or the
+                        # group's proposals diverge; a rank's attention slice feeds only its o_proj all-reduce part
+                        module = HummingW4A8Linear(dequant_block_fp8(value, scale), w4a8,
+                                                   batch_invariant=size > 1 and cut is None)
                         w4a8_modules.append(name)
+                        if module.batch_invariant:
+                            w4a8_invariant.append(name)
                     else:
                         module = Fp8BlockLinear(value, scale)
                         served_fp8.append(name)
@@ -365,6 +370,7 @@ def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, 
         model.config = replace(c, num_attention_heads=heads, num_key_value_heads=kv)
     model.fp8_modules = tuple(served_fp8)
     model.w4a8_modules = tuple(w4a8_modules)
+    model.w4a8_batch_invariant = tuple(w4a8_invariant)
     model.w4a8_spec = w4a8
     model.compile_mode = fast_drafter.install(model, replicas=size, device=device)
     return model.eval().requires_grad_(False)
@@ -524,7 +530,8 @@ class DFlashDraftWorker:
             local = [f"fp8 {len(self.model.fp8_modules)} linears"]
             if self.model.w4a8_modules:
                 dtype, zero_point, group, scope = self.model.w4a8_spec
-                local.append(f"w4a8 {dtype}{'z' if zero_point else ''}:{group}:{scope} {len(self.model.w4a8_modules)} linears")
+                local.append(f"w4a8 {dtype}{'z' if zero_point else ''}:{group}:{scope} {len(self.model.w4a8_modules)} linears"
+                             f" ({len(self.model.w4a8_batch_invariant)} batch-invariant)")
             sel = self.model.candidate_selector
             local.append(f"selector rows {sel.predecessor_codebook.shape[0]}/{sel.successor_codebook.shape[0]}")
         else:
