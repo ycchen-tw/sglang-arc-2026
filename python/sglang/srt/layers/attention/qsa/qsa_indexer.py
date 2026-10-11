@@ -18,7 +18,12 @@ from sglang.srt.layers.attention.qsa.metadata import (
     build_pending_ring_slots,
     build_rope_position_matrix,
 )
-from sglang.srt.layers.attention.qsa.mqa import qsa_mqa_decode, qsa_mqa_prefill
+from sglang.srt.layers.attention.qsa.mqa import (
+    qsa_mqa_decode,
+    qsa_mqa_prefill,
+    qsa_prefill_local_tiles,
+    tilelang_qsa_mqa_prefill_local,
+)
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
@@ -43,6 +48,8 @@ def _env_flag(name: str) -> bool:
 # fixes only the order: ties and threshold-bin overflow still change the set,
 # so a bitwise end-to-end comparison needs ARC_QSA_TOPK_EXACT=1 (fast_topk.py).
 _ARC_QSA_TOPK_SORT = _env_flag("ARC_QSA_TOPK_SORT")
+# b200-perf-prefill (b): prefill scores in sequence-local columns (select_prefill_tokens_local)
+_ARC_QSA_INDEXER_LOCAL = _env_flag("ARC_QSA_INDEXER_LOCAL")
 # Eager-only HiSparse checks of the selection the swap-in kernel consumes.
 _ARC_HISPARSE_QSA_DEBUG = _env_flag("ARC_HISPARSE_QSA_DEBUG")
 
@@ -608,6 +615,78 @@ class QSAIndexer(MultiPlatformOp):
             del logits, block_indices, selected
         return output
 
+    def select_prefill_tokens_local(
+        self,
+        q: torch.Tensor,
+        compressed_keys: torch.Tensor,
+        row_starts: torch.Tensor,
+        row_ends: torch.Tensor,
+        query_positions: torch.Tensor,
+        sequence_lengths_for_rows: torch.Tensor,
+        metadata,
+    ) -> torch.Tensor:
+        """ARC_QSA_INDEXER_LOCAL: select_prefill_tokens with each row's logits in its own
+        sequence's coordinates ([rows, longest visible] instead of [rows, all keys of the
+        batch]), written once by a column-split kernel that applies the scale and the -inf
+        mask itself (no zero fill, divide or mask pass). The scores in a row's range are the
+        same bits as the global layout's, so the top-k is too (exactly so under
+        ARC_QSA_TOPK_EXACT=1; the production kernel's order and tie choice vary run to run
+        either way)."""
+        extend_lens = metadata.prefill_extend_lens_cpu
+        seq_lens = metadata.prefill_seq_lens_cpu
+        if extend_lens is None or seq_lens is None:
+            raise RuntimeError("ARC_QSA_INDEXER_LOCAL needs the extend's host lengths in the indexer metadata")
+        rows = q.shape[0]
+        if sum(extend_lens) != rows:
+            raise RuntimeError(f"ARC_QSA_INDEXER_LOCAL: {rows} query rows, host extend lengths sum to {sum(extend_lens)}")
+        if not q.is_cuda:
+            raise RuntimeError("ARC_QSA_INDEXER_LOCAL is a CUDA (TileLang) path")
+        output = torch.empty(
+            (rows, self.token_topk + self.compress_ratio - 1), dtype=torch.int32, device=q.device
+        )
+        if rows == 0:
+            return output
+        row_lens = (row_ends - row_starts).to(torch.int32)
+        heads = q.shape[1]
+        block_q = max(1, 128 // heads)
+        _, width_all = qsa_prefill_local_tiles(
+            extend_lens, seq_lens, self.compress_ratio, 0, rows, block_q
+        )
+        row_chunk_size = _qsa_prefill_row_chunk_size(rows, max(width_all, 1), heads)
+        for row_start in range(0, rows, row_chunk_size):
+            row_end = min(row_start + row_chunk_size, rows)
+            chunk_slice = slice(row_start, row_end)
+            tiles, width = qsa_prefill_local_tiles(
+                extend_lens, seq_lens, self.compress_ratio, row_start, row_end, block_q
+            )
+            if compressed_keys.shape[0] == 0 or width == 0:
+                block_indices = torch.full(
+                    (row_end - row_start, self.block_topk), -1, dtype=torch.int32, device=q.device
+                )
+            else:
+                logits = tilelang_qsa_mqa_prefill_local(
+                    q[chunk_slice], compressed_keys, row_lens[chunk_slice], tiles, width
+                )
+                block_indices = qsa_fast_topk(
+                    logits,
+                    torch.zeros_like(row_lens[chunk_slice]),
+                    row_lens[chunk_slice],
+                    topk=self.block_topk,
+                )
+                if _ARC_QSA_TOPK_SORT:
+                    block_indices = _sort_topk_blocks(block_indices)
+                del logits
+            output[chunk_slice].copy_(
+                expand_qsa_block_indices(
+                    block_indices,
+                    query_positions[chunk_slice],
+                    sequence_lengths_for_rows[chunk_slice],
+                    compress_ratio=self.compress_ratio,
+                    token_topk=self.token_topk,
+                )
+            )
+        return output
+
     def select_decode_tokens(
         self,
         q: torch.Tensor,
@@ -888,6 +967,16 @@ class QSAIndexer(MultiPlatformOp):
         row_sequence_lengths = sequence_lengths.index_select(
             0, query_sequence_ids.long()
         )
+        if _ARC_QSA_INDEXER_LOCAL:
+            return self.select_prefill_tokens_local(
+                q,
+                compressed_keys,
+                row_starts,
+                row_ends,
+                logical_positions,
+                row_sequence_lengths,
+                indexer_metadata,
+            )
         return self.select_prefill_tokens(
             q,
             compressed_keys,

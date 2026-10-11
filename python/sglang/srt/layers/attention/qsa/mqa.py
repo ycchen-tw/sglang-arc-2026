@@ -266,6 +266,86 @@ if HAS_TILELANG:
 
         return kernel
 
+    @tilelang.jit(
+        pass_configs={
+            tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+            tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+            tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        }
+    )
+    def _tilelang_qsa_mqa_prefill_local_kernel(
+        heads: int,
+        head_dim: int,
+        block_n: int = 64,
+        block_q: int = 32,
+        num_stages: int = 3,
+        threads: int = 512,
+        keys_per_cta: int = 1024,
+    ):
+        """ARC_QSA_INDEXER_LOCAL: _tilelang_qsa_mqa_prefill_kernel's score tile (same GEMM, ReLU
+        and head sum per element) over a sequence-local [rows, width] matrix. A tile is up to
+        block_q rows of ONE sequence (Tiles: first row, rows, the sequence's first key, the
+        visible blocks of its last row); the grid also splits the columns (keys_per_cta each).
+        Every element is written once: score * Inv for col < RowLen[row], -inf otherwise, so
+        no zero fill, divide or mask pass follows."""
+        rows = T.dynamic("rows")
+        padded = T.dynamic("padded")
+        keys = T.dynamic("keys")
+        width = T.dynamic("width")
+        tiles = T.dynamic("tiles")
+
+        @T.prim_func
+        def kernel(
+            Q: T.Tensor([padded * heads, head_dim], T.bfloat16),  # type: ignore
+            K: T.Tensor([keys, head_dim], T.bfloat16),  # type: ignore
+            Logits: T.Tensor([rows, width], T.float32),  # type: ignore
+            Tiles: T.Tensor([tiles, 4], T.int32),  # type: ignore
+            RowLen: T.Tensor([rows], T.int32),  # type: ignore
+            Inv: T.float32,
+        ):
+            with T.Kernel(tiles, T.ceildiv(width, keys_per_cta), threads=threads) as (bx, by):
+                q_shared = T.alloc_shared([block_q * heads, head_dim], T.bfloat16)
+                k_shared = T.alloc_shared([block_n, head_dim], T.bfloat16)
+                scores = T.alloc_fragment([block_n, block_q * heads], T.float32)
+                scores_3d = T.reshape(scores, (block_n, block_q, heads))
+                reduced = T.alloc_fragment([block_n, block_q], T.float32)
+                row_base = Tiles[bx, 0]
+                n_rows = Tiles[bx, 1]
+                key_base = Tiles[bx, 2]
+                tile_len = Tiles[bx, 3]
+                col0 = by * keys_per_cta
+                col_end = T.min(col0 + keys_per_cta, width)
+                n_iter = T.max(T.ceildiv(T.min(col_end, tile_len) - col0, block_n), 0)
+
+                T.copy(Q[row_base * heads, 0], q_shared)
+                for ni in T.Pipelined(n_iter, num_stages=num_stages):
+                    T.copy(K[key_base + col0 + ni * block_n, 0], k_shared)
+                    T.gemm(
+                        k_shared,
+                        q_shared,
+                        scores,
+                        transpose_B=True,
+                        clear_accum=True,
+                        policy=T.GemmWarpPolicy.FullCol,
+                    )
+                    for n, qi, head in T.Parallel(block_n, block_q, heads):
+                        scores_3d[n, qi, head] = T.max(scores_3d[n, qi, head], 0.0)
+                    T.reduce_sum(scores_3d, reduced, dim=-1, clear=True)
+                    for qi, n in T.Parallel(block_q, block_n):
+                        col = col0 + ni * block_n + n
+                        if qi < n_rows and col < col_end:
+                            Logits[row_base + qi, col] = T.if_then_else(
+                                col < RowLen[row_base + qi],
+                                reduced[n, qi] * Inv,
+                                -T.infinity(T.float32),
+                            )
+                fill = col0 + n_iter * block_n
+                for qi, c in T.Parallel(block_q, keys_per_cta):
+                    if qi < n_rows and fill + c < col_end:
+                        Logits[row_base + qi, fill + c] = -T.infinity(T.float32)
+
+        return kernel
+
     @tilelang.jit
     def _tilelang_qsa_mqa_mask_kernel(threads: int = 512, block_k: int = 4096):
         rows = T.dynamic("rows")
@@ -734,6 +814,71 @@ def tilelang_qsa_mqa_prefill(
     logits = logits[:rows]
     logits.div_(score_scale or math.sqrt(head_dim))
     _tilelang_qsa_mqa_mask_kernel()(logits, starts[:rows], ends[:rows])
+    return logits
+
+
+def qsa_prefill_local_inverse_scale(score_scale: float):
+    """The fp32 factor torch's ``logits.div_(score_scale)`` multiplies by: a CPU-scalar divide
+    on CUDA is ``a * (1 / b)`` with b cast to float and the reciprocal taken in float."""
+    import numpy as np
+
+    return float(np.float32(1.0) / np.float32(score_scale))
+
+
+def qsa_prefill_local_tiles(
+    extend_lens, seq_lens, ratio: int, row_begin: int, row_end: int, block_q: int
+):
+    """Host tile plan of ARC_QSA_INDEXER_LOCAL for the query rows [row_begin, row_end) of an
+    extend batch (rows in sequence order): per tile (first row - row_begin, rows, the
+    sequence's first compressed key, visible blocks of the tile's last row), and the width
+    (largest visible count). Row j of sequence b sits at position seq_b - extend_b + j and sees
+    min((pos + 1) // ratio, seq_b // ratio) blocks (build_qsa_row_ranges)."""
+    tiles, width, row0, key0 = [], 0, 0, 0
+    for e, s in zip(extend_lens, seq_lens):
+        lo, hi = max(row0, row_begin), min(row0 + e, row_end)
+        blocks = s // ratio
+        prefix = s - e
+        for r in range(lo, hi, block_q):
+            n = min(block_q, hi - r)
+            last = min((prefix + (r + n - 1 - row0) + 1) // ratio, blocks)
+            tiles.append((r - row_begin, n, key0, last))
+            width = max(width, last)
+        row0 += e
+        key0 += blocks
+    return tiles, width
+
+
+def tilelang_qsa_mqa_prefill_local(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    row_lens: torch.Tensor,
+    tiles,
+    width: int,
+    score_scale: Optional[float] = None,
+) -> torch.Tensor:
+    """ARC_QSA_INDEXER_LOCAL: [rows, width] logits with row r's visible blocks at columns
+    [0, row_lens[r]) (scaled exactly as ``tilelang_qsa_mqa_prefill`` scales them) and -inf
+    after; ``tiles``/``width`` from ``qsa_prefill_local_tiles``."""
+    if not HAS_TILELANG:
+        raise RuntimeError("TileLang is unavailable")
+    _validate_q(q)
+    _validate_k(k)
+    rows, heads, head_dim = q.shape
+    block_q = max(1, 128 // heads)
+    if width <= 0 or not tiles:
+        raise ValueError(f"local prefill logits need a positive width and tiles, got {width}, {len(tiles)}")
+    # tiles read block_q query rows from their first row on; the last may run past the batch
+    q_padded = torch.cat([q.to(torch.bfloat16), q.new_zeros((block_q, heads, head_dim), dtype=torch.bfloat16)])
+    logits = torch.empty((rows, width), dtype=torch.float32, device=q.device)
+    tile_t = torch.tensor(tiles, dtype=torch.int32, pin_memory=True).to(q.device, non_blocking=True)
+    _tilelang_qsa_mqa_prefill_local_kernel(heads=heads, head_dim=head_dim, block_q=block_q)(
+        q_padded.reshape(-1, head_dim),
+        k[:, 0].to(torch.bfloat16).contiguous(),
+        logits,
+        tile_t,
+        row_lens.to(torch.int32).contiguous(),
+        qsa_prefill_local_inverse_scale(score_scale or math.sqrt(head_dim)),
+    )
     return logits
 
 

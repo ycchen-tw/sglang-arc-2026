@@ -187,3 +187,56 @@
   - `ARC_DFLASH_ATTN_TP=1`（既有旗標；serve 腳本在 TP>1 預設 0，因為 TP4 切不了 drafter 的 2 個 KV head，TP2 可以切）：每個 rank 只算一半的 query／KV head（q／k／v／o_proj 與 ring attention 減半，o_proj 後 all-reduce）。r8（r5＋這項，GPU 0,1）對 r5：draft −0.61 ms（中位；bs 80–87 −0.55 → 120–128 −0.65），verify −0.03；accept 3.151、server log 無錯。不逐位（多一次 all-reduce 的加法順序），drafter 專屬。
   - 合計：drafter 五項（r0 → r5）draft −1.32 ms／cycle（中位；bs 80–87 −1.00、96–103 −1.55、120–127 −1.31），加 `ATTN_TP=1` 再 −0.61；target 兩項 verify −1.22。對 round 1 的 c1B（同卡對、不同時段）：換卡第 2 輪的 B 臂（drafter 五項＋HC＋fold，沒有 ATTN_TP）總 cycle −2.60 ms（draft −1.30、verify −1.17），bs 104–111 是 36.98 → 34.37 ms（−7.0%）。單卡 bench 的 drafter step（五項全開）bs 128 5.39 → 4.09、104 5.38 → 3.82、80 4.23 → 3.37 ms；剩下的 eager 4.16 ms 裡 ring 0.84、bf16 GEMM 約 1.75、gate 乘法的 transpose kernel 0.16、gather／index 約 0.4。
   - 給 RL 的建議：逐位的五項（`ARC_DFLASH_GRAPH_SIZES` 那串、`ARC_DFLASH_RING_OUT_T=1`、`ARC_DFLASH_BATCHED_COMMIT=1`、`ARC_HC_GATE_PRECOMPUTE=1`、`ARC_GDN_FOLD_COMMIT_COMPACT=1`）直接預設打開；只影響 drafter 的四項（`ARC_DFLASH_RING_TILE=auto`、`ARC_DFLASH_FUSED_PROPOSE=1`、`ARC_DFLASH_FAST_TOPK=1`、TP2 的 `ARC_DFLASH_ATTN_TP=1`）改的是提案、不是 target 的分佈（rejection sampling），accept 在各臂的範圍內（3.135–3.156），也建議打開。沒做的：r6／r7 的依序臂（改用換卡對量）、r0b 的漂移複測（收尾時取消）；候選：gate 乘法併進 ring kernel（約 −0.1 ms）、drafter 的 dense GEMM 在 sm_100 走 FP8（現在 bf16 約 1.75 ms）。
+- **QSA prefix chunk prefill 的聯集讀取（`ARC_QSA_UNION_PREFILL=1`）**（branch `exp/b200-perf-prefill`，2026-10-09；opt-in，預設 0，沒設時行為不變；`qsa/union_prefill.py`；arc-forge `docs/research/qwen38fn_b200_rollout_perf_20261008.md` 的候選 (a)）：
+  - 原本：`_sparse_gqa_chunk_prefill` 每個 (query, kv head) 一個 program，各自 gather 自己選中的 2,051 個 key（512 個 4-token block＋最多 3 個 tail）。相鄰 query 選的 block 大多相同，但每條各讀一次；之前還要先把整段 context 用 index_select＋cat 複製成緊密的一份（`_extend_context`）。
+  - 開旗標：同一序列相鄰 T 條 query 成一個 tile（預設 T＝10：TP2 每個 kv head 12 個 q head，10×12＝120 列填進 128 列的 MMA）。每層三個 kernel：
+    1. `_union_scatter`：每條 query 把自己選中的 block 寫進自己的 bitmap（每個 tile T 張，`ceil(seq/4/32)` 個 word；block 從 `expand_qsa_block_indices` 的排列直接讀：第 4j 欄是 block 起點、第 4j+3 欄有效才是完整 block，tail 至多 3 格所以不會被當成 block）。
+    2. `_union_compact`：每個 tile 把 T 張 bitmap 的 OR 壓成遞增的 block 清單，每個 block 帶「哪幾條 query 選了它」的 T-bit mask 與 4 個 pool slot（req_to_token 在這裡查，attention 迴圈的 gather 只依賴一次 load）。
+    3. `_union_attention`：每個 (tile, kv head) 一個 program、T×12 列 query，沿聯集清單每步讀 32 個 block（128 key）的 K/V **一次**，直接從 FP8 pool 讀（不再做 `_extend_context`），對每一列遮掉它沒選的 key 做 online softmax，最後一步做 tail（query p 的 tail＝`[floor((p+1)/4)·4, p]`，與 expansion kernel 同一個公式）。
+    每條 query 看到的 key 多重集合與 chunk kernel 完全相同（Q 的預乘、FP8→bf16 的轉換也相同），只有 online softmax 的累加分段不同，所以**不逐位**。
+  - `ARC_QSA_UNION_PREFILL_CFG=T,NB,warps,stages`（預設 `10,32,8,1`）：真流量 dump 上掃過 T∈{5,8,10,16}、NB∈{8,16,32,64}、warps∈{4,8,16}、stages∈{1,2,3}：16 warps 會掉回 mma.sync 且大量 spill（慢 20×）；T=16 超過 TMEM；NB=32 配 2 stages 超過 shared memory；T=10/NB=32/8 warps/1 stage 最快（tcgen05，255 regs、~100 spill）。
+  - `ARC_QSA_UNION_PREFILL=check`：每層同時跑 chunk kernel 比對（每層 host sync，只用來驗證），任何非有限值、或某個 (列, head) 輸出差超過該列 max |ref| 的 1/16 就 raise（錯的 key 集合是 O(1) 的差，累加順序只有幾個 bf16 ulp），每 100 層印最大比值。
+  - 只支援一般 FP8／BF16 pool、沒有 QSA HiSparse；NVFP4 KV 或 HiSparse 開旗標會 raise。暫存：每個 forward 一份 tile 計畫，bitmap＋清單（生產形狀 ~6 MB；8k token 的 chunk 接 250k context 約 150 MB）。
+  - debug：`ARC_QSA_PREFILL_DUMP=<dir>`（`_MAX`、`_LAYERS`、`_MIN_ROWS`、`_MIN_SEQS`、`_MIN_PREFIX`）存下 chunk kernel 的輸入（TP rank 0），給 `scripts/arc/qsa_union_prefill_bench.py dump` 用；會 host sync，只用在 debug run。
+  - 正確性：
+    - 測試 `test/registered/unit/layers/test_qsa_union_prefill.py`（7 個，CUDA 或 `TRITON_INTERPRET=1`）：block 數多於／少於 top-k、extend 不是 T 的倍數、1 token 的 extend、兩個 kv head、T＝3/5/10、打亂的 pool（req_to_token 是排列）、indices 帶 padding 列；對 float64 的誤差須不超過 chunk kernel 的 2 倍。負對照：拿掉 tail 或丟掉每列第一個 block 時誤差 0.56／0.64（正常 7.5e-4），測試會抓到。
+    - CUDA（B200）上第一次跑：6 個過 4 個。沒過的 2 個是測試自己用了 NB×ratio＜16（每步 8 個 key）：tl.dot 在 CUDA 上要求 K≥16，interpreter 不檢查，所以 CPU 會過、CUDA 編譯失敗。已改成 `union_prefill_attention` 遇到 NB×ratio＜16 直接 raise，並加一個測試；那兩個 case 改成 NB≥4。**改過的測試只在 CPU interpreter 重跑過（7 個全過），CUDA 重跑在收尾時取消了。** 部署設定 NB＝32（每步 128 key）不受影響；下面的 server check 模式與 dump 比對都是在 CUDA 上跑的。
+    - 真流量 dump（16 groups codex harness，每條 prefix ≥4096 的 extend，3 個 batch × layer 3/23/47）對 float64：union 與 chunk kernel 的誤差分布相同（p50 2.4–2.7e-3、p99 3.6–4.6e-3、max 5.1–8.8e-3，兩者逐項相同或差在第三位），union 與 chunk kernel 之間最大差 6.5–7.8e-3（相對該列尺度）。
+    - server 上 `check` 模式（TP2 FP8 DFlash K4 BCG，32 條 8–16k prompt 的 prefix extend）：兩個 rank 各 1,000+ 層比完，最大 |diff|/scale 7.8e-3、平均 1.3e-3，0 次 raise。
+    - parity（`scripts/arc/qwen4_exp_prefill_parity.py`：32 條 8–16k prompt，prefix 逐條暖好後 extend 704–767 token，看 extend 區段每個位置的 prompt logprob 與 top-5；兩次 32 條同時送、一次 16 條逐條送；結果 `qwen38fn_b200_perf/20261009-prepar-*`）：
+      - 確定性旗標（`ARC_QSA_TOPK_EXACT=1 SGLANG_FLASHINFER_MOE_FUSED_FINALIZE=0 ARC_HC_MIX_DETERMINISTIC=1`）＋`--random-seed 1234`（pA2 對 pU2，16 條 11,608 個位置）：union 對舊路徑逐條送 |Δlp| p50 1.0e-3、p90 0.28、p99 1.41、max 6.07、mean 0.097、top-1 一致 0.964、top-5 集合一致 0.487；floor（同一個舊 server 同時送對逐條送）p50 8.7e-4、p90 0.26、p99 1.38、max 4.36、mean 0.092、top-1 0.963、top-5 0.498。|Δlp| 在 floor 的 1.5 倍內，top-5 集合低 0.011（gate 只有這一項 ✗）；同時送的兩次 union 對舊路徑都在 floor 內。
+      - 部署設定（不開確定性旗標，pP1／pP2／pPU）：舊路徑兩次 server 啟動之間逐條送 p50 1.09e-3、p90 0.30、p99 1.43、max 6.14、mean 0.101、top-1 0.962、top-5 0.458；union 對舊路徑 p50 1.03e-3、p90 0.30、p99 1.50、max 5.43、mean 0.102、top-1 0.961、top-5 0.452，gate 全過。union 與舊路徑之間的差，和舊路徑自己兩次之間的差（production fast_topk 每次順序／同分取捨不同）一樣大。
+  - 時間：
+    - kernel（真流量 dump，每層 µs，chunk kernel＋context gather → union 全部〔zero＋scatter＋compact＋attention〕）：8 條×~1k new、prefix 4096：3,189–3,311 → 1,124–1,265（2.5–2.8×）；4 條×~1.3k、prefix 4608：2,243 → 760–920（2.4–3.0×）；3 條×1.8k、prefix 4.6–5.1k：2,232 → 1,001（2.2×）。union 的 key 數是 T×每條 2,049 的 0.14–0.18（每個聯集 key 平均被 10 條裡 5.5–7 條用到）。
+    - 固定形狀 torch trace（`qwen4_exp_extend_profile.py`，random-word prompt，BCG，xprof r1 xA vs xU）：QSA attention（chunk＋gather）p10k 14.6 → 9.3 ms（`_union_attention` 8.6＋scatter／compact 0.2＋其餘 0.4），pmix 15.8 → 12.5，p45k 16.8 → 13.8；每批 target GPU（telemetry，無 profiler）77.8 → 72.6、91.0 → 86.5、101.2 → 96.3 ms；kernel 合計（trace，扣掉 all-reduce 等待）70.7 → 65.0、82.5 → 78.7、91.7 → 88.2 ms。random-word prompt 的選取比真流量分散（聯集大），所以這裡的收益比 dump 小；prefix 越長聯集越大，收益越小。
+    - 真 harness：只有兩項一起開對對照的量測，見下一項之後的 telemetry 項。只開本項的那一臂（tU）和對照不在同樣的主機負載下，不能用（原因也在那一項）。
+    - 剩下的空間（估計，未做）：`_union_attention` 每個 program 佔一個 SM（255 regs × 256 threads 吃滿暫存器檔），stages＝1 沒有軟體 pipeline，gather → FP8 轉 bf16 → smem → MMA → softmax 全部串行。b0-l3（800 個 program、5.4 波、每 tile 23 步）每步 128 key 約 8 µs；同一步的 QK＋PV MMA 以單 SM 峰值約 1.1 µs，64 KB FP8 gather 以平均分到的 HBM 頻寬約 1.2 µs。改用 TMA gather4（一個 block 正好 4 列）加 warp specialization，把 load 和 MMA／softmax 重疊起來，估計還能快 2–3 倍（p10k 每批再省約 4–5 ms）。
+- **QSA indexer prefill 的序列區域分數（`ARC_QSA_INDEXER_LOCAL=1`）**（branch `exp/b200-perf-prefill`，2026-10-09；opt-in，預設 0，沒設時行為不變；候選 (b)）：
+  - 原本：`select_prefill_tokens` 的 logits 是 [列數, 整批所有序列的 compressed key 總數] fp32：整張 `torch.zeros`、TileLang score kernel（grid 只有 列數/32 個 CTA，一個 tile 跨序列時算兩序列的聯集範圍）、整張 `div_`、mask kernel 把範圍外寫 −inf，再 fast_topk 帶 row_starts。矩陣隨「列數 × 整批 prefix 總和」長，超過 128 MiB 就切 row chunk（pmix 6 段、p45k 8 段，每段重做四步）。
+  - 開旗標：logits 改成 [列數, 本 chunk 最長的可見 block 數]，每列用自己序列的區域座標。新的 `_tilelang_qsa_mqa_prefill_local_kernel`：tile 只含同一序列的 ≤32 列（host 從 scheduler 的長度算 tile 表：首列、列數、序列的首個 key、tile 最後一列的可見 block 數；不讀 GPU），grid 再沿欄切（每 CTA 1,024 欄）；每個元素只寫一次：範圍內＝分數 × fp32(1/fp32(√128))（torch 對 CPU 純量的 `div_` 就是乘這個倒數），範圍外 −inf；不 zero、不 div、不 mask。top-k 從第 0 欄起。需要 indexer metadata 帶 extend 的 host 長度（`prefill_extend_lens_cpu`／`prefill_seq_lens_cpu`，backend 從 scheduler 的 CPU 長度填），沒有就 raise；只有 CUDA＋TileLang。
+  - GEMM／ReLU／head 加總的 tile 形狀、運算與原 kernel 相同，所以範圍內的分數**逐位相同**：`scripts/arc/qsa_indexer_local_bench.py`（p10k、p10k_1408、pmix、p45k、6 條不等長）每列範圍內逐位相同、範圍外全 −inf、`ARC_QSA_TOPK_EXACT=1` 的 top-k 完全相同、production fast_topk 選到的集合相同（它自己的順序與同分取捨本來就每次不同：pmix 舊路徑對自己 0.9996）。server 上（上一項的 parity 工具，確定性旗標＋seed，pA2 對 pI2）：逐條送逐位相同（16 條、11,608 個位置 |Δlp| max 0、top-5 集合 1.000、輸出 logprob 0 條不同），第一次同時送在這 16 條上也逐位相同；第二次同時送、以及第一次的 32 條全部，有少數差異（輸出 logprob 3／4 條不同），判讀為 batch 組成不同：同一個舊 server 自己兩次同時送也不逐位（max 2.03）。
+  - 時間（xprof r1 xA vs xI，torch trace 的 QSA indexer 分類 → 每批 target GPU telemetry）：p10k 4.78 → 3.84 ms（77.8 → 77.0）、pmix 15.23 → 5.68（91.0 → 80.9）、p45k 23.35 → 7.22（101.2 → 83.7）；kernel 合計（trace，扣掉 all-reduce 等待）70.7 → 69.7、82.5 → 72.9、91.7 → 75.4 ms。microbench（每層，scores＋top-k＋expansion）：p10k 269 → 195 µs、p10k_1408 550 → 350、pmix 1,136 → 334、p45k 1,813 → 446、6 條不等長 575 → 205。收益隨「整批 key 總數 ÷ 最長序列 key 數」變大：一批裡 prefix 越不齊越多。
+- **上面兩項在真 harness 的 extend telemetry**（2026-10-09；16 groups codex harness × 12 分鐘，前 3 個 60 秒窗不算；GPU 2,3、TP2 FP8 DFlash K4、H1 B 的部署旗標＋RL 帳本、不開確定性旗標；`scripts/arc/extend_telemetry_compare.py`；臂 `qwen38fn_b200_perf/20261009-pre-{tA,tB,tU}-a0`，負載 `qwen38fn_b200_perf/loads/pre-{tA,tB,tU}`）：
+  - tA（對照）對 tB（兩項都開），同一對卡，負載分別在 05:00、05:16 UTC 開始。每批 target GPU ms（n＝batch 數；new token 與 cached prefix 是 bin 內每批的平均，prefix 是整批合計）：
+
+    | bin | tA n | tA ms | tB n | tB ms | 差 | new tok（A／B） | prefix（A／B） |
+    |---|---|---|---|---|---|---|---|
+    | k4+/<1024 | 11 | 58.8 | 12 | 53.8 | −5.0 | 891／860 | 40.5k／41.2k |
+    | k4+/<2048 | 74 | 67.2 | 73 | 60.8 | −6.4（−9.5%） | 1,581／1,504 | 42.7k／45.1k |
+    | **k4+/<4096**（生產形狀） | 94 | 88.9 | 98 | 81.5 | **−7.4（−8.3%）** | 2,748／2,830 | 42.5k／41.6k |
+    | k4+/≥4096 | 107 | 165.0 | 99 | 144.9 | −20.1（−12.2%） | 6,869／6,930 | 27.1k／25.1k |
+    | k3/<1024 | 62 | 51.6 | 37 | 44.1 | −7.5 | 814／806 | 30.9k／30.8k |
+    | k3/<2048 | 78 | 62.5 | 80 | 57.0 | −5.4 | 1,443／1,467 | 29.1k／27.2k |
+    | k3/<4096 | 42 | 85.4 | 57 | 79.6 | −5.8 | 2,812／2,870 | 24.2k／23.3k |
+    | k3/≥4096 | 167 | 171.1 | 156 | 152.2 | −19.0（−11.1%） | 7,889／7,872 | 4.9k／5.0k |
+
+    k1、k2 的 bin：−2.9～+1.7 ms（k1/≥4096 只有 2／5 批，−7.2）。
+  - **沒有同條件的 floor**：重跑一次對照（tA2）的計畫在收尾時取消了。兩臂的主機條件接近：sar 顯示兩段時間都是 50–66% user（192 核）；每批 target CPU ms 相差不到 2 ms（k4+/<4096 是 44.5 對 42.4）。固定形狀上兩項分開量的和：p10k telemetry −6.0 ms、kernel −6.7 ms；pmix −14.6／−13.4。
+  - 只開 union 的 tU（07:00 UTC）不能用來歸因。那時主機只有 27% user（load average 約 67；tA／tB 時 160–185），每批 target CPU ms 比 tA 低 7–10 ms。結果是每個 bin 的 GPU ms 都比 tA 低 4–10 ms，連 union 幾乎沒事做的小 batch 也一樣，而且也比兩項都開的 tB 低。extend 的 GPU ms 包含等 CPU 發 kernel 的空隙（BCG 之外的 eager 段，例如 QSA indexer 與 attention），所以會跟著主機負載走。單項的歸因請用各項「時間」裡的固定形狀 kernel 時間。
+  - gen tok/s（只當 sanity check）：tA 5,972、tB 6,170、tU 6,447。
+- **HC mix 的 prefill epilogue 融合（拒絕，程式碼沒進 branch）**（2026-10-09；候選 (c) 的一部分）：extend 尺寸的 `GatedResidual._mix_compute` 是 torch.compile 出來的兩個 cuBLAS GEMM＋兩個 pointwise，up GEMM 把 4 倍 hidden 寬的 U 寫出去，再讀回來做 sigmoid(U)×Xn 對 4 個分支取平均。試做的 Triton kernel（`ARC_HC_MIX_PREFILL_FUSED`）把這段放進 up GEMM 的 epilogue：每個 output tile 涵蓋 BJ 個 hidden 欄的 4 個分支，在 fp32 累加器上做完，U 不落地。結果：
+  - 時間（乾淨的 GPU 2，每個 HC block）：1,024／2,816／3,072／5,632 列，torch 43／83／93／134 µs，融合 63／121／135／206 µs。生產形狀（2,816 列 × 96 個 HC block）每批慢 3.6 ms。
+  - 誤差：對 float64 略小（2.62e-3 對 2.69e-3）。
+  - server parity（確定性旗標）：top-5 集合一致 0.436，floor 是 0.498。
+  - 沒做的部分：norm＋gate＋combine 整段融合。
+  - patch：`qwen38fn_b200_perf/20261009-pre-scratch/rejected_hc_mix_fused.patch`。
