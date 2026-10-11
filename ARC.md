@@ -38,6 +38,12 @@
 
 同一個 commit 跑在所有平台上，差異用旗標或 GPU 架構分派，預設維持原本行為：
 
+- **遮掉補齊的 vocab**（`ARC_LOGITS_VOCAB_LIMIT=<N>`，2026-10-11，opt-in；沒設時行為不變）：
+  - LogitsProcessor 把 id ≥ N 的 logit 設成 −inf。一般取樣、spec verify 的 rejection sampling（包括 `ARC_RS_FUSED_SOFTMAX` 直接從 logits 算的那條路）、logprob 都在這之後，所以都不會出現這些 id。
+  - 用途：Qwen3.8-FN 的 lm_head 有 248320 列，但 tokenizer 的 id 只到 248077。不截斷的 T=1.0 取樣在約 8.9e7 個 RL 輸出 token 裡抽到過一次 248134，arc-forge 的帳本 audit（`ids_in_vocab`）因此擋下了整個 batch。
+  - N 大於模型的 vocab_size 時，起服就 raise。
+  - drafter 端不用改：它提出補齊 id 時，target 的機率是 0，rejection sampling 不會接受。
+  - 測試：`test/registered/unit/layers/test_arc_logits_vocab_limit.py`。
 - **Responses 的預設溫度**（`ARC_RESPONSES_DEFAULT_TEMPERATURE=<T>`，2026-10-11，opt-in；沒設時行為不變）：
   - `/v1/responses` 的 request 沒送 temperature 時，改用 T 取代類別預設值 0.7。request 自己送的值，以及 `--sampling-defaults model` 的 generation_config，仍然優先。
   - 用途：codex 從不送 temperature，所以 RL rollout 只能靠這個旗標取樣在 T=1.0（arc-forge `configure_b200.py --rollout-temperature`）。

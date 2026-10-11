@@ -15,6 +15,7 @@
 
 import dataclasses
 import logging
+import os
 from contextlib import contextmanager
 from enum import IntEnum
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -409,6 +410,33 @@ class LogitsMetadata:
         )
 
 
+def _arc_logits_vocab_limit() -> Optional[int]:
+    """ARC_LOGITS_VOCAB_LIMIT=N (opt-in; unset = upstream): logits of token ids >= N are set to -inf, so
+    nothing samples, verifies or reports a logprob for them. For a lm_head padded past the tokenizer
+    (Qwen3.8-FN: 248320 rows, tokenizer ids < 248077): untruncated T=1.0 sampling drew padded id
+    248134 once in ~8.9e7 RL output tokens (2026-10-11), an id no tokenizer can decode."""
+    raw = os.environ.get("ARC_LOGITS_VOCAB_LIMIT")
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"ARC_LOGITS_VOCAB_LIMIT must be an integer, got {raw!r}") from None
+    if value <= 0:
+        raise ValueError(f"ARC_LOGITS_VOCAB_LIMIT must be positive, got {raw!r}")
+    return value
+
+
+ARC_LOGITS_VOCAB_LIMIT = _arc_logits_vocab_limit()
+
+
+def arc_mask_padded_vocab(logits: torch.Tensor, limit: Optional[int]) -> torch.Tensor:
+    """In place: logits[..., limit:] = -inf (no-op when limit is None or covers the width)."""
+    if limit is not None and logits.shape[-1] > limit:
+        logits[..., limit:] = float("-inf")
+    return logits
+
+
 class LogitsProcessor(nn.Module):
     def __init__(
         self,
@@ -420,6 +448,10 @@ class LogitsProcessor(nn.Module):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
+        if ARC_LOGITS_VOCAB_LIMIT is not None and ARC_LOGITS_VOCAB_LIMIT > self.vocab_size:
+            raise ValueError(
+                f"ARC_LOGITS_VOCAB_LIMIT {ARC_LOGITS_VOCAB_LIMIT} exceeds the model's vocab_size {self.vocab_size}"
+            )
         self.logit_scale = logit_scale
         self.use_attn_tp_group = get_parallel().enable_dp_lm_head
         self.use_tp_lm_head_all_to_all = get_parallel().enable_tp_lm_head_all_to_all
@@ -1095,7 +1127,7 @@ class LogitsProcessor(nn.Module):
             logits = logits_buffer
         else:
             logits = logits.float()
-        return logits
+        return arc_mask_padded_vocab(logits, ARC_LOGITS_VOCAB_LIMIT)
 
     def _get_dllm_logits(
         self,
