@@ -38,6 +38,11 @@
 
 同一個 commit 跑在所有平台上，差異用旗標或 GPU 架構分派，預設維持原本行為：
 
+- **Responses 的預設溫度**（`ARC_RESPONSES_DEFAULT_TEMPERATURE=<T>`，2026-10-11，opt-in；沒設時行為不變）：
+  - `/v1/responses` 的 request 沒送 temperature 時，改用 T 取代類別預設值 0.7。request 自己送的值，以及 `--sampling-defaults model` 的 generation_config，仍然優先。
+  - 用途：codex 從不送 temperature，所以 RL rollout 只能靠這個旗標取樣在 T=1.0（arc-forge `configure_b200.py --rollout-temperature`）。
+  - `--preferred-sampling-params` 改不了這個值：Responses 一定會自己把 temperature 填好。
+  - 值不是 ≥ 0 的有限數時，import 時就 raise。測試：`test/registered/unit/entrypoints/openai/test_responses_protocol.py`。
 - **HiSparse L4 路徑**（h23–h39：attention DP2、sm_89、分散式 spec、native MTP host KV）：
   - 都用 `ARC_HISPARSE_*`、`ARC_GDN_STATE_FMT`、`ARC_NATIVE_MTP_KV_HOST` 這類旗標控制，或只在 sm_89／DP／TP>1 才會走到。
   - G4（TP1）在 L4 旗標全關時，和 v8 逐位相同：12 條真實 prompt 的 prefill logprob 加 512 步 decode 都一樣，見 arc-forge `work/sglang_fork/`。

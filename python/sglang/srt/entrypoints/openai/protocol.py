@@ -16,6 +16,8 @@
 from __future__ import annotations
 
 import logging
+import math
+import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -71,6 +73,26 @@ except:
     StructuralTag = Any
 
 from sglang.utils import convert_json_schema_to_str
+
+
+def _arc_responses_default_temperature() -> Optional[float]:
+    """ARC_RESPONSES_DEFAULT_TEMPERATURE (opt-in; unset = upstream behaviour): the temperature a
+    /v1/responses request that sends none samples at, in place of the class default 0.7. codex
+    never sends a temperature, so this is how an RL rollout through it samples at T=1.0. A value
+    the request sends, and --sampling-defaults model's generation_config, still take precedence."""
+    raw = os.environ.get("ARC_RESPONSES_DEFAULT_TEMPERATURE")
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(f"ARC_RESPONSES_DEFAULT_TEMPERATURE must be a number, got {raw!r}") from None
+    if not (math.isfinite(value) and value >= 0):
+        raise ValueError(f"ARC_RESPONSES_DEFAULT_TEMPERATURE must be finite and >= 0, got {raw!r}")
+    return value
+
+
+ARC_RESPONSES_DEFAULT_TEMPERATURE = _arc_responses_default_temperature()
 
 logger = logging.getLogger(__name__)
 
@@ -1852,7 +1874,10 @@ class ResponsesRequest(BaseModel):
         temperature = self.temperature
         if temperature is None:
             temperature = default_params.get(
-                "temperature", self._DEFAULT_SAMPLING_PARAMS["temperature"]
+                "temperature",
+                self._DEFAULT_SAMPLING_PARAMS["temperature"]
+                if ARC_RESPONSES_DEFAULT_TEMPERATURE is None
+                else ARC_RESPONSES_DEFAULT_TEMPERATURE,
             )
 
         top_p = self.top_p
