@@ -6,6 +6,8 @@ pinned per device generation, the two measured paths: CUTLASS on sm_120 (G4, as 
 target's ARC_HC_ONLINE_FP8 there). Anything else raises.
 """
 
+import json
+
 import torch
 from torch import nn
 from torch.nn import Parameter
@@ -100,14 +102,21 @@ def _humming():
         raise RuntimeError("ARC_DFLASH_W4A8 needs ARC_HUMMING_DIR (the unpacked humming-kernels)")
     if root not in sys.path:
         sys.path.insert(0, root)
-    from humming.layer import HummingLayer
+    from humming.layer import HummingLayer, HummingLayerMethod
     from humming.schema import HummingInputSchema, HummingWeightSchema
 
-    return HummingLayer, HummingWeightSchema, HummingInputSchema
+    return HummingLayer, HummingLayerMethod, HummingWeightSchema, HummingInputSchema
 
 
 class HummingW4A8Linear(nn.Module):
-    """One drafter linear as Humming INT4 weights x per-token FP8 activations (ARC_DFLASH_W4A8)."""
+    """One drafter linear as Humming INT4 weights x per-token FP8 activations (ARC_DFLASH_W4A8).
+
+    Always on Humming's batch-invariant tuning (no stream-K, a fixed K reduction): an attention-TP group's ranks run the
+    replicated drafter ops each on their own and must propose the same tokens. Humming's default heuristic splits K
+    across CTAs (stream-K) for K > 1024, and its fix-up order varies run to run -- the L4 pair diverged within a minute
+    (ARC_SPEC_AGREE_DEVICE); on a 4090 the default gave 0/30 equal repeats for down_proj at M=48 and q_proj at M=384,
+    the batch-invariant configs 30/30 for every shape, at about the same speed for M <= 384.
+    """
 
     def __init__(self, weight: torch.Tensor, spec):
         super().__init__()
@@ -118,7 +127,7 @@ class HummingW4A8Linear(nn.Module):
         n, k = weight.shape
         if k % group:
             raise ValueError(f"W4A8: K {k} is not a multiple of the group {group}")
-        HummingLayer, HummingWeightSchema, HummingInputSchema = _humming()
+        HummingLayer, HummingLayerMethod, HummingWeightSchema, HummingInputSchema = _humming()
         hm = HummingLayer(shape_n=n, shape_k=k,
                           weight_config=HummingWeightSchema(b_dtype=dtype, weight_scale_group_size=group,
                                                             has_zero_point=zero_point),
@@ -128,6 +137,7 @@ class HummingW4A8Linear(nn.Module):
         hm = hm.to(weight.device)
         hm.transform()
         self.hm = hm
+        self.tuning = json.dumps(HummingLayerMethod.get_default_tuning_configs(hm, use_batch_invariant=True))
         self.in_features, self.out_features = k, n
 
     def forward(self, x):
@@ -135,7 +145,7 @@ class HummingW4A8Linear(nn.Module):
         rows = x.reshape(-1, shape[-1])
         if rows.shape[0] == 0:  # an attention-DP IDLE batch
             return x.new_empty(*shape[:-1], self.out_features)
-        y = self.hm(rows.contiguous())
+        y = self.hm(rows.contiguous(), tuning_config=self.tuning)
         return y.reshape(*shape[:-1], self.out_features)
 
 
