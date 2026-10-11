@@ -42,6 +42,10 @@
   - 只有一個 worker：drafter 跑在這張卡的 attention-TP 群組上。
   - routed experts 預設依 compute capability 選後端：sm_100／sm_120 用 CUTLASS W4A4；sm_89 用 Marlin W4A16，並在群組內做 EP。
   - lm_head：單卡用 `TargetHead`，群組大小大於 1 時用 `PairHead`。
+  - dense drafter 的每卡記憶體（L4 pair）：
+    - attention 切片（q/k/v 依 head 取列）改成 clone：以前 row slice 是 view，整個投影矩陣的 storage 留在每張卡上（每層每卡約 17 MB，5 層約 85 MB）。數值不變。
+    - 開 `ARC_TARGET_VOCAB` 時 selector 的兩個 codebook 只留得到的列（`CandidateSelector.prune`）：predecessor 只會是 target 取樣的 bonus token 或 drafter 提的 token，留 target 清單的列；successor 只會是 draft vocab 的候選，留 draft vocab 的列。查表經 id→列 對照，清單外的 id 對到列尾後一格，torch gather 會報錯。98k／16k 時每卡 254 → 59 MB，分數與 fused chain 的取樣逐位相同（`test_arc_dflash_selector_prune.py`）。
+    - `ARC_DFLASH_W4A8=<int4|uint4z>:<32|64|128>[:<all|mlp>]`（opt-in，預設關）：drafter 的 block FP8 linear 改成 Humming INT4 權重（由 FP8 值 RTN，每 group 一個 scale）× 每 token 動態 FP8 e4m3 activation，sm_89 照樣走 FP8 tensor core、權重 bytes 減半（每卡 FFN 393 → 約 203 MB、attention 125 → 約 64 MB）。4090 上 M=384 每層 387 µs（FP8 387 µs）、M=512 449 µs（FP8 514 µs）；權重相對誤差 g128 約 11%（FP8 2.6%），只改提案，看 accept 與速度。要 `ARC_HUMMING_DIR`（展開的 humming-kernels）與 Humming 的 CUDA root。
 - **PLE 表格式**（從 main 移植到 L4 樹）：
   - `ARC_PLE_NVFP4=1`（opt-in，預設 0；只支援 `--ple-offload-backend pinned`＋FP8 PLE 表）：PLE 表在載入時逐 shard 於 GPU 量化成 NVFP4（e2m1＋每 16 個一個 e4m3 scale，沒有 global scale：來源已是 e4m3），每列 90 B 連續存放，host 47.7 → 26.8 GiB。gather 解碼成 bf16，相對 FP8 列 relRMSE 9.6%、cosine 0.9955；4090 上 gather 比 FP8 快 15%。所有列沒載滿就報錯。`models/arc_ple_nvfp4.py`。
   - `ARC_PLE_INT5=1`（opt-in，預設 0；與 `ARC_PLE_NVFP4` 互斥，同時開起服 raise；同樣只支援 `--ple-offload-backend pinned`＋FP8 PLE 表、寬度須為 16 的倍數）：同一套載入時 GPU 量化，改存對稱 INT5（每 16 個一組、每組一個 e4m3 scale＝amax/15，碼 −15..15 以 code+16 存 5 bit，8 碼 5 byte 小端連續），一列 d·5/8 碼 byte 接 d/16 scale byte 連續存放（d=160 為 110 B），host 47.7 → 32.8 GiB。gather 解碼成 bf16（精確）。EAN320 layer 1 shard_7 前 40 萬列：相對 FP8 列 relRMSE 4.17%（NVFP4 9.59%）、cosine 0.99915；B200 pinned 20M 列隨機 gather 15.8k／131k／524k 列：FP8 150／1,158／4,638 us、NVFP4 117／890／3,536、INT5 128／996／4,074。`models/arc_ple_int5.py`，測試 `test/registered/kernel/embeddings/test_arc_ple_int5_codec.py`＋`test_qwen4_ple_offload.py`。

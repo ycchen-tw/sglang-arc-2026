@@ -222,7 +222,9 @@ def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, 
 
     from safetensors import safe_open
 
-    from .fp8 import BLOCK, AllReduced, Fp8BlockLinear
+    from . import target_vocab
+    from .fp8 import BLOCK, AllReduced, Fp8BlockLinear, HummingW4A8Linear, dequant_block_fp8, w4a8_spec
+    from .heads import draft_vocab
 
     # the runner's device is "cuda" without an index; safetensors would read "cuda" as cuda:0 on every rank (on L4 the
     # other three ranks then put their drafter on GPU 0 and the TP group's KV budget fails there): name this rank's GPU
@@ -266,15 +268,19 @@ def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, 
             return 1, rank * heads * dim, heads * dim
         return None
 
+    # This rank's slice as its own tensor: a row slice (q/k/v) is a contiguous view, and keeping the view kept the
+    # whole projection's storage alive (~17 MB per layer per rank on the L4 pair)
     def narrow(t, cut):
         axis, start, count = cut
-        return t.narrow(axis, start, count)
+        return t.narrow(axis, start, count).clone()
 
     def narrow_fp8(weight, scale, cut):
         axis, start, count = cut
         if start % BLOCK or count % BLOCK:
             raise ValueError(f"attention slice {cut} cuts through a {BLOCK}x{BLOCK} FP8 block")
-        return weight.narrow(axis, start, count), scale.narrow(axis, start // BLOCK, count // BLOCK)
+        return weight.narrow(axis, start, count).clone(), scale.narrow(axis, start // BLOCK, count // BLOCK).clone()
+
+    w4a8 = w4a8_spec()
 
     if quant is not None and quant.get("method") != "block_fp8":
         raise ValueError(f"{directory}: quantization {quant.get('method')!r}; this loader reads block_fp8 only")
@@ -283,7 +289,7 @@ def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, 
     model.embed_tokens = TargetEmbedding(target_model.get_input_embeddings())
     model.lm_head = nn.Module()  # replaced below
     model = model.to_empty(device=device).to(torch.bfloat16)
-    loaded, fp8_modules = set(), []
+    loaded, fp8_modules, served_fp8, w4a8_modules = set(), [], [], []
     for filename in manifest["files"]:
         with safe_open(str(directory / filename), framework="pt", device=str(device)) as f:
             keys = set(f.keys())
@@ -307,8 +313,14 @@ def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, 
                     if cut is not None:
                         value, scale = narrow_fp8(value, scale, cut)
                     parent, _, child = name.rpartition(".")
-                    setattr(model.get_submodule(parent), child, Fp8BlockLinear(value, scale))
-                    fp8_modules.append(name)
+                    if w4a8 is not None and (w4a8[3] == "all" or ".mlp.routed." in name):
+                        module = HummingW4A8Linear(dequant_block_fp8(value, scale), w4a8)
+                        w4a8_modules.append(name)
+                    else:
+                        module = Fp8BlockLinear(value, scale)
+                        served_fp8.append(name)
+                    setattr(model.get_submodule(parent), child, module)
+                    fp8_modules.append(name)  # stored as FP8: the config's quantization record
                 elif cut is not None:  # a BF16 attention projection: this rank's slice replaces the whole matrix
                     linear = model.get_submodule(name)
                     linear.weight = nn.Parameter(narrow(value, cut).contiguous(), requires_grad=False)
@@ -331,6 +343,10 @@ def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, 
     if stray:
         raise RuntimeError(f"{directory}: FP8 modules {stray[:4]} are not declared in config quantization.modules")
     model.lm_head = build_head(target_model, model_dir, device, c.vocab_size, c.hidden_size, group)
+    if target_vocab.is_pruned(getattr(target_model, "lm_head", None)):
+        # predecessors are the target's sampled bonus tokens (inside ARC_TARGET_VOCAB) and drafted tokens, candidates
+        # are draft-vocabulary ids (build_head checked those are inside the target list): the other rows are dead
+        model.candidate_selector.prune(target_vocab.tables()["c2g"].to(device), draft_vocab(c.vocab_size, device))
     if shard:
         # the per-rank heads: the attention modules, the window state pool and the blank states all read them
         AllReduced.forward = torch.compiler.disable(AllReduced.forward)
@@ -340,12 +356,16 @@ def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, 
             want = {"q_proj": (heads * 2 * dim, c.hidden_size), "k_proj": (kv * dim, c.hidden_size),
                     "v_proj": (kv * dim, c.hidden_size), "o_proj": (c.hidden_size, heads * dim)}
             for proj, shape in want.items():
-                got = tuple(getattr(attention, proj).weight.shape)
+                module = getattr(attention, proj)
+                got = ((module.out_features, module.in_features) if isinstance(module, HummingW4A8Linear)
+                       else tuple(module.weight.shape))
                 if got != shape:
                     raise RuntimeError(f"rank {rank}: {proj} is {got} after the attention split, want {shape}")
             attention.o_proj = AllReduced(attention.o_proj, group)
         model.config = replace(c, num_attention_heads=heads, num_key_value_heads=kv)
-    model.fp8_modules = tuple(fp8_modules)
+    model.fp8_modules = tuple(served_fp8)
+    model.w4a8_modules = tuple(w4a8_modules)
+    model.w4a8_spec = w4a8
     model.compile_mode = fast_drafter.install(model, replicas=size, device=device)
     return model.eval().requires_grad_(False)
 
@@ -502,6 +522,11 @@ class DFlashDraftWorker:
         if dense:
             kept = [f"dense {self.model.config.dense_intermediate_size}"] * self.model.config.num_layers
             local = [f"fp8 {len(self.model.fp8_modules)} linears"]
+            if self.model.w4a8_modules:
+                dtype, zero_point, group, scope = self.model.w4a8_spec
+                local.append(f"w4a8 {dtype}{'z' if zero_point else ''}:{group}:{scope} {len(self.model.w4a8_modules)} linears")
+            sel = self.model.candidate_selector
+            local.append(f"selector rows {sel.predecessor_codebook.shape[0]}/{sel.successor_codebook.shape[0]}")
         else:
             experts = [self.model.layers[i].mlp.experts for i in range(self.model.config.num_layers)]
             kept = [len(keep[str(i)]) for i in range(self.model.config.num_layers)]
