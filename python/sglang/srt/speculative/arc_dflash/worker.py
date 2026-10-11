@@ -574,16 +574,19 @@ class DFlashDraftWorker:
         sizes = sorted({s for s in GRAPH_SIZES if s < self.max_running_requests} | {self.max_running_requests})
         begin = time.monotonic()
         free_before = torch.cuda.mem_get_info(self.device)[0]
-        # the group's all-reduce / all-gather inside the graphs go through pynccl, which SGLang enables only here
-        capture = self.group.graph_capture() if self.group.world_size > 1 else contextlib.nullcontext()
         # ARC_DFLASH_SHARED_GRAPH_POOL (default 1): on one rank the drafter graphs go into the target's graph memory
-        # pool on its capture stream (G4 c110: drafter graphs 0.44 -> 0.08 GiB, accept unchanged). Attention-TP
-        # groups (L4) keep their own pool: not validated under the group's graph_capture.
+        # pool on its capture stream (G4 c110: drafter graphs 0.44 -> 0.08 GiB, accept unchanged).
+        # ARC_DFLASH_SHARED_GRAPH_POOL_GROUP (default 0, opt-in): the same on an attention-TP group (L4 pairs); the
+        # group's graph_capture then runs on the target's capture stream as well, so the pool hands the drafter the
+        # target's freed blocks (a block goes back only to the stream that allocated it).
         shared = os.environ.get("ARC_DFLASH_SHARED_GRAPH_POOL", "1")
         if shared not in ("0", "1"):
             raise ValueError(f"ARC_DFLASH_SHARED_GRAPH_POOL must be 0 or 1, got {shared!r}")
+        group_shared = os.environ.get("ARC_DFLASH_SHARED_GRAPH_POOL_GROUP", "0")
+        if group_shared not in ("0", "1"):
+            raise ValueError(f"ARC_DFLASH_SHARED_GRAPH_POOL_GROUP must be 0 or 1, got {group_shared!r}")
         target_pool = target_stream = None
-        if shared == "1" and self.group.world_size == 1:
+        if shared == "1" and (self.group.world_size == 1 or group_shared == "1"):
             from sglang.srt.model_executor.runner_utils import (
                 get_global_graph_memory_pool,
                 get_or_create_global_graph_capture_stream,
@@ -592,6 +595,9 @@ class DFlashDraftWorker:
             target_pool = get_global_graph_memory_pool()  # None when the target runs without CUDA graphs
             if target_pool is not None:
                 target_stream = get_or_create_global_graph_capture_stream()
+        # the group's all-reduce / all-gather inside the graphs go through pynccl, which SGLang enables only here
+        capture = (self.group.graph_capture(stream=target_stream) if self.group.world_size > 1
+                   else contextlib.nullcontext())
         with capture:
             self.pool.capture(sizes, target_pool=target_pool, target_stream=target_stream)
         torch.cuda.synchronize(self.device)
