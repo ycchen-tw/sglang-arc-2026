@@ -59,15 +59,48 @@ def _env_flag(name: str, default: str) -> bool:
 # 0 restores the full-ring loads (kill switch, and the reference for the check).
 _ARC_GDN_COMMIT_LIVE_ROWS = _env_flag("ARC_GDN_COMMIT_LIVE_ROWS", "1")
 
-# arc-forge h20 (opt-in, QSA HiSparse arm only; attention_hook refuses it elsewhere):
-# with a 16-bit checkpoint the accepted window is folded by the NEXT verify, which
-# reads the checkpoint anyway, instead of by the commit, which read and wrote it once
-# more. The commit keeps only the snapshot-track rows and leaves the cursors as the
-# advance set them (base at the window, write_pos = accepted, is_flush = 1); the
-# verify folds those rows with the commit's arithmetic, stores the checkpoint and
-# projects with it. Nothing but the verify and the commit's track reads the live
-# checkpoint on that arm, and a fresh request row starts with zeroed cursors.
-_ARC_GDN_FOLD_IN_VERIFY = _env_flag("ARC_GDN_FOLD_IN_VERIFY", "0")
+# arc-forge h20 (opt-in; attention_hook admits the QSA HiSparse arm and the mamba radix
+# cache in extra_buffer mode, see there): with a 16-bit checkpoint the accepted window
+# is folded by the NEXT verify, which reads the checkpoint anyway, instead of by the
+# commit, which read and wrote it once more. The commit keeps only the snapshot-track
+# rows and leaves the cursors as the advance set them (base at the window, write_pos =
+# accepted, is_flush = 1); the verify folds those rows with the commit's arithmetic,
+# stores the checkpoint and projects with it. Nothing but the verify and the commit's
+# track reads the live checkpoint on those arms. A fresh request row must start with
+# zeroed cursors at its first verify: the zeroing in HybridReqToTokenPool.alloc runs on
+# the schedule stream, unordered against the advance of the row's previous owner still
+# in flight under the overlap scheduler (which then leaves its window pending in the
+# row; the normal commit's finish kernel clears it, this mode has none), so this mode
+# zeroes fresh rows again on the forward stream before their extend
+# (ModelRunner._maybe_execute_deferred_mamba_cow_and_clear). B200 TP2 DFlash K4 on the
+# radix cache with the reset skipped (2026-10-09, i3neg, 10 min of the RL harness at ~98
+# running): 88 verify rows in 76 of 12,303 commits (of 3,034 requests, ~2.9%) found the
+# previous owner's window (write_pos 1, 2 or 4); with the reset, 0 in 12,000+ commits.
+# QSA HiSparse fences every release of a running row behind the forward stream
+# (QSAHiSparseCoordinator.request_finished: schedule stream waits on it), and with
+# native MTP the scheduler's WAR barrier waits for the draft extend, which follows the
+# advance; the race needs neither, so it lives on DFlash (whose last shared read is the
+# target verify's metadata prep, before the advance) off HiSparse.
+# ARC_GDN_FOLD_IN_VERIFY=check: the same kernels, plus a protocol check at every commit
+# (spec_utils.check_fold_in_verify_owners): a window pending in a row must have been
+# left there by the request that now holds the row.
+ARC_GDN_FOLD_IN_VERIFY_MODE = os.environ.get("ARC_GDN_FOLD_IN_VERIFY", "0")
+if ARC_GDN_FOLD_IN_VERIFY_MODE not in ("0", "1", "check"):
+    raise ValueError(
+        f"ARC_GDN_FOLD_IN_VERIFY must be 0, 1 or check, got {ARC_GDN_FOLD_IN_VERIFY_MODE!r}"
+    )
+_ARC_GDN_FOLD_IN_VERIFY = ARC_GDN_FOLD_IN_VERIFY_MODE in ("1", "check")
+# ARC_GDN_FOLD_COMMIT_COMPACT=1 (opt-in, needs fold-in-verify): the commit's track snapshots through
+# gdn_replayssm_fold_track_kernel over the compacted track rows instead of the compact kernel's full grid; the
+# same bytes. ARC_GDN_FOLD_COMMIT_COMPACT=check runs both into separate track slots and raises on any difference
+# (a host sync per step; validation only).
+ARC_GDN_FOLD_COMMIT_COMPACT = os.environ.get("ARC_GDN_FOLD_COMMIT_COMPACT", "0")
+if ARC_GDN_FOLD_COMMIT_COMPACT not in ("0", "1", "check"):
+    raise ValueError(f"ARC_GDN_FOLD_COMMIT_COMPACT must be 0, 1 or check, got {ARC_GDN_FOLD_COMMIT_COMPACT!r}")
+if ARC_GDN_FOLD_COMMIT_COMPACT != "0" and not _ARC_GDN_FOLD_IN_VERIFY:
+    raise ValueError("ARC_GDN_FOLD_COMMIT_COMPACT changes the fold-in-verify commit; it needs ARC_GDN_FOLD_IN_VERIFY")
+_FOLD_COMMIT_SLOTS = 8  # programs per (V-tile, layer x head) that share the track rows
+_fold_commit_check_stats = [0, 0]  # check mode: steps compared, track slots compared
 # the verify's fold tile (key rows per step) and loop form; any choice gives the same
 # bytes (per element the same dot chain and roundings), they differ in speed only.
 # G4, 36 layers x 53 rows (opt2_fold_sweep.sh): 32 rows unrolled 4.82 ms per step of
@@ -1110,6 +1143,207 @@ def gdn_replayssm_compact_commit_kernel(
 
 
 @triton.jit
+def _fold_track_rows_kernel(
+    ssm_state_indices,
+    mamba_track_indices,
+    mamba_steps_to_track,
+    active_rows,
+    n_active,
+    n_rows,
+    stride_indices: tl.constexpr,
+    stride_track: tl.constexpr,
+    stride_steps: tl.constexpr,
+    NULL_BLOCK_ID: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """ARC_GDN_FOLD_COMMIT_COMPACT: the batch rows the h20 commit writes (a live slot and a track snapshot this
+    step), compacted in batch order into active_rows[:n_active]; the same predicate as the compact commit
+    kernel's early returns under FOLD_IN_VERIFY."""
+    offs = tl.arange(0, BLOCK)
+    in_batch = offs < n_rows
+    state_idx = tl.load(ssm_state_indices + offs * stride_indices, mask=in_batch, other=NULL_BLOCK_ID).to(tl.int64)
+    track_idx = tl.load(mamba_track_indices + offs * stride_track, mask=in_batch, other=NULL_BLOCK_ID).to(tl.int64)
+    track_step = tl.load(mamba_steps_to_track + offs * stride_steps, mask=in_batch, other=-1).to(tl.int32)
+    active = in_batch & (state_idx > NULL_BLOCK_ID) & (track_idx > NULL_BLOCK_ID) & (track_step >= 0)
+    flag = active.to(tl.int32)
+    slot = tl.cumsum(flag, axis=0) - flag
+    tl.store(active_rows + slot, offs, mask=active)
+    tl.store(n_active, tl.sum(flag, axis=0))
+
+
+@triton.jit
+def gdn_replayssm_fold_track_kernel(
+    h0,
+    d_cache,
+    k_cache,
+    g_cache,
+    d_residual_cache,
+    k_residual_cache,
+    ssm_state_indices,
+    replay_indices,
+    write_pos,
+    is_flush_flags,
+    cache_base,
+    accept_lens,
+    mamba_track_indices,
+    mamba_steps_to_track,
+    active_rows,
+    n_active,
+    stride_state_slot: tl.constexpr,
+    stride_d_slot: tl.constexpr,
+    stride_k_slot: tl.constexpr,
+    stride_g_slot: tl.constexpr,
+    stride_d_residual_slot: tl.constexpr,
+    stride_k_residual_slot: tl.constexpr,
+    stride_state_layer: tl.constexpr,
+    stride_d_layer: tl.constexpr,
+    stride_k_layer: tl.constexpr,
+    stride_g_layer: tl.constexpr,
+    stride_d_residual_layer: tl.constexpr,
+    stride_k_residual_layer: tl.constexpr,
+    stride_indices: tl.constexpr,
+    stride_replay_indices: tl.constexpr,
+    stride_accept: tl.constexpr,
+    stride_track: tl.constexpr,
+    stride_steps: tl.constexpr,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BV: tl.constexpr,
+    MAX_CACHE_LEN: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
+    LIVE_ROWS: tl.constexpr,
+    SLOTS: tl.constexpr,
+):
+    """ARC_GDN_FOLD_COMMIT_COMPACT: gdn_replayssm_compact_commit_kernel's FOLD_IN_VERIFY + HAS_TRACK path over the
+    compacted track rows only. Program (i_v, i_s, layer x head) handles rows active_rows[i_s::SLOTS]; per row the
+    loads, masks and arithmetic are the compact kernel's, expression for expression, so the track snapshots are
+    the same bytes. The compact kernel launches B x layers x heads x V-tiles programs every step and all but the
+    few track rows' return at once (~170k programs, ~0.9 ms at 120 requests)."""
+    i_v = tl.program_id(0)
+    i_s = tl.program_id(1)
+    i_hvl = tl.program_id(2)
+    i_layer = (i_hvl // HV).to(tl.int64)
+    i_hv = i_hvl % HV
+    i_h = i_hv // (HV // H)
+
+    h0 += i_layer * stride_state_layer
+    d_cache += i_layer * stride_d_layer
+    k_cache += i_layer * stride_k_layer
+    g_cache += i_layer * stride_g_layer
+    d_residual_cache += i_layer * stride_d_residual_layer
+    k_residual_cache += i_layer * stride_k_residual_layer
+    o_t = tl.arange(0, MAX_CACHE_LEN)
+    o_k = tl.arange(0, K)
+    o_v = i_v * BV + tl.arange(0, BV)
+    mask_v = o_v < V
+    count = tl.load(n_active)
+    for j in range(i_s, count, SLOTS):
+        i_n = tl.load(active_rows + j)
+        state_idx = tl.load(ssm_state_indices + i_n * stride_indices).to(tl.int64)
+        replay_idx = tl.load(replay_indices + i_n * stride_replay_indices).to(tl.int64)
+        n_history = tl.load(write_pos + replay_idx).to(tl.int32)
+        fold_active = tl.load(is_flush_flags + replay_idx) != 0
+        track_idx = tl.load(mamba_track_indices + i_n * stride_track).to(tl.int64)
+        track_step = tl.load(mamba_steps_to_track + i_n * stride_steps).to(tl.int32)
+        n_accepted = tl.load(accept_lens + i_n * stride_accept).to(tl.int32)
+        track_len = n_history - n_accepted + track_step + 1
+
+        base = tl.load(cache_base + replay_idx).to(tl.int32)
+        phys = (base + o_t) & (MAX_CACHE_LEN - 1)
+        if LIVE_ROWS:
+            n_live = tl.where(fold_active, n_history, 0)
+            n_live = tl.maximum(n_live, track_len)
+            mask_t = o_t < n_live
+        else:
+            mask_t = o_t < MAX_CACHE_LEN
+
+        p_h0 = (
+            h0
+            + state_idx * stride_state_slot
+            + i_hv * V * K
+            + o_v[None, :] * K
+            + o_k[:, None]
+        )
+        old_state = tl.load(p_h0, mask=mask_v[None, :], other=0.0).to(tl.float32)
+        keys = tl.load(
+            k_cache
+            + replay_idx * stride_k_slot
+            + (i_h * MAX_CACHE_LEN + phys[:, None]) * K
+            + o_k[None, :],
+            mask=mask_t[:, None],
+            other=0.0,
+        )
+        if HAS_RESIDUAL:
+            key_residual = tl.load(
+                k_residual_cache
+                + replay_idx * stride_k_residual_slot
+                + (i_h * MAX_CACHE_LEN + phys[:, None]) * K
+                + o_k[None, :],
+                mask=mask_t[:, None],
+                other=0.0,
+            )
+        updates = tl.load(
+            d_cache
+            + replay_idx * stride_d_slot
+            + (i_hv * MAX_CACHE_LEN + phys[:, None]) * V
+            + o_v[None, :],
+            mask=mask_t[:, None] & mask_v[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        if HAS_RESIDUAL:
+            updates += tl.load(
+                d_residual_cache
+                + replay_idx * stride_d_residual_slot
+                + (i_hv * MAX_CACHE_LEN + phys[:, None]) * V
+                + o_v[None, :],
+                mask=mask_t[:, None] & mask_v[None, :],
+                other=0.0,
+            ).to(tl.float32)
+        gates = tl.load(
+            g_cache + replay_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + phys,
+            mask=mask_t,
+            other=0.0,
+        ).to(tl.float32)
+
+        track_mask = o_t < track_len
+        track_g = tl.where(track_mask, gates, 0.0)
+        track_prefix = tl.cumsum(track_g, axis=0)
+        track_total = tl.sum(track_g, axis=0)
+        track_decay = tl.where(track_mask, tl.exp(track_total - track_prefix), 0.0)
+        track_updates = updates * track_decay[:, None]
+        track_hi = track_updates.to(k_cache.dtype.element_ty)
+        track_lo = (track_updates - track_hi.to(tl.float32)).to(
+            k_cache.dtype.element_ty
+        )
+        track_delta = tl.dot(tl.trans(keys), track_hi)
+        track_delta += tl.dot(tl.trans(keys), track_lo)
+        if HAS_RESIDUAL:
+            track_delta += tl.dot(tl.trans(key_residual), track_hi)
+            track_delta += tl.dot(tl.trans(key_residual), track_lo)
+        tl.store(
+            h0
+            + track_idx * stride_state_slot
+            + i_hv * V * K
+            + o_v[None, :] * K
+            + o_k[:, None],
+            (
+                tl.inline_asm_elementwise(
+                    "mul.rn.f32 $0, $1, $2;",
+                    "=f,f,f",
+                    [old_state, tl.exp(track_total)],
+                    dtype=tl.float32,
+                    is_pure=True,
+                    pack=1,
+                )
+                + track_delta
+            ).to(h0.dtype.element_ty),
+            mask=mask_v[None, :],
+        )
+
+
+@triton.jit
 def _finish_gdn_replayssm_circular_fold_kernel(
     write_pos,
     cache_base,
@@ -1534,7 +1768,7 @@ def gdn_replayssm_spec_decode(
         is_flush = is_flush.to(torch.int8)
     if _ARC_GDN_FOLD_IN_VERIFY and launch_mode != "verify":
         raise ValueError(
-            f"ARC_GDN_FOLD_IN_VERIFY=1 folds in the verify launch; launch_mode={launch_mode!r}"
+            f"ARC_GDN_FOLD_IN_VERIFY={ARC_GDN_FOLD_IN_VERIFY_MODE} folds in the verify launch; launch_mode={launch_mode!r}"
         )
 
     if launch_mode in ("both", "flush"):
@@ -1698,7 +1932,9 @@ def commit_gdn_replayssm_circular(
     cursors keep the advance's values: the next verify folds the window.
     """
     if _ARC_GDN_FOLD_IN_VERIFY and checkpoint_state.dtype == torch.float32:
-        raise ValueError("ARC_GDN_FOLD_IN_VERIFY=1 needs a 16-bit checkpoint (fold every commit)")
+        raise ValueError(
+            f"ARC_GDN_FOLD_IN_VERIFY={ARC_GDN_FOLD_IN_VERIFY_MODE} needs a 16-bit checkpoint (fold every commit)"
+        )
     launch_gdn_replayssm_compact_commit(
         checkpoint_state=checkpoint_state,
         d_cache=d_cache,
@@ -1757,10 +1993,14 @@ def launch_gdn_replayssm_compact_commit(
     null_block_id: int,
     live_rows: bool,
     fold_in_verify: bool = False,
+    compact: str | None = None,
 ) -> None:
     """The compact commit kernel alone (no cursor finish): reads the cursors,
     writes the checkpoint and track slots. ``live_rows`` is patch 0030's switch;
-    ``fold_in_verify`` (h20) writes the track slots only."""
+    ``fold_in_verify`` (h20) writes the track slots only; ``compact`` (ARC_GDN_FOLD_COMMIT_COMPACT, read when
+    None) launches them over the compacted track rows."""
+    if compact is None:
+        compact = ARC_GDN_FOLD_COMMIT_COMPACT
     if checkpoint_state.dtype == torch.uint8:
         # arc-forge h24: the packed state commits h20's track rows only
         from sglang.kernels.ops.attention.fla.gdn_state_fmt_kernels import launch_track_packed
@@ -1791,6 +2031,24 @@ def launch_gdn_replayssm_compact_commit(
     has_track = mamba_track_indices is not None and mamba_steps_to_track is not None
     if fold_in_verify and not has_track:
         return
+    if fold_in_verify and compact != "0":
+        if compact == "check":
+            # only track slots are written in this mode: save them, compare the two kernels' writes there
+            check_slots = mamba_track_indices[mamba_track_indices > null_block_id].to(torch.long)
+            saved = checkpoint_state[:, check_slots].clone()
+        _launch_fold_track_compact(
+            checkpoint_state=checkpoint_state, d_cache=d_cache, k_cache=k_cache, g_cache=g_cache,
+            d_residual_buf=d_residual_buf, k_residual_buf=k_residual_buf, has_residual=has_residual,
+            state_batch_indices=state_batch_indices, replay_indices=replay_indices, write_pos=write_pos,
+            cache_base=cache_base, is_flush=is_flush, accept_lens=accept_lens,
+            mamba_track_indices=mamba_track_indices, mamba_steps_to_track=mamba_steps_to_track,
+            null_block_id=null_block_id, live_rows=live_rows, BV=BV,
+        )
+        if compact == "1":
+            return
+        # check: restore the slots, run the full grid as well, then every byte of both writes must agree
+        got = checkpoint_state[:, check_slots].clone()
+        checkpoint_state[:, check_slots] = saved
     if has_track:
         track_indices = mamba_track_indices
         track_steps = mamba_steps_to_track
@@ -1845,6 +2103,95 @@ def launch_gdn_replayssm_compact_commit(
         HAS_RESIDUAL=has_residual,
         LIVE_ROWS=live_rows,
         FOLD_IN_VERIFY=fold_in_verify,
+        num_warps=4,
+        num_stages=2,
+    )
+    if fold_in_verify and compact == "check":
+        ref = checkpoint_state[:, check_slots]
+        if not torch.equal(got.view(torch.uint8), ref.view(torch.uint8)):
+            bad = (got.view(torch.uint8) != ref.view(torch.uint8)).flatten(2).any(-1).nonzero().tolist()
+            raise RuntimeError(f"ARC_GDN_FOLD_COMMIT_COMPACT=check: the compacted commit differs from the full grid "
+                               f"at (layer, track slot) {bad[:8]} of slots {check_slots.tolist()}")
+        _fold_commit_check_stats[0] += 1
+        _fold_commit_check_stats[1] += int(check_slots.numel())
+        if _fold_commit_check_stats[0] % 1000 == 0:
+            import logging
+
+            logging.getLogger(__name__).info(
+                "ARC_GDN_FOLD_COMMIT_COMPACT=check: %d steps, %d track slots bitwise equal to the full grid",
+                *_fold_commit_check_stats,
+            )
+
+
+def _launch_fold_track_compact(
+    *, checkpoint_state, d_cache, k_cache, g_cache, d_residual_buf, k_residual_buf, has_residual,
+    state_batch_indices, replay_indices, write_pos, cache_base, is_flush, accept_lens, mamba_track_indices,
+    mamba_steps_to_track, null_block_id, live_rows, BV,
+) -> None:
+    """ARC_GDN_FOLD_COMMIT_COMPACT: compact the track rows on the device, then the track kernel over them only."""
+    num_layers, _, HV, V, K = checkpoint_state.shape
+    H = k_cache.shape[2]
+    max_cache_len = d_cache.shape[-2]
+    B = state_batch_indices.shape[0]
+    active_rows = torch.empty(B, dtype=torch.int32, device=state_batch_indices.device)
+    n_active = torch.empty(1, dtype=torch.int32, device=state_batch_indices.device)
+    _fold_track_rows_kernel[(1,)](
+        state_batch_indices,
+        mamba_track_indices,
+        mamba_steps_to_track,
+        active_rows,
+        n_active,
+        B,
+        stride_indices=state_batch_indices.stride(0),
+        stride_track=mamba_track_indices.stride(0),
+        stride_steps=mamba_steps_to_track.stride(0),
+        NULL_BLOCK_ID=null_block_id,
+        BLOCK=triton.next_power_of_2(max(1, B)),
+    )
+    grid = (triton.cdiv(V, BV), _FOLD_COMMIT_SLOTS, HV * num_layers)
+    gdn_replayssm_fold_track_kernel[grid](
+        checkpoint_state,
+        d_cache,
+        k_cache,
+        g_cache,
+        d_residual_buf,
+        k_residual_buf,
+        state_batch_indices,
+        replay_indices,
+        write_pos,
+        is_flush,
+        cache_base,
+        accept_lens,
+        mamba_track_indices,
+        mamba_steps_to_track,
+        active_rows,
+        n_active,
+        checkpoint_state.stride(1),
+        d_cache.stride(1),
+        k_cache.stride(1),
+        g_cache.stride(1),
+        d_residual_buf.stride(1),
+        k_residual_buf.stride(1),
+        checkpoint_state.stride(0),
+        d_cache.stride(0),
+        k_cache.stride(0),
+        g_cache.stride(0),
+        d_residual_buf.stride(0),
+        k_residual_buf.stride(0),
+        state_batch_indices.stride(0),
+        replay_indices.stride(0),
+        accept_lens.stride(0),
+        mamba_track_indices.stride(0),
+        mamba_steps_to_track.stride(0),
+        H=H,
+        HV=HV,
+        K=K,
+        V=V,
+        BV=BV,
+        MAX_CACHE_LEN=max_cache_len,
+        HAS_RESIDUAL=has_residual,
+        LIVE_ROWS=live_rows,
+        SLOTS=_FOLD_COMMIT_SLOTS,
         num_warps=4,
         num_stages=2,
     )

@@ -1867,6 +1867,16 @@ class ModelRunner:
                     pool.translate_mamba_indices(forward_batch.mamba_cow_src_indices),
                     pool.translate_mamba_indices(forward_batch.mamba_cow_dst_indices),
                 )
+        if forward_batch.replay_cursor_reset_rows is not None:
+            # arc-forge h20 (ARC_GDN_FOLD_IN_VERIFY): HybridReqToTokenPool.alloc zeroed
+            # these fresh rows' spec cursors on the schedule stream, possibly before the
+            # previous owner's in-flight advance wrote them; on this stream that
+            # advance has run, and no verify of the new request has.
+            mp = pool.mamba_pool
+            rows = forward_batch.replay_cursor_reset_rows
+            mp.replayssm_spec_write_pos.index_fill_(0, rows, 0)
+            mp.replayssm_cache_base.index_fill_(0, rows, 0)
+            mp.replayssm_is_flush.index_fill_(0, rows, 0)
         if forward_batch.mamba_restore_bufs is not None:
             # QSA HiSparse (arc-forge h08): H2D a published GDN snapshot into the
             # new slot on this (forward) stream, like the COW above.
@@ -1877,6 +1887,7 @@ class ModelRunner:
                 pool.translate_mamba_indices(forward_batch.mamba_restore_dst_indices),
             )
         forward_batch.mamba_clear_indices = None
+        forward_batch.replay_cursor_reset_rows = None
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None
         forward_batch.mamba_restore_bufs = None

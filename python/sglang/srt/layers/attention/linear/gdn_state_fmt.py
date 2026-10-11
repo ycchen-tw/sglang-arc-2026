@@ -231,8 +231,8 @@ def check_server_args(cfg) -> None:
     if fmt is None:
         return
     need = {
-        "ARC_GDN_FOLD_IN_VERIFY=1 (the h20 verify is the only kernel that folds a packed state)": os.environ.get(
-            "ARC_GDN_FOLD_IN_VERIFY", "0") == "1",
+        "ARC_GDN_FOLD_IN_VERIFY=1 or check (the h20 verify is the only kernel that folds a packed state)": os.environ.get(
+            "ARC_GDN_FOLD_IN_VERIFY", "0") in ("1", "check"),
         "--mamba-ssm-dtype float16 (the kernels' activation-side state dtype)": cfg.mamba_ssm_dtype == "float16",
         "--tp-size 1": cfg.tp_size == 1,
         "speculative decoding (every decode step is a ReplaySSM verify)": cfg.speculative_algorithm is not None,
