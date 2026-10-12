@@ -42,6 +42,11 @@ class Config:
     # dense_intermediate_size in place of the routed experts and router, shared expert and its gate unchanged
     ffn_type: str = "moe"
     dense_intermediate_size: int = 0
+    # The proposal slots after the anchor (block slots 1 .. b-1, the mask embeddings): "copy" pairs each with the
+    # anchor's predecessor GR, the same GR as slot 0; "none" feeds them the mask embedding alone -- their GR is zeroed,
+    # and pre_fc_norm_hidden(0) = 0 through the bias-free fc_hidden, so the fusion's GR term is exactly absent.
+    # Committed slots and the anchor always read their own predecessor GR.
+    mask_gr: str = "copy"
 
     def __post_init__(self):
         if self.hidden_size % self.conv_group_size or self.window < 1:
@@ -58,6 +63,8 @@ class Config:
             raise ValueError(f"unknown ffn_type {self.ffn_type!r}")
         if (self.ffn_type == "dense_shared") != (self.dense_intermediate_size > 0):
             raise ValueError("dense_intermediate_size is set exactly when ffn_type is dense_shared")
+        if self.mask_gr not in ("copy", "none"):
+            raise ValueError(f"unknown mask_gr {self.mask_gr!r}")
         if not 1 <= self.selector_top_k <= self.vocab_size:
             raise ValueError("invalid selector top-K")
         rotary = int(self.head_dim * self.partial_rotary_factor)
@@ -584,6 +591,14 @@ class MTP3(nn.Module):
             caches.append(cache)
         return self.hyper_connection_mixer(h), CleanCache(positions, tuple(caches))
 
+    def proposal_gr(self, grs, spoken):
+        """The GR a proposal block's slots read, under Config.mask_gr. grs [batch, n, branches, hidden] as built for
+        "copy" (mask slots on the anchor's predecessor GR); spoken [batch or 1, n] marks the committed slots and the
+        anchor, which keep theirs. "none" zeroes the rest."""
+        if self.config.mask_gr == "copy":
+            return grs
+        return grs.masked_fill(~spoken[..., None, None], 0)
+
     @torch.no_grad()
     def refresh(self, tokens, predecessor_gr, positions, prefix=None, *, retain_trace=False):
         """Append committed tokens; predecessor_gr[i] is the target GR at positions[i] - 1.
@@ -685,6 +700,7 @@ class MTP3(nn.Module):
             # has produced; the target has not read the anchor, so nothing later
             # exists.
             grs = torch.cat((gr_span[:, :-1], gr_span[:, -1:].expand(-1, n - k, -1, -1)), 1)
+            grs = self.proposal_gr(grs, (slot <= k)[None])
         else:
             require((lengths <= k).all(), "a row cannot commit more tokens than the block holds")
             edge = lengths[:, None]
@@ -695,7 +711,7 @@ class MTP3(nn.Module):
             # Row `i` reads gr_span[i] for its own committed slots and the cursor
             # GR from lengths[i] onward -- the same rule, clamped per row.
             index = slot.minimum(edge)
-            grs = gr_span.gather(1, index[..., None, None].expand(-1, -1, *gr_span.shape[2:]))
+            grs = self.proposal_gr(gr_span.gather(1, index[..., None, None].expand(-1, -1, *gr_span.shape[2:])), spoken)
         hidden, block = self(embeds, grs, positions, prefix)
         if lengths is None:
             # Slot k is the anchor, and under the next-token contract its output
@@ -727,7 +743,9 @@ class MTP3(nn.Module):
         embeds = torch.cat(
             (self.embed_tokens(anchor_tokens)[:, None], self.mask_embedding.expand(len(anchors), b - 1, -1)), 1
         )
-        hidden, _ = self(embeds, predecessor_gr[:, None].expand(-1, b, -1, -1), positions, prefix)
+        grs = self.proposal_gr(predecessor_gr[:, None].expand(-1, b, -1, -1),
+                               (torch.arange(b, device=anchors.device) == 0)[None])
+        hidden, _ = self(embeds, grs, positions, prefix)
         # The last slot would predict x[a+b], which a b-wide verify can never
         # reach, so it is dropped: b - 1 proposals for b - 1 verified positions.
         # Proposal KV is discarded whatever the outputs are used for.
