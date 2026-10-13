@@ -481,7 +481,7 @@ class RingStatePool(StatePool):
         ids = torch.where(committed, torch.nn.functional.pad(tokens, (0, max(0, n - b)))[:, :n], self.anchor[:batch, None])
         embeds = torch.where(spoken[..., None], model.embed_tokens(ids), model.mask_embedding)
         span = self.pending_gr[idx]
-        grs = span.gather(1, slot.minimum(edge)[..., None, None].expand(-1, -1, *span.shape[2:]))
+        grs = model.proposal_gr(span.gather(1, slot.minimum(edge)[..., None, None].expand(-1, -1, *span.shape[2:])), spoken)
         hidden, block = model(embeds, grs, positions, prefix)
         take = edge + torch.arange(self.steps, device=self.device)
         proposal_hidden = hidden.gather(1, take[..., None].expand(-1, -1, hidden.shape[-1]))
