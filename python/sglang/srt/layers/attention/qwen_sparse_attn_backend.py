@@ -104,10 +104,29 @@ _ARC_QSA_NVFP4_DIRECT = _arc_flag("ARC_QSA_NVFP4_DIRECT")
 _ARC_QSA_FP8_DIRECT = _arc_flag("ARC_QSA_FP8_DIRECT")
 # (block_n, warps, stages, chunk, decode) per pool kind, from the G4 microbench (h22 note)
 _ARC_QSA_DIRECT_TILE = {"nvfp4": (64, 4, 3, 512, 2), "fp8": (64, 4, 3, 1024, 0)}
-# sm_89 HiSparse route (h25/h28): arithmetic E2M1 decode, two stages (99 KiB shared memory)
-_ARC_QSA_SM89_TILE = {"nvfp4": (64, 4, 2, 512, 0), "fp8": (64, 4, 2, 1024, 0)}
+# arc-forge l4opt (10-11): the HiSparse sm_89 direct decode's E2M1 decode and pipeline stages. Decode 0 (the
+# arithmetic decode this path shipped with), 1 or 3 give the same bits; 3 (bf16 bit construction and bf16 scale
+# multiply) is -31 % on a 4090 at the L4 verify shape (48 requests x 4 rows, top-k 2304), stages 3 another -4 %.
+_ARC_QSA_SM89_DECODE = int(os.environ.get("ARC_QSA_SM89_DECODE", "0"))
+_ARC_QSA_SM89_STAGES = int(os.environ.get("ARC_QSA_SM89_STAGES", "2"))
+if _ARC_QSA_SM89_DECODE not in (0, 1, 3) or _ARC_QSA_SM89_STAGES not in (2, 3, 4):
+    raise ValueError(
+        f"ARC_QSA_SM89_DECODE must be 0, 1 or 3 and ARC_QSA_SM89_STAGES 2-4, got "
+        f"{_ARC_QSA_SM89_DECODE} / {_ARC_QSA_SM89_STAGES}"
+    )
+# sm_89 HiSparse route (h25/h28): (block_n, warps, stages, chunk, decode); stages / decode default to the shipped
+# two stages (99 KiB shared memory) and arithmetic E2M1 decode, overridable by the two knobs above
+_ARC_QSA_SM89_TILE = {
+    "nvfp4": (64, 4, _ARC_QSA_SM89_STAGES, 512, _ARC_QSA_SM89_DECODE),
+    "fp8": (64, 4, _ARC_QSA_SM89_STAGES, 1024, _ARC_QSA_SM89_DECODE),
+}
 # Opt-in measured tiles per exact shape (qsa/direct_tiles.py); unset = the tiles above, bit for bit.
 _ARC_QSA_DIRECT_TILE_TABLE_PATH = os.environ.get("ARC_QSA_DIRECT_TILE_TABLE")
+if _ARC_QSA_DIRECT_TILE_TABLE_PATH is not None and (_ARC_QSA_SM89_DECODE, _ARC_QSA_SM89_STAGES) != (0, 2):
+    raise ValueError(
+        "ARC_QSA_DIRECT_TILE_TABLE and ARC_QSA_SM89_DECODE / ARC_QSA_SM89_STAGES both pick the sm_89 direct tile; "
+        "set one of them"
+    )
 _ARC_QSA_DIRECT_TILE_TABLE = (
     load_direct_tile_table(_ARC_QSA_DIRECT_TILE_TABLE_PATH)
     if _ARC_QSA_DIRECT_TILE_TABLE_PATH is not None
@@ -2733,7 +2752,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             ks = vs = None
             # Match h22 and the gather path: QSA FP8 storage is unscaled.
             kg = vg = 1.0
-        # h22 guards padded/all-invalid rows; decode=0 uses Ada-compatible E2M1 arithmetic.
+        # h22 guards padded/all-invalid rows; decodes 0 / 1 / 3 are Ada-compatible E2M1 (same bits).
         kind = "nvfp4" if self.arc_nvfp4 else "fp8"
         indices = indices.to(torch.int32).contiguous()
         block_n, warps, stages, chunk, decode = self._direct_tile(

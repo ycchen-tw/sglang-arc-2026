@@ -494,6 +494,24 @@ class LogitsProcessor(nn.Module):
 
         self.input_logprob_processor = InputLogprobProcessor()
 
+        # arc-forge ARC_SHARDED_VERIFY: target-verify logits stay vocab-sharded on the
+        # attention-TP group (dp-lm-head); eagle_sample samples from the shards.
+        from sglang.srt.speculative.arc_dflash import sharded_verify as _arc_sv
+        from sglang.srt.speculative.arc_dflash import target_vocab as _arc_tv
+
+        # ARC_TARGET_VOCAB: the restricted target head's logits are a compact id space (target_vocab.py)
+        self._arc_tv = _arc_tv
+
+        # dp-lm-head (the attention-TP group's vocab shards) or pure TP (no attention
+        # DP: the TP group is the attention-TP group)
+        self._arc_shard_verify = (
+            _arc_sv.enabled()
+            and self.do_tensor_parallel_all_gather
+            and (self.use_attn_tp_group or get_parallel().attn_dp_size == 1)
+        )
+        if self._arc_shard_verify:
+            _arc_sv.require_supported(self)
+
     def forward(
         self,
         input_ids,
@@ -565,7 +583,29 @@ class LogitsProcessor(nn.Module):
         )
         del hidden_states
 
+        if logits_metadata.extend_return_logprob and self._arc_tv.is_pruned(lm_head):
+            raise RuntimeError("ARC_TARGET_VOCAB: input logprobs need the full output vocabulary")
+
         if not logits_metadata.extend_return_logprob:
+            if (
+                self._arc_shard_verify
+                and logits_metadata.forward_mode.is_target_verify()
+            ):
+                logits, vocab_start = self._get_local_vocab_logits(
+                    pruned_states, lm_head
+                )
+                return LogitsProcessorOutput(
+                    next_token_logits=logits,
+                    hidden_states=hidden_states_to_store,
+                    mm_input_embeds=logits_metadata.mm_input_embeds,
+                    next_token_logits_vocab_start=vocab_start,
+                    # the compact id space under ARC_TARGET_VOCAB (sharded_verify maps it)
+                    next_token_logits_global_vocab_size=(
+                        self._arc_tv.tables()["size"]
+                        if self._arc_tv.is_pruned(lm_head)
+                        else self.vocab_size
+                    ),
+                )
             # Compute logits for both input and sampled tokens.
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
             sampled_logits = (
@@ -881,7 +921,22 @@ class LogitsProcessor(nn.Module):
             logits.mul_(self.logit_scale)
 
         used_tp_lm_head_all_to_all = False
-        if self.do_tensor_parallel_all_gather:
+        if self._arc_tv.is_pruned(lm_head):
+            # ARC_TARGET_VOCAB: gather the compact shards over the attention-TP group (target_vocab.prune_lm_head
+            # checked it is the head's group) and scatter them into full-width rows, -inf off the list
+            n = get_parallel().attn_tp_size
+            compact = torch.empty(
+                (n, logits.shape[0], logits.shape[-1]),
+                device=logits.device,
+                dtype=logits.dtype,
+            )
+            attn_tp_all_gather_into_tensor(compact, logits.contiguous())
+            # explicit width: an attention-DP IDLE batch has 0 rows
+            logits = self._arc_tv.expand(
+                compact.permute(1, 0, 2).reshape(logits.shape[0], n * logits.shape[-1]),
+                self.vocab_size,
+            )
+        elif self.do_tensor_parallel_all_gather:
             _trace_e2e_logits(
                 "tp_logits_gather_enter", logits_shape=tuple(logits.shape)
             )
@@ -922,6 +977,27 @@ class LogitsProcessor(nn.Module):
                 )
 
         return logits
+
+    def _get_local_vocab_logits(
+        self, hidden_states: torch.Tensor, lm_head: VocabParallelEmbedding
+    ) -> Tuple[torch.Tensor, int]:
+        """ARC_SHARDED_VERIFY: this attention-TP rank's vocab shard of the verify
+        logits in the LM head's dtype -- no gather, no FP32 copy."""
+        logits = self._compute_lm_head(hidden_states, lm_head)
+        if self.logit_scale is not None:
+            logits.mul_(self.logit_scale)
+        n = get_parallel().attn_tp_size
+        width = (
+            self._arc_tv.tables()["size"]
+            if self._arc_tv.is_pruned(lm_head)
+            else self.vocab_size
+        )
+        if logits.shape[-1] * n != width:
+            raise RuntimeError(
+                f"ARC_SHARDED_VERIFY: local logits width {logits.shape[-1]} x {n} "
+                f"ranks != vocab {width} (padded shard)"
+            )
+        return logits, get_parallel().attn_tp_rank * logits.shape[-1]
 
     def _compute_lm_head(
         self,

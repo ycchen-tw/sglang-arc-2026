@@ -543,6 +543,41 @@ class CandidateSelector(nn.Module):
         self.successor_codebook = nn.Parameter(torch.zeros(c.vocab_size, c.selector_rank))
         self.hidden_projection = nn.Linear(c.hidden_size, c.selector_rank, bias=False)
         nn.init.normal_(self.predecessor_codebook, std=0.02)
+        # prune(): codebook rows kept for a subset of the vocabulary; vocabulary id -> row (None: every id is a row)
+        self.pred_rows = None
+        self.succ_rows = None
+
+    def prune(self, pred_ids: torch.Tensor, succ_ids: torch.Tensor):
+        """Keep the predecessor rows of `pred_ids` and the successor rows of `succ_ids` (sorted unique vocabulary ids).
+
+        Same values, so the same scores, as long as every predecessor is in `pred_ids` and every candidate in
+        `succ_ids` -- the caller's contract (ARC_TARGET_VOCAB: a predecessor is the target's sampled bonus token or a
+        drafted token, a candidate is a draft-vocabulary id). An id off the list maps to row len(ids), one past the
+        end, so an indexed gather fails instead of reading a wrong row.
+        """
+        if self.pred_rows is not None:
+            raise RuntimeError("selector codebooks are already pruned")
+        vocab = self.predecessor_codebook.shape[0]
+        for name, ids in (("pred", pred_ids), ("succ", succ_ids)):
+            if ids.dtype != torch.int64 or ids.ndim != 1 or not len(ids) or ids.min() < 0 or ids.max() >= vocab \
+                    or (ids[1:] <= ids[:-1]).any():
+                raise ValueError(f"selector prune: {name} ids must be sorted unique int64 in [0, {vocab})")
+
+        def rows(ids):
+            table = torch.full((vocab,), len(ids), dtype=torch.int64, device=ids.device)
+            table[ids] = torch.arange(len(ids), dtype=torch.int64, device=ids.device)
+            return table
+
+        with torch.no_grad():
+            self.predecessor_codebook = nn.Parameter(self.predecessor_codebook.data[pred_ids].clone(), requires_grad=False)
+            self.successor_codebook = nn.Parameter(self.successor_codebook.data[succ_ids].clone(), requires_grad=False)
+        self.pred_rows, self.succ_rows = rows(pred_ids), rows(succ_ids)
+
+    def pred_lookup(self, predecessor):
+        return self.predecessor_codebook[predecessor if self.pred_rows is None else self.pred_rows[predecessor]]
+
+    def succ_lookup(self, candidates):
+        return self.successor_codebook[candidates if self.succ_rows is None else self.succ_rows[candidates]]
 
     def scores(self, unary, projected, successor, predecessor):
         """The selector score with the position-independent factors already built.
@@ -551,11 +586,11 @@ class CandidateSelector(nn.Module):
         proposal chain can hoist `hidden_projection` and the successor gather out
         of its loop. `forward` delegates here so the two cannot drift apart.
         """
-        context = self.predecessor_codebook[predecessor] * projected
+        context = self.pred_lookup(predecessor) * projected
         return unary + torch.einsum("...r,...kr->...k", context, successor)
 
     def forward(self, candidates, unary, hidden, predecessor):
-        return self.scores(unary, self.hidden_projection(hidden), self.successor_codebook[candidates], predecessor)
+        return self.scores(unary, self.hidden_projection(hidden), self.succ_lookup(candidates), predecessor)
 
 
 class MTP3(nn.Module):

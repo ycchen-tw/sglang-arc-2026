@@ -307,3 +307,104 @@ def fused_qwen4_short_conv_state(
             num_warps=8,
         )
     return conv_input
+
+
+@triton.jit
+def _qwen4_short_conv_verify_window_kernel(
+    conv_input_ptr,
+    valid_ptr,
+    cache_ptr,
+    cache_stride_req,
+    ROW_WIDTH: tl.constexpr,
+    CHANNELS: tl.constexpr,
+    STATE_LEN: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)  # request * ROW_WIDTH + step, the valid_tokens order
+    req = row // ROW_WIDTH
+    step = row % ROW_WIDTH
+    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)  # flat (channel, state column)
+    mask = offs < CHANNELS * STATE_LEN
+    channel = offs // STATE_LEN
+    col = offs % STATE_LEN
+    valid = tl.load(valid_ptr + row)
+    src = (
+        req.to(tl.int64) * CHANNELS * (STATE_LEN + ROW_WIDTH)
+        + channel * (STATE_LEN + ROW_WIDTH)
+        + step
+        + 1
+        + col
+    )
+    value = tl.load(conv_input_ptr + src, mask=mask & valid, other=0.0)
+    dst = req.to(tl.int64) * cache_stride_req + step * (CHANNELS * STATE_LEN) + offs
+    tl.store(cache_ptr + dst, value, mask=mask)
+
+
+def can_fuse_qwen4_short_conv_verify_window(
+    conv_input: torch.Tensor,
+    valid_tokens: torch.Tensor,
+    intermediate_cache: torch.Tensor,
+    row_width: int,
+) -> bool:
+    """Return whether the verify step-window copy can use the fused kernel."""
+
+    if not (
+        conv_input.is_cuda
+        and conv_input.dim() == 3
+        and conv_input.is_contiguous()
+        and intermediate_cache.is_cuda
+        and intermediate_cache.dtype == conv_input.dtype
+        and intermediate_cache.dim() == 4
+        and valid_tokens.is_cuda
+        and valid_tokens.dtype == torch.bool
+        and valid_tokens.is_contiguous()
+    ):
+        return False
+    requests, channels, width = conv_input.shape
+    state_len = width - row_width
+    return (
+        0 < state_len <= _QWEN4_MAX_SHORT_CONV_STATE_LEN
+        and valid_tokens.numel() == requests * row_width
+        and intermediate_cache.shape[0] >= requests
+        and intermediate_cache.shape[1] >= row_width
+        and intermediate_cache.shape[2:] == (channels, state_len)
+        and intermediate_cache[0].is_contiguous()
+    )
+
+
+def fused_qwen4_short_conv_verify_window(
+    conv_input: torch.Tensor,
+    valid_tokens: torch.Tensor,
+    intermediate_cache: torch.Tensor,
+    row_width: int,
+) -> None:
+    """Write every verify step's post-step conv state straight into the intermediate cache.
+
+    ``intermediate_cache[r, t] = conv_input[r, :, t + 1 : t + 1 + state_len]`` where step ``t`` of request ``r`` is
+    valid, zeros elsewhere: the same bytes as the native unfold / permute / contiguous / where / copy_ chain, which
+    moves the (requests, row_width, channels, state_len) window five times (L4 verify at 48 requests: 35 MB per pass,
+    ~0.97 ms per step), with one read of conv_input and one write of the cache.
+    """
+
+    if not can_fuse_qwen4_short_conv_verify_window(
+        conv_input, valid_tokens, intermediate_cache, row_width
+    ):
+        raise ValueError("unsupported input for fused Qwen4 short-conv verify window")
+    requests, channels, width = conv_input.shape
+    state_len = width - row_width
+    if requests == 0:
+        return
+    block = 1024
+    _qwen4_short_conv_verify_window_kernel[
+        (requests * row_width, triton.cdiv(channels * state_len, block))
+    ](
+        conv_input,
+        valid_tokens,
+        intermediate_cache,
+        intermediate_cache.stride(0),
+        ROW_WIDTH=row_width,
+        CHANNELS=channels,
+        STATE_LEN=state_len,
+        BLOCK=block,
+        num_warps=4,
+    )

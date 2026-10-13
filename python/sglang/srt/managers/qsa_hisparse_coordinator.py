@@ -94,6 +94,9 @@ _SYNC_STAGING_ENV = "ARC_HISPARSE_QSA_SYNC_STAGING"
 # Debug flag (shared with the indexer's selection check): before each eager
 # swap-in, check that every block the kernel may copy from host has a record.
 _DEBUG_ENV = "ARC_HISPARSE_QSA_DEBUG"
+# arc-forge 10-13 review E5: per-layer swap-in counters (load_cache_to_device_buffer_planar miss_stats), read by the
+# arc_hostcomm_hook forward timing; 0 = off (the kernel gets no counter pointer).
+_MISS_STATS_ENV = "ARC_HISPARSE_MISS_STATS"
 
 # State the inherited HiSparseCoordinator methods read (design §2: the subclass
 # skips super().__init__ and must set every one of them itself).
@@ -200,14 +203,17 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         self.tp_world_size = torch.distributed.get_world_size(group=tp_group)
         from sglang.srt.mem_cache.qsa_hisparse_distributed import (
             AttentionTPConsensus, distributed_hisparse_enabled, distributed_spec_enabled, distributed_mtp_steps, new_spec_protocols,
+            tp4_attention_enabled,
         )
         self.distributed = distributed_hisparse_enabled()
         if self.tp_world_size != 1 and not self.distributed:
             raise NotImplementedError("QSA HiSparse is TP1 unless ARC_HISPARSE_DISTRIBUTED=1")
         self.distributed_spec = distributed_spec_enabled()
         expected_verify = distributed_mtp_steps() + 1 if self.distributed_spec else 1
-        if self.distributed and (self.tp_world_size != 2 or verify_tokens != expected_verify):
-            raise NotImplementedError("distributed HiSparse requires attention TP2 and the explicitly gated verify width")
+        attention_tp = 4 if tp4_attention_enabled() else 2
+        if self.distributed and (self.tp_world_size != attention_tp or verify_tokens != expected_verify):
+            raise NotImplementedError(f"distributed HiSparse requires attention TP{attention_tp} and the explicitly "
+                                      "gated verify width")
         if self.distributed and host_admission is None:
             raise ValueError("distributed HiSparse requires collective host admission before pin")
         if self.distributed:
@@ -277,6 +283,16 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
         # h16: set by a multi-row verify swap-in that evicted a block an earlier row of
         # the same request selected; never cleared (the server stops on it).
         self.verify_overflow = torch.zeros(1, dtype=torch.int32, device=device)
+        # ARC_HISPARSE_MISS_STATS=1: [layer, 8] int64 the swap-in kernel adds into (misses, misses^2, max,
+        # slow rows, ring hits, LRU hits, fast rows; see load_cache_to_device_buffer_planar), never cleared.
+        # A miss copies miss_record_bytes from host.
+        miss_stats = os.environ.get(_MISS_STATS_ENV, "0")
+        if miss_stats not in ("0", "1"):
+            raise ValueError(f"{_MISS_STATS_ENV} must be 0 or 1, got {miss_stats!r}")
+        self.miss_stats = (
+            torch.zeros((layer_num, 8), dtype=torch.int64, device=device) if miss_stats == "1" else None
+        )
+        self.miss_record_bytes = sum(self.mem_pool_device.plane_spec.plane_bytes)
         self._skip_first_backup = [False] * num_slots
         # M5 h17: blocks [0, host_done[r]) of row r are on host (staging sets it to
         # the prompt's complete blocks, backup_after_accept advances it; design §5.1).
@@ -1029,6 +1045,7 @@ class QSAHiSparseCoordinator(HiSparseCoordinator):
             rows_per_req=rows_per_req,
             ring_width=self.ring_width,
             overflow_flag=self.verify_overflow,
+            miss_stats=None if self.miss_stats is None else self.miss_stats[layer_id],
         )
         return top_k_device_locs
 

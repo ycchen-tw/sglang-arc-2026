@@ -555,6 +555,7 @@ def load_cache_to_device_buffer_planar(
     rows_per_req: int = 1,
     ring_width: int = 1,
     overflow_flag: torch.Tensor | None = None,
+    miss_stats: torch.Tensor | None = None,
 ) -> None:
     """HiSparse swap-in whose miss copy moves one planar host record per item.
 
@@ -571,6 +572,12 @@ def load_cache_to_device_buffer_planar(
     resolve to ring slot hot_buffer_size + block % ring_width. With K > 1,
     overflow_flag (int32 [1] on the device, never cleared here) is set when a
     row evicts a block an earlier row of its request selected.
+
+    miss_stats (arc-forge 10-13 review E5, ARC_HISPARSE_MISS_STATS): int64 [8] on
+    the device, never cleared here; every slow-path row adds [0] misses (records
+    copied from host), [1] misses^2, [3] 1, [4] ring hits, [5] LRU hits and raises
+    [2] to its misses (max); a fast-path row (seq_len <= hot_buffer_size) adds 1 to
+    [6]. [7] unused.
     """
     num_planes = len(plane_bytes)
     if not 1 <= num_planes <= PLANAR_MAX_PLANES or len(device_planes) != num_planes:
@@ -673,6 +680,18 @@ def load_cache_to_device_buffer_planar(
         or not num_real_reqs.is_cuda
     ):
         raise ValueError("num_real_reqs must be a 1-element int32 CUDA tensor")
+    if miss_stats is None:
+        miss_stats = torch.empty(0, dtype=torch.int64, device=top_k_tokens.device)
+    elif (
+        miss_stats.dtype != torch.int64
+        or miss_stats.shape != (8,)
+        or not miss_stats.is_cuda
+        or miss_stats.stride() != (1,)
+    ):
+        raise ValueError(
+            f"miss_stats must be a contiguous int64 [8] CUDA tensor, got {miss_stats.dtype} "
+            f"{tuple(miss_stats.shape)} strides {miss_stats.stride()} on {miss_stats.device}"
+        )
 
     padded_bytes = tuple(plane_bytes) + (0,) * (PLANAR_MAX_PLANES - num_planes)
     empty = torch.empty(0, dtype=torch.uint8, device=top_k_tokens.device)
@@ -695,4 +714,5 @@ def load_cache_to_device_buffer_planar(
         rows_per_req,
         ring_width,
         overflow_flag,
+        miss_stats,
     )

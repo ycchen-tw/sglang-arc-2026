@@ -257,3 +257,13 @@
   - server parity（確定性旗標）：top-5 集合一致 0.436，floor 是 0.498。
   - 沒做的部分：norm＋gate＋combine 整段融合。
   - patch：`qwen38fn_b200_perf/20261009-pre-scratch/rejected_hc_mix_fused.patch`。
+  - dense drafter 的每卡記憶體（L4 pair）：
+    - attention 切片（q/k/v 依 head 取列）改成 clone：以前 row slice 是 view，整個投影矩陣的 storage 留在每張卡上（每層每卡約 17 MB，5 層約 85 MB）。數值不變。
+    - 開 `ARC_TARGET_VOCAB` 時 selector 的兩個 codebook 只留得到的列（`CandidateSelector.prune`）：predecessor 只會是 target 取樣的 bonus token 或 drafter 提的 token，留 target 清單的列；successor 只會是 draft vocab 的候選，留 draft vocab 的列。查表經 id→列 對照，清單外的 id 對到列尾後一格，torch gather 會報錯。98k／16k 時每卡 254 → 59 MB，分數與 fused chain 的取樣逐位相同（`test_arc_dflash_selector_prune.py`）。
+    - `ARC_DFLASH_W4A8=<int4|uint4z>:<32|64|128>[:<all|mlp>]`（opt-in，預設關）：drafter 的 block FP8 linear 改成 Humming INT4 權重（由 FP8 值 RTN，每 group 一個 scale）× 每 token 動態 FP8 e4m3 activation，sm_89 照樣走 FP8 tensor core、權重 bytes 減半（每卡 FFN 393 → 約 203 MB、attention 125 → 約 64 MB）。4090 上 M=384 每層 387 µs（FP8 387 µs）、M=512 449 µs（FP8 514 µs）；權重相對誤差 g128 約 11%（FP8 2.6%），只改提案，看 accept 與速度。群組內每個 rank 都對同一份輸入算的 linear（複製的 FFN；`ARC_DFLASH_ATTN_TP=0` 時連 attention）用 Humming 的 batch-invariant tuning（不用 stream-K、K 的累加順序固定）：各 rank 自己算，提案必須逐位相同；Humming 預設對 K>1024 用 stream-K，重算結果會變（4090 上 down_proj M=48、q_proj M=384 重複 30 次 0 次相同），L4 pair 開跑一分鐘內就被 `ARC_SPEC_AGREE_DEVICE` 抓到提案分歧，batch-invariant 每個形狀 30/30 相同。每個 rank 自己的 attention 切片（q/k/v 的列、o_proj 的欄）只進這個 rank 的 o_proj all-reduce 部分和，all-reduce 後各 rank 拿到同一個和，所以維持預設 heuristic：全部 linear 都 batch-invariant 時，L4 C96 的 draft 每步比 FP8 慢 0.86 ms（同一段 harness 時間窗比較）。要 `ARC_HUMMING_DIR`（展開的 humming-kernels）與 Humming 的 CUDA root。
+- **L4 線（`exp/l4-*`，2026-10-13 併入 `all-merge`，全部 opt-in）**：arc-forge `work/qwen38fn_l4/`、`docs/research/` 的 l4opt 筆記。
+  - `ARC_HISPARSE_TP4=1`：distributed HiSparse＋DFlash 走純 TP4 attention（預設 DP2×attention-TP2）。
+  - `ARC_SHARDED_VERIFY=1`：dp-lm-head／純 TP 的 vocab-sharded verify 取樣（與 `ARC_DFLASH_SPARSE_Q` 互斥，同開 raise）。
+  - `ARC_TARGET_VOCAB=<json>`：target lm_head 只留固定的輸出詞表；`ARC_DFLASH_DRAFT_VOCAB` 在 attention-TP pair 上走 `SubsetPairHead`。
+  - `ARC_QSA_SM89_DECODE`／`ARC_QSA_SM89_STAGES`：sm_89 HiSparse direct decode 的 E2M1 decode 與 stages（決定 sm_89 的內建 tile；與 `ARC_QSA_DIRECT_TILE_TABLE` 互斥）。
+  - `ARC_GDN_STATE_FMT` 在 TP>1／attention DP（`ARC_GDN_STATE_FMT_DISTR`）、`ARC_DFLASH_SHARED_GRAPH_POOL_GROUP=1`、`ARC_DFLASH_W4A8`、`ARC_HEAPDIAG`、`ARC_HISPARSE_MISS_STATS`。

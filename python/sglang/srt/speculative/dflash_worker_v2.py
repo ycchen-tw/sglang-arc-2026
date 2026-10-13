@@ -368,6 +368,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         target_worker: TpModelWorker,
     ):
         super().__init__()
+        from sglang.srt.speculative.arc_dflash import sharded_verify
+
+        if sharded_verify.enabled():
+            raise RuntimeError(
+                "ARC_SHARDED_VERIFY=1 is for the EAGLE worker's arc DFlash drafter; "
+                "DFlashWorkerV2 reads full-vocabulary verify logits"
+            )
 
         self.server_args = server_args
         self.gpu_id = gpu_id

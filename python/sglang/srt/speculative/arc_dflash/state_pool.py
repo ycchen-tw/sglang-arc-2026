@@ -57,7 +57,7 @@ def fast_propose(model, hidden, anchor, temperature):
         from .fused_propose import chain
 
         return chain(selector, unary, candidates, projected, anchor, temperature)
-    successor = selector.successor_codebook[candidates]
+    successor = selector.succ_lookup(candidates)
     ones = torch.ones_like(temperature)
     keep = torch.full_like(temperature, -1, dtype=torch.long)
     previous = anchor

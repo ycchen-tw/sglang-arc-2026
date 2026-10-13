@@ -126,6 +126,7 @@ def compile_layers(model, deterministic: bool = False):
     ring_attention.attend = torch.compiler.disable(ring_attention.attend)
     nvfp4.Nvfp4Experts.forward = torch.compiler.disable(nvfp4.Nvfp4Experts.forward)
     fp8.Fp8BlockLinear.forward = torch.compiler.disable(fp8.Fp8BlockLinear.forward)
+    fp8.HummingW4A8Linear.forward = torch.compiler.disable(fp8.HummingW4A8Linear.forward)
     for layer in model.layers:
         layer.forward = torch.compile(layer.forward, dynamic=True, options=options)
     model.hyper_connection_mixer.forward = torch.compile(model.hyper_connection_mixer.forward, dynamic=True,

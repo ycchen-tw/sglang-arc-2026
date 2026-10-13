@@ -1319,6 +1319,15 @@ class ModelRunner:
                 is_ep_joiner=get_exec().moe.is_ep_joiner,
             )
 
+        # arc-forge ARC_TARGET_VOCAB: restrict the target lm_head to a fixed output vocabulary, before CUDA graphs and
+        # the DFlash drafter (whose subset head reads this one)
+        from sglang.srt.speculative.arc_dflash import target_vocab as _arc_tv
+
+        if _arc_tv.path() is not None and not self.is_draft_worker:
+            from pathlib import Path
+
+            _arc_tv.prune_lm_head(self.model, Path(self.model_config.model_path), self.model_config.vocab_size)
+
         self._arc_drop_checkpoint_pages_after_load()
 
     def _arc_drop_checkpoint_pages_after_load(self):
@@ -1358,8 +1367,10 @@ class ModelRunner:
                 identity = json.loads(raw)
                 result = drop_checkpoint_pages(Path(model_root), identity)
                 # Keep the broadcast and log contract plain JSON, including an advisory-only result.
+                # The flat shard roster comes from the identity (20 for REAP320 NVFP4, 104 for gEAN320 INT3 HF).
                 outcome = json.loads(json.dumps({"status": "advised", "result": result,
-                    "identity_sha256": hashlib.sha256(raw).hexdigest()}))
+                    "identity_sha256": hashlib.sha256(raw).hexdigest(),
+                    "identity_shards": sorted(n for n in identity["target_sizes"] if n.endswith(".safetensors"))}))
             except BaseException as error:
                 outcome = {"status": "failed", "error": f"{type(error).__name__}: {error}"}
         shared = [outcome]
@@ -1370,9 +1381,11 @@ class ModelRunner:
             if outcome["status"] != "advised":
                 raise RuntimeError(outcome["error"])
             result = outcome["result"]
+            shards = outcome["identity_shards"]
             if not (result["operation"] == "POSIX_FADV_DONTNEED" and result["advisory_only"] is True
-                    and result["files_advised"] == 20 and result["reclaimed_bytes"] is None):
-                raise RuntimeError("h30 helper did not publish exact20-shard advisory-only completion")
+                    and shards and sorted(result["files"]) == shards and result["files_advised"] == len(shards)
+                    and result["reclaimed_bytes"] is None):
+                raise RuntimeError("h30 helper did not publish an advisory-only completion over exactly the identity's shards")
         except BaseException as failure:
             error = f"{type(failure).__name__}: {failure}"
         acknowledgements = [None] * len(ranks)

@@ -31,24 +31,26 @@ from .sampling import Proposal
 
 @triton.jit
 def _chain_kernel(
-    UNARY, PROJ, CAND, PRED, SUCC, ANCHOR, TEMP, U, TOK, Q, SEL,
-    s_ub, s_up, s_pb, s_pp, s_cb, s_cp, s_pred, s_succ, s_tb, s_qb, s_qp, s_sb,
+    UNARY, PROJ, CAND, CAND_PRED, CAND_SUCC, PRED, SUCC, ANCHOR, TEMP, U, TOK, Q, SEL,
+    s_ub, s_up, s_pb, s_pp, s_cb, s_cp, s_rpb, s_rpp, s_rsb, s_rsp, s_pred, s_succ, s_tb, s_qb, s_qp, s_sb,
     K: tl.constexpr, R: tl.constexpr, STEPS: tl.constexpr, TINY: tl.constexpr,
     CONTEXT_DTYPE: tl.constexpr, PAIR_DTYPE: tl.constexpr,
 ):
     b = tl.program_id(0)
     k = tl.arange(0, K)
     r = tl.arange(0, R)
-    prev = tl.load(ANCHOR + b)
+    prev = tl.load(ANCHOR + b)  # the predecessor's codebook row (CandidateSelector.prune: not the token id)
     t = tl.load(TEMP + b)
     greedy = t == 0
     inv_t = 1.0 / tl.maximum(t, TINY)
     for p in tl.static_range(STEPS):
         cand = tl.load(CAND + b * s_cb + p * s_cp + k)
+        cand_pred = tl.load(CAND_PRED + b * s_rpb + p * s_rpp + k)
+        cand_succ = tl.load(CAND_SUCC + b * s_rsb + p * s_rsp + k)
         pred = tl.load(PRED + prev * s_pred + r)
         proj = tl.load(PROJ + b * s_pb + p * s_pp + r)
         context = (pred.to(tl.float32) * proj.to(tl.float32)).to(CONTEXT_DTYPE).to(tl.float32)
-        succ = tl.load(SUCC + cand[:, None] * s_succ + r[None, :]).to(tl.float32)
+        succ = tl.load(SUCC + cand_succ[:, None] * s_succ + r[None, :]).to(tl.float32)
         pair = tl.sum(succ * context[None, :], 1).to(PAIR_DTYPE).to(tl.float32)
         score = tl.load(UNARY + b * s_ub + p * s_up + k) + pair
         top = tl.max(score, 0)
@@ -59,9 +61,9 @@ def _chain_kernel(
         q = tl.where(greedy, tl.where(k == first_top, 1.0, 0.0), q)
         u = tl.load(U + b * STEPS + p)
         index = tl.minimum(tl.sum((tl.cumsum(q, 0) <= u).to(tl.int32), 0), K - 1)
-        prev = tl.sum(tl.where(k == index, cand, 0), 0)
+        prev = tl.sum(tl.where(k == index, cand_pred, 0), 0)
         tl.store(Q + b * s_qb + p * s_qp + k, q)
-        tl.store(TOK + b * s_tb + p, prev)
+        tl.store(TOK + b * s_tb + p, tl.sum(tl.where(k == index, cand, 0), 0))
         tl.store(SEL + b * s_sb + p, index.to(tl.int64))
 
 
@@ -71,7 +73,9 @@ _TL = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl
 def chain(selector, unary, candidates, projected, anchor, temperature, uniform=None) -> Proposal:
     """unary [B, S, K] fp32, candidates [B, S, K] int64, projected [B, S, R] (hidden_projection's output),
     anchor [B] int64, temperature [B] fp32 -> Proposal (tokens, candidates, q [B, S, K] fp32, selected).
-    uniform: [B, S] fp32 draws in [0, 1) (tests); by default drawn here from the default generator."""
+    uniform: [B, S] fp32 draws in [0, 1) (tests); by default drawn here from the default generator.
+    With pruned codebooks (CandidateSelector.prune) the kernel reads rows through the selector's id -> row tables:
+    candidates and the anchor stay vocabulary ids, the tokens it writes are vocabulary ids."""
     batch, steps, k = unary.shape
     rank = projected.shape[-1]
     pred, succ = selector.predecessor_codebook, selector.successor_codebook
@@ -91,6 +95,11 @@ def chain(selector, unary, candidates, projected, anchor, temperature, uniform=N
     if pred.stride(1) != 1 or succ.stride(1) != 1 or projected.stride(-1) != 1 or unary.stride(-1) != 1 \
             or candidates.stride(-1) != 1:
         raise ValueError("chain: inner dimensions must be contiguous")
+    if selector.pred_rows is None:
+        cand_pred, cand_succ, anchor_row = candidates, candidates, anchor
+    else:
+        cand_pred, cand_succ = selector.pred_rows[candidates], selector.succ_rows[candidates]
+        anchor_row = selector.pred_rows[anchor]
     if uniform is None:
         uniform = torch.empty((batch, steps), dtype=torch.float32, device=unary.device).uniform_()
     elif uniform.shape != (batch, steps) or uniform.dtype != torch.float32 or not uniform.is_contiguous():
@@ -100,9 +109,10 @@ def chain(selector, unary, candidates, projected, anchor, temperature, uniform=N
     q = torch.empty((batch, steps, k), dtype=torch.float32, device=unary.device)
     if batch:
         _chain_kernel[(batch,)](
-            unary, projected, candidates, pred, succ, anchor, temperature, uniform, tokens, q, selected,
-            unary.stride(0), unary.stride(1), projected.stride(0), projected.stride(1),
-            candidates.stride(0), candidates.stride(1), pred.stride(0), succ.stride(0),
+            unary, projected, candidates, cand_pred, cand_succ, pred, succ, anchor_row, temperature, uniform, tokens, q,
+            selected, unary.stride(0), unary.stride(1), projected.stride(0), projected.stride(1),
+            candidates.stride(0), candidates.stride(1), cand_pred.stride(0), cand_pred.stride(1),
+            cand_succ.stride(0), cand_succ.stride(1), pred.stride(0), succ.stride(0),
             tokens.stride(0), q.stride(0), q.stride(1), selected.stride(0),
             K=k, R=rank, STEPS=steps, TINY=torch.finfo(torch.float32).tiny,
             CONTEXT_DTYPE=_TL[context_dtype], PAIR_DTYPE=_TL[pair_dtype],

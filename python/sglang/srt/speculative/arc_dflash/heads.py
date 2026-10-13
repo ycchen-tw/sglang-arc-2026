@@ -4,7 +4,9 @@ One GPU (G4): the target's lm_head is the whole vocabulary, `TargetHead`. Attent
 TP4 target, attention DP2, pairs): the target's lm_head is vocab-sharded over all TP ranks, so each rank adds the
 rows of its counterparts in the other DP groups (read from the target checkpoint), takes the top-k of what it holds,
 and the group merges by all-gather: `PairHead`. Both expose topk(x, k) -> (values, ids) over the full vocabulary,
-which is all the proposal step (state_pool.fast_propose) reads.
+which is all the proposal step (state_pool.fast_propose) reads. ARC_DFLASH_DRAFT_VOCAB restricts either to a fixed
+id list (`SubsetHead`, `SubsetPairHead`). Under ARC_TARGET_VOCAB the target head holds a slice of a kept-id list
+(target_vocab.py) and the drafter's subset head takes its rows from that slice.
 """
 
 from __future__ import annotations
@@ -16,6 +18,24 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+from sglang.srt.speculative.arc_dflash import target_vocab
+
+
+# arc-forge ARC_DFLASH_FAST_TOPK (opt-in, default 0): the vocabulary top-k of TargetHead / PairHead by fast_topk
+# (two Triton passes; the same set and order, ties to the lower id) instead of torch.topk
+FAST_TOPK = os.environ.get("ARC_DFLASH_FAST_TOPK", "0")
+if FAST_TOPK not in ("0", "1"):
+    raise ValueError(f"ARC_DFLASH_FAST_TOPK must be 0 or 1, got {FAST_TOPK!r}")
+
+
+def _vocab_topk(logits, k: int):
+    """top-k over the last dimension of 2-D logits."""
+    if FAST_TOPK == "1":
+        from .fast_topk import topk
+
+        return topk(logits, k)
+    return logits.topk(k, -1)
 
 
 # arc-forge ARC_DFLASH_FAST_TOPK (opt-in, default 0): the vocabulary top-k of TargetHead / PairHead by fast_topk
@@ -124,6 +144,53 @@ class PairHead(nn.Module):
         return top.view(*x.shape[:-1], k), i.gather(-1, pick).view(*x.shape[:-1], k)
 
 
+class SubsetPairHead(nn.Module):
+    """PairHead over a fixed draft vocabulary (ARC_DFLASH_DRAFT_VOCAB): each rank keeps the listed rows of the
+    vocabulary it holds (build_head checked that the group holds every id exactly once), takes their top-k, and the
+    group merges by all-gather exactly as PairHead does. Proposals only, as SubsetHead: the target still verifies
+    against its full distribution. On L4 (dp-lm-head pairs) the full head is a [rows, 124k] BF16 GEMM per rank,
+    ~2.9 ms of each draft step at C48 (e1 trace)."""
+
+    MIN_ROWS = 64  # every rank must hold at least the draft top-k
+
+    def __init__(self, parts, ids: torch.Tensor, vocab: int, group):
+        """parts: (weight [rows, H], row_ids [rows] int64 vocabulary ids) this rank scores; the listed ids among them
+        are kept, in row order."""
+        super().__init__()
+        weights, maps = [], []
+        for w, row_ids in parts:
+            if row_ids.shape != (w.shape[0],):
+                raise ValueError(f"SubsetPairHead: weight {tuple(w.shape)} with row ids {tuple(row_ids.shape)}")
+            pos = torch.isin(row_ids, ids).nonzero().squeeze(1)
+            if pos.numel():
+                weights.append(w.index_select(0, pos))
+                maps.append(row_ids[pos])
+        rows = sum(m.numel() for m in maps)
+        if rows < self.MIN_ROWS:
+            raise RuntimeError(f"ARC_DFLASH_DRAFT_VOCAB: this rank holds {rows} of the {ids.numel()} draft ids "
+                               f"(< {self.MIN_ROWS}); the list does not span the group's vocabulary shards")
+        # Zero rows up to a multiple of 64, sliced off before the top-k: an odd row count (17,131 on an L4 pair rank)
+        # leaves the logits' row stride unaligned and cuBLAS falls back to an align1 kernel (L4 654 us per draft
+        # step; 4090 215 -> 138 us padded).
+        sub = torch.cat(weights)
+        self.rows = sub.shape[0]
+        pad = -self.rows % 64
+        if pad:
+            sub = torch.cat([sub, sub.new_zeros(pad, sub.shape[1])])
+        self.register_buffer("sub", sub.contiguous(), persistent=False)
+        self.register_buffer("map", torch.cat(maps), persistent=False)
+        self.vocab, self.group = vocab, group
+
+    def topk(self, x, k: int):
+        flat = x.reshape(-1, x.shape[-1])
+        v, local = F.linear(flat, self.sub)[:, : self.rows].topk(k, -1)
+        i = self.map[local]
+        if self.group.world_size > 1:
+            v, i = self.group.all_gather(v.contiguous(), dim=-1), self.group.all_gather(i.contiguous(), dim=-1)
+        top, pick = v.topk(k, -1)
+        return top.view(*x.shape[:-1], k), i.gather(-1, pick).view(*x.shape[:-1], k)
+
+
 def vocab_shard(vocab: int, rank: int, size: int) -> tuple[int, int]:
     """[start, end) of the original vocabulary on TP rank `rank` (VocabParallelEmbedding with page 64 padding)."""
     padded = -(-vocab // 64) * 64
@@ -134,7 +201,8 @@ def vocab_shard(vocab: int, rank: int, size: int) -> tuple[int, int]:
 
 
 def build_head(target_model, model_dir: Path, device, vocab: int, hidden: int, group):
-    """TargetHead when this rank's target lm_head is the whole vocabulary, else the group's PairHead."""
+    """TargetHead when this rank's target lm_head is the whole vocabulary, else the group's PairHead (SubsetHead /
+    SubsetPairHead under ARC_DFLASH_DRAFT_VOCAB)."""
     from safetensors import safe_open
 
     from sglang.srt.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
@@ -142,6 +210,8 @@ def build_head(target_model, model_dir: Path, device, vocab: int, hidden: int, g
     head = getattr(target_model, "lm_head", None)
     if head is None or head.weight.dtype != torch.bfloat16 or head.weight.shape[1] != hidden:
         raise RuntimeError(f"target lm_head is not a BF16 [*, {hidden}] matrix: {head}")
+    if target_vocab.is_pruned(head):
+        return _pruned_target_head(head, vocab, group)
     si = head.shard_indices
     own = (si.org_vocab_start_index, si.org_vocab_end_index)
     if own == (0, vocab):
@@ -151,8 +221,6 @@ def build_head(target_model, model_dir: Path, device, vocab: int, hidden: int, g
             raise RuntimeError(f"target lm_head {tuple(head.weight.shape)} != [{vocab}, {hidden}]")
         ids = draft_vocab(vocab, head.weight.device)
         return TargetHead(head.weight) if ids is None else SubsetHead(head.weight, ids)
-    if os.environ.get("ARC_DFLASH_DRAFT_VOCAB"):
-        raise RuntimeError("ARC_DFLASH_DRAFT_VOCAB is implemented for a full-vocabulary lm_head on one GPU only")
     rows = own[1] - own[0]
     parts = [(head.weight[:rows], own[0])]
     covered = [own]
@@ -184,4 +252,27 @@ def build_head(target_model, model_dir: Path, device, vocab: int, hidden: int, g
         edge = end
     if edge != vocab:
         raise RuntimeError(f"lm_head spans {spans} stop at {edge}, vocab {vocab}")
-    return PairHead(parts, vocab, group)
+    ids = draft_vocab(vocab, device)
+    if ids is None:
+        return PairHead(parts, vocab, group)
+    return SubsetPairHead([(w, torch.arange(first, first + w.shape[0], device=w.device)) for w, first in parts],
+                          ids, vocab, group)
+
+
+def _pruned_target_head(head, vocab: int, group):
+    """ARC_TARGET_VOCAB: the target head holds this rank's slice of the kept ids (target_vocab.prune_lm_head); the
+    draft vocabulary must lie inside the list, and each draft id is then on exactly one rank of the group."""
+    t = target_vocab.tables()
+    if group.world_size != t["n"] or group.rank_in_group != t["rank"]:
+        raise RuntimeError(f"ARC_TARGET_VOCAB: drafter group rank {group.rank_in_group}/{group.world_size}, target "
+                           f"head sliced for {t['rank']}/{t['n']}")
+    ids = draft_vocab(vocab, head.weight.device)
+    if ids is None:
+        raise RuntimeError("ARC_TARGET_VOCAB needs ARC_DFLASH_DRAFT_VOCAB (the drafter proposes inside the target list)")
+    off = ids[t["g2c"][ids] < 0]
+    if off.numel():
+        raise RuntimeError(f"ARC_DFLASH_DRAFT_VOCAB: {off.numel()} draft ids are not in ARC_TARGET_VOCAB, e.g. "
+                           f"{off[:5].tolist()}")
+    if head.weight.shape[0] != t["mine"].numel():
+        raise RuntimeError(f"ARC_TARGET_VOCAB: head {tuple(head.weight.shape)} vs {t['mine'].numel()} kept rows")
+    return SubsetPairHead([(head.weight, t["mine"])], ids, vocab, group)

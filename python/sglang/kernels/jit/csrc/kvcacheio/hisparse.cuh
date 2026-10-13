@@ -465,7 +465,8 @@ __global__ void load_cache_to_device_buffer_kernel(
     const PlanePtrs planes,
     int32_t rows_per_req,
     int32_t ring_width,
-    int32_t* __restrict__ overflow_flag) {
+    int32_t* __restrict__ overflow_flag,
+    unsigned long long* __restrict__ miss_stats) {
   static_assert(!IsDsv4Layout || IsMLA, "DSv4 page-padded layout is K-only (MLA).");
   // todo hisparse: support page wise sparsity
   constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
@@ -560,6 +561,9 @@ __global__ void load_cache_to_device_buffer_kernel(
         if (tid == 0) {
           miss_count_out[bid] = 0;
         }
+      }
+      if (miss_stats != nullptr && tid == 0) {
+        atomicAdd(miss_stats + 6, 1ull);  // fast rows (see the slow path's counters below)
       }
       continue;
     }
@@ -770,6 +774,18 @@ __global__ void load_cache_to_device_buffer_kernel(
     __syncthreads();
 
     total_misses = NUM_TOP_K - s_total_hits - s_ring_hits;
+    // arc-forge 10-13 review E5 (ARC_HISPARSE_MISS_STATS): this slow row's swap-in counts, added by thread 0
+    // into miss_stats [0] misses, [1] misses^2, [2] max misses of one row, [3] slow rows, [4] ring hits,
+    // [5] LRU hits; [6] counts fast rows (seq_len <= HOT_BUFFER_SIZE, nothing loaded).
+    if (miss_stats != nullptr && tid == 0) {
+      const unsigned long long m = static_cast<unsigned long long>(total_misses);
+      atomicAdd(miss_stats + 0, m);
+      atomicAdd(miss_stats + 1, m * m);
+      atomicMax(miss_stats + 2, m);
+      atomicAdd(miss_stats + 3, 1ull);
+      atomicAdd(miss_stats + 4, static_cast<unsigned long long>(s_ring_hits));
+      atomicAdd(miss_stats + 5, static_cast<unsigned long long>(s_total_hits));
+    }
     if constexpr (RecordMissPlan) {
       if (tid == 0) {
         miss_count_out[bid] = total_misses;
@@ -848,6 +864,7 @@ struct SwapInCaches {
   int32_t* miss_dst;
   int32_t* miss_count;
   int64_t plan_stride;
+  unsigned long long* miss_stats = nullptr;  // planar entry only: see the kernel (ARC_HISPARSE_MISS_STATS)
 };
 
 template <
@@ -933,7 +950,8 @@ void launch_load_cache_to_device_buffer(
         planes,
         static_cast<int32_t>(rows_per_req),
         static_cast<int32_t>(ring_width),
-        overflow_flag);
+        overflow_flag,
+        caches.miss_stats);
   };
 
   const auto seq_dtype = seq_lens.dtype();
@@ -1099,7 +1117,8 @@ void load_cache_to_device_buffer_planar(
     tvm::ffi::TensorView num_real_reqs,
     int64_t rows_per_req,
     int64_t ring_width,
-    tvm::ffi::TensorView overflow_flag) {
+    tvm::ffi::TensorView overflow_flag,
+    tvm::ffi::TensorView miss_stats) {
   using namespace host;
   using Spec = PlanarSpec<P0, P1, P2, P3>;
   static_assert(Spec::N > 0, "planar swap-in needs at least one plane");
@@ -1147,8 +1166,26 @@ void load_cache_to_device_buffer_planar(
         "planar swap-in: overflow_flag must be an int32 CUDA tensor");
     overflow_ptr = static_cast<int32_t*>(overflow_flag.data_ptr());
   }
+  // arc-forge 10-13 review E5: swap-in telemetry, 8 uint64 counters on the device (empty = off).
+  unsigned long long* stats_ptr = nullptr;
+  if (miss_stats.numel() > 0) {
+    const auto stats_dtype = miss_stats.dtype();
+    RuntimeCheck(
+        miss_stats.numel() == 8 && stats_dtype.code == kDLInt && stats_dtype.bits == 64 &&
+            miss_stats.device().device_type == kDLCUDA && miss_stats.stride(0) == 1,
+        "planar swap-in: miss_stats must be 8 contiguous int64 on the device");
+    stats_ptr = static_cast<unsigned long long*>(miss_stats.data_ptr());
+  }
   const SwapInCaches caches{
-      runtime::get_device_accessible_ptr(host_records), nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0};
+      runtime::get_device_accessible_ptr(host_records),
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
+      0,
+      stats_ptr};
   launch_load_cache_to_device_buffer<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, true, false, false, SkipIO, Spec>(
       top_k_tokens,
       device_buffer_tokens,

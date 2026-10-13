@@ -360,6 +360,16 @@ def gdn_replayssm_track_packed_kernel(
                        i_v, K, BV, FOLD_BK, O_LO, O_SC, LO_BITS, QMAX, False)
 
 
+def _check_heads(hv: int, h: int, *, v_heads: dict, k_heads: dict) -> None:
+    """The kernels give value head i the key head i // (HV / H) and index every ring by head, so all of a rank's
+    tensors must carry its own head counts (an attention-TP shard divides HV and H by the same attn_tp_size)."""
+    bad = {name: n for name, n in v_heads.items() if n != hv}
+    bad.update({name: n for name, n in k_heads.items() if n != h})
+    if h <= 0 or hv % h or bad:
+        raise ValueError(f"packed GDN kernels need HV % H == 0 and every tensor on HV={hv} value / H={h} key "
+                         f"heads; off: {bad}")
+
+
 def _fmt_consts(fmt: StateFmt, v: int, k: int) -> dict:
     _, o_lo, o_sc = fmt.offsets(v, k)
     return dict(NB=fmt.head_bytes(v, k), O_LO=o_lo, O_SC=o_sc, LO_BITS=fmt.lo_bits, QMAX=float(fmt.qmax))
@@ -380,6 +390,11 @@ def launch_spec_verify_packed(*, fmt, q, k, v, a, b, A_log, dt_bias, out, state,
         raise ValueError("packed state heads must be contiguous")
     if rawv_cache is None or rawk_cache is None:
         raise ValueError("the packed verify needs the compact D/K low-part rings")
+    _check_heads(HV, H,
+                 v_heads=dict(a=a.shape[1], b=b.shape[1], out=out.shape[1], A_log=A_log.numel(),
+                              dt_bias=dt_bias.numel(), d_cache=d_cache.shape[1], rawv_cache=rawv_cache.shape[1],
+                              g_cache=g_cache.shape[1]),
+                 k_heads=dict(q=q.shape[1], k_cache=k_cache.shape[1], rawk_cache=rawk_cache.shape[1]))
     if max_cache_len < 16 or max_cache_len & (max_cache_len - 1):
         raise ValueError(f"ring length {max_cache_len} must be a power of two >= 16")
     BK = triton.next_power_of_2(K)
@@ -409,6 +424,9 @@ def launch_track_packed(*, fmt, state, d_cache, k_cache, g_cache, d_residual_cac
     if d_residual_cache is None or k_residual_cache is None:
         raise ValueError("the packed commit needs the compact D/K low-part rings")
     H = k_cache.shape[2]
+    _check_heads(HV, H, v_heads=dict(d_cache=d_cache.shape[2], d_residual_cache=d_residual_cache.shape[2],
+                                     g_cache=g_cache.shape[2]),
+                 k_heads=dict(k_residual_cache=k_residual_cache.shape[2]))
     B = state_batch_indices.shape[0]
     BV = GROUP_V
     gdn_replayssm_track_packed_kernel[(triton.cdiv(v_dim, BV), B, HV * num_layers)](

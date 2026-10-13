@@ -1357,6 +1357,20 @@ def _e2m1_pair_f32(b, DECODE: tl.constexpr):
 
 
 @triton.jit
+def _e2m1_pair_bf16(b):
+    """uint8 packed E2M1 pairs -> (low nibble, high nibble) as bf16, by bit construction (bf16 keeps fp32's
+    exponent bias, so the fp32 pattern of DECODE 1 shifted right by 16). Every E2M1 value is exact in bf16."""
+    bi = b.to(tl.int32)
+    lo = bi & 0x0F
+    hi = bi >> 4
+    elo = lo & 7
+    ehi = hi & 7
+    blo = tl.where(elo >= 2, (elo + 252) << 6, tl.where(elo == 1, 0x3F00, 0)) | ((lo & 8) << 12)
+    bhi = tl.where(ehi >= 2, (ehi + 252) << 6, tl.where(ehi == 1, 0x3F00, 0)) | ((hi & 8) << 12)
+    return blo.to(tl.int16).to(tl.bfloat16, bitcast=True), bhi.to(tl.int16).to(tl.bfloat16, bitcast=True)
+
+
+@triton.jit
 def _qsa_direct_decode(
     q, k, v, k_sf, v_sf, table, table_rows, indices, lens, out, part_o, part_ml,
     sm_scale, k_global, v_global, topk, table_stride, chunk,
@@ -1400,11 +1414,20 @@ def _qsa_direct_decode(
         if FP4:
             kb = tl.load(k + tok[None, :] * (HEADS * HALF) + kv_head * HALF + offs_p[:, None],
                          mask=valid[None, :], other=0)
-            ks = tl.load(k_sf + tok[None, :] * (HEADS * SF) + kv_head * SF + offs_s[:, None],
-                         mask=valid[None, :], other=0.0).to(tl.float32)
-            ks = tl.reshape(tl.broadcast_to(tl.reshape(ks, (SF, 1, BLOCK_N)), (SF, 8, BLOCK_N)), (HALF, BLOCK_N))
-            k_lo, k_hi = _e2m1_pair_f32(kb, DECODE)
-            scores = tl.dot(qe, (k_lo * ks).to(tl.bfloat16)) + tl.dot(qo, (k_hi * ks).to(tl.bfloat16))
+            if DECODE == 3:
+                # bf16 dequant: an E2M1 value times an E4M3 scale has at most 6 significant bits, so the bf16
+                # product is the exact fp32 product -- bitwise the fp32 path's (x * s).to(bf16), fewer instructions
+                ks = tl.load(k_sf + tok[None, :] * (HEADS * SF) + kv_head * SF + offs_s[:, None],
+                             mask=valid[None, :], other=0.0).to(tl.bfloat16)
+                ks = tl.reshape(tl.broadcast_to(tl.reshape(ks, (SF, 1, BLOCK_N)), (SF, 8, BLOCK_N)), (HALF, BLOCK_N))
+                k_lo, k_hi = _e2m1_pair_bf16(kb)
+                scores = tl.dot(qe, k_lo * ks) + tl.dot(qo, k_hi * ks)
+            else:
+                ks = tl.load(k_sf + tok[None, :] * (HEADS * SF) + kv_head * SF + offs_s[:, None],
+                             mask=valid[None, :], other=0.0).to(tl.float32)
+                ks = tl.reshape(tl.broadcast_to(tl.reshape(ks, (SF, 1, BLOCK_N)), (SF, 8, BLOCK_N)), (HALF, BLOCK_N))
+                k_lo, k_hi = _e2m1_pair_f32(kb, DECODE)
+                scores = tl.dot(qe, (k_lo * ks).to(tl.bfloat16)) + tl.dot(qo, (k_hi * ks).to(tl.bfloat16))
         else:
             kt = tl.load(k + tok[None, :] * (HEADS * DIM) + kv_head * DIM + offs_d[:, None],
                          mask=valid[None, :], other=0.0).to(tl.bfloat16)
@@ -1418,13 +1441,21 @@ def _qsa_direct_decode(
         if FP4:
             vb = tl.load(v + tok[:, None] * (HEADS * HALF) + kv_head * HALF + offs_p[None, :],
                          mask=valid[:, None], other=0)
-            vs = tl.load(v_sf + tok[:, None] * (HEADS * SF) + kv_head * SF + offs_s[None, :],
-                         mask=valid[:, None], other=0.0).to(tl.float32)
-            vs = tl.reshape(tl.broadcast_to(tl.reshape(vs, (BLOCK_N, SF, 1)), (BLOCK_N, SF, 8)), (BLOCK_N, HALF))
-            v_lo, v_hi = _e2m1_pair_f32(vb, DECODE)
             pb = p.to(tl.bfloat16)
-            acc_e = tl.dot(pb, (v_lo * vs).to(tl.bfloat16), acc_e * alpha[:, None])
-            acc_o = tl.dot(pb, (v_hi * vs).to(tl.bfloat16), acc_o * alpha[:, None])
+            if DECODE == 3:
+                vs = tl.load(v_sf + tok[:, None] * (HEADS * SF) + kv_head * SF + offs_s[None, :],
+                             mask=valid[:, None], other=0.0).to(tl.bfloat16)
+                vs = tl.reshape(tl.broadcast_to(tl.reshape(vs, (BLOCK_N, SF, 1)), (BLOCK_N, SF, 8)), (BLOCK_N, HALF))
+                v_lo, v_hi = _e2m1_pair_bf16(vb)
+                acc_e = tl.dot(pb, v_lo * vs, acc_e * alpha[:, None])
+                acc_o = tl.dot(pb, v_hi * vs, acc_o * alpha[:, None])
+            else:
+                vs = tl.load(v_sf + tok[:, None] * (HEADS * SF) + kv_head * SF + offs_s[None, :],
+                             mask=valid[:, None], other=0.0).to(tl.float32)
+                vs = tl.reshape(tl.broadcast_to(tl.reshape(vs, (BLOCK_N, SF, 1)), (BLOCK_N, SF, 8)), (BLOCK_N, HALF))
+                v_lo, v_hi = _e2m1_pair_f32(vb, DECODE)
+                acc_e = tl.dot(pb, (v_lo * vs).to(tl.bfloat16), acc_e * alpha[:, None])
+                acc_o = tl.dot(pb, (v_hi * vs).to(tl.bfloat16), acc_o * alpha[:, None])
         else:
             vt = tl.load(v + tok[:, None] * (HEADS * DIM) + kv_head * DIM + offs_d[None, :],
                          mask=valid[:, None], other=0.0).to(tl.bfloat16)
@@ -1482,7 +1513,11 @@ def qsa_sparse_decode_direct(
     feature, with k_sf/v_sf E4M3 [slots, kv_heads, dim/16]) or FP8 E4M3 [slots, kv_heads, dim] (k_sf/v_sf None);
     slot = table[table_rows[r], indices[r, j]] for 0 <= indices[r, j] < lens[r]. chunk (a multiple of block_n)
     splits the selection; None = one split. Returns BF16 [rows, q_heads, dim]; a row with no valid slot is 0.
+    decode (NVFP4): 0 arithmetic E2M1 -> fp32, 1 fp32 bit construction, 2 cvt.e2m1x2 (sm_100+), 3 bf16 bit
+    construction with a bf16 scale multiply (exact, so all four give the same bits; 3 is the cheapest on sm_89).
     """
+    if decode not in (0, 1, 2, 3):
+        raise ValueError(f"decode must be 0, 1, 2 or 3, got {decode!r}")
     rows, q_heads, dim = q.shape
     fp4 = k.dtype == torch.uint8
     if q.dtype != torch.bfloat16 or not q.is_contiguous() or not indices.is_contiguous():

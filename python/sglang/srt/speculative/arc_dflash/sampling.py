@@ -140,7 +140,7 @@ def propose_path(model, hidden, anchor, *, temperature=1.0, top_p=1.0, top_k=-1,
     # Nothing in the chain feeds these two, so they run once for all positions
     # instead of once per step. The chain itself was 89% of this function.
     projected = selector.hidden_projection(hidden)
-    successor = selector.successor_codebook[candidates]
+    successor = selector.succ_lookup(candidates)
     previous = anchor
     tokens, probabilities, selected = [], [], []
     for position in range(hidden.shape[1]):

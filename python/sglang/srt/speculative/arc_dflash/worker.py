@@ -242,7 +242,9 @@ def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, 
 
     from safetensors import safe_open
 
-    from .fp8 import BLOCK, AllReduced, Fp8BlockLinear
+    from . import target_vocab
+    from .fp8 import BLOCK, AllReduced, Fp8BlockLinear, HummingW4A8Linear, dequant_block_fp8, w4a8_spec
+    from .heads import draft_vocab
 
     # the runner's device is "cuda" without an index; safetensors would read "cuda" as cuda:0 on every rank (on L4 the
     # other three ranks then put their drafter on GPU 0 and the TP group's KV budget fails there): name this rank's GPU
@@ -261,9 +263,17 @@ def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, 
         raise ValueError(f"{directory}: not a dense B8 drafter (ffn_type {c.ffn_type}, block {c.block_size})")
     rank, size = group.rank_in_group, group.world_size
     shard = size > 1 and os.environ.get("ARC_DFLASH_ATTN_TP", "1") == "1"
-    if shard and (c.num_attention_heads % size or c.num_key_value_heads % size):
-        raise ValueError(f"{c.num_attention_heads}/{c.num_key_value_heads} heads do not divide across {size} ranks")
-    heads, kv, dim = c.num_attention_heads // size, c.num_key_value_heads // size, c.head_dim
+    kv_rep = 1  # ranks sharing one KV head
+    if shard:
+        if c.num_attention_heads % size:
+            raise ValueError(f"{c.num_attention_heads} query heads do not divide across {size} ranks")
+        if c.num_key_value_heads % size:
+            # more ranks than KV heads (L4 pure TP4: 24 query / 2 KV heads over 4): each KV head is replicated on
+            # size / num_kv ranks, each holding a contiguous part of that head's query group (GQA groups stay whole)
+            if size % c.num_key_value_heads:
+                raise ValueError(f"{c.num_key_value_heads} KV heads neither divide nor tile {size} ranks")
+            kv_rep = size // c.num_key_value_heads
+    heads, kv, dim = c.num_attention_heads // size, max(1, c.num_key_value_heads // size), c.head_dim
 
     def attention_slice(name):
         """(axis, start, count) of this rank's part of an attention projection, or None (kept whole)."""
@@ -273,20 +283,24 @@ def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, 
         if proj == "q_proj":  # [head, 2 * head_dim] rows per head: the value and its gate, contiguous
             return 0, rank * heads * 2 * dim, heads * 2 * dim
         if proj in ("k_proj", "v_proj"):
-            return 0, rank * kv * dim, kv * dim
+            return 0, (rank // kv_rep) * kv * dim, kv * dim
         if proj == "o_proj":
             return 1, rank * heads * dim, heads * dim
         return None
 
+    # This rank's slice as its own tensor: a row slice (q/k/v) is a contiguous view, and keeping the view kept the
+    # whole projection's storage alive (~17 MB per layer per rank on the L4 pair)
     def narrow(t, cut):
         axis, start, count = cut
-        return t.narrow(axis, start, count)
+        return t.narrow(axis, start, count).clone()
 
     def narrow_fp8(weight, scale, cut):
         axis, start, count = cut
         if start % BLOCK or count % BLOCK:
             raise ValueError(f"attention slice {cut} cuts through a {BLOCK}x{BLOCK} FP8 block")
-        return weight.narrow(axis, start, count), scale.narrow(axis, start // BLOCK, count // BLOCK)
+        return weight.narrow(axis, start, count).clone(), scale.narrow(axis, start // BLOCK, count // BLOCK).clone()
+
+    w4a8 = w4a8_spec()
 
     if quant is not None and quant.get("method") != "block_fp8":
         raise ValueError(f"{directory}: quantization {quant.get('method')!r}; this loader reads block_fp8 only")
@@ -295,7 +309,7 @@ def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, 
     model.embed_tokens = TargetEmbedding(target_model.get_input_embeddings())
     model.lm_head = nn.Module()  # replaced below
     model = model.to_empty(device=device).to(torch.bfloat16)
-    loaded, fp8_modules = set(), []
+    loaded, fp8_modules, served_fp8, w4a8_modules, w4a8_invariant = set(), [], [], [], []
     for filename in manifest["files"]:
         with safe_open(str(directory / filename), framework="pt", device=str(device)) as f:
             keys = set(f.keys())
@@ -319,8 +333,19 @@ def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, 
                     if cut is not None:
                         value, scale = narrow_fp8(value, scale, cut)
                     parent, _, child = name.rpartition(".")
-                    setattr(model.get_submodule(parent), child, Fp8BlockLinear(value, scale))
-                    fp8_modules.append(name)
+                    if w4a8 is not None and (w4a8[3] == "all" or ".mlp.routed." in name):
+                        # every rank computes a whole (unsliced) linear on the same input: bitwise equal or the
+                        # group's proposals diverge; a rank's attention slice feeds only its o_proj all-reduce part
+                        module = HummingW4A8Linear(dequant_block_fp8(value, scale), w4a8,
+                                                   batch_invariant=size > 1 and cut is None)
+                        w4a8_modules.append(name)
+                        if module.batch_invariant:
+                            w4a8_invariant.append(name)
+                    else:
+                        module = Fp8BlockLinear(value, scale)
+                        served_fp8.append(name)
+                    setattr(model.get_submodule(parent), child, module)
+                    fp8_modules.append(name)  # stored as FP8: the config's quantization record
                 elif cut is not None:  # a BF16 attention projection: this rank's slice replaces the whole matrix
                     linear = model.get_submodule(name)
                     linear.weight = nn.Parameter(narrow(value, cut).contiguous(), requires_grad=False)
@@ -343,6 +368,10 @@ def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, 
     if stray:
         raise RuntimeError(f"{directory}: FP8 modules {stray[:4]} are not declared in config quantization.modules")
     model.lm_head = build_head(target_model, model_dir, device, c.vocab_size, c.hidden_size, group)
+    if target_vocab.is_pruned(getattr(target_model, "lm_head", None)):
+        # predecessors are the target's sampled bonus tokens (inside ARC_TARGET_VOCAB) and drafted tokens, candidates
+        # are draft-vocabulary ids (build_head checked those are inside the target list): the other rows are dead
+        model.candidate_selector.prune(target_vocab.tables()["c2g"].to(device), draft_vocab(c.vocab_size, device))
     if shard:
         # the per-rank heads: the attention modules, the window state pool and the blank states all read them
         AllReduced.forward = torch.compiler.disable(AllReduced.forward)
@@ -352,12 +381,17 @@ def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, 
             want = {"q_proj": (heads * 2 * dim, c.hidden_size), "k_proj": (kv * dim, c.hidden_size),
                     "v_proj": (kv * dim, c.hidden_size), "o_proj": (c.hidden_size, heads * dim)}
             for proj, shape in want.items():
-                got = tuple(getattr(attention, proj).weight.shape)
+                module = getattr(attention, proj)
+                got = ((module.out_features, module.in_features) if isinstance(module, HummingW4A8Linear)
+                       else tuple(module.weight.shape))
                 if got != shape:
                     raise RuntimeError(f"rank {rank}: {proj} is {got} after the attention split, want {shape}")
             attention.o_proj = AllReduced(attention.o_proj, group)
         model.config = replace(c, num_attention_heads=heads, num_key_value_heads=kv)
-    model.fp8_modules = tuple(fp8_modules)
+    model.fp8_modules = tuple(served_fp8)
+    model.w4a8_modules = tuple(w4a8_modules)
+    model.w4a8_batch_invariant = tuple(w4a8_invariant)
+    model.w4a8_spec = w4a8
     model.compile_mode = fast_drafter.install(model, replicas=size, device=device)
     return model.eval().requires_grad_(False)
 
@@ -430,6 +464,17 @@ class DFlashDraftWorker:
         if self.sparse_q and not self.use_rejection_sampling:
             raise ValueError("ARC_DFLASH_SPARSE_Q=1 is the q of rejection sampling: it needs "
                              "--speculative-use-rejection-sampling")
+        from sglang.srt.runtime_context import get_parallel
+        from sglang.srt.speculative.arc_dflash import sharded_verify
+
+        self.sharded_verify = sharded_verify.enabled()
+        ps_ = get_parallel()
+        if self.sharded_verify and not (ps_.attn_tp_size > 1 and (ps_.enable_dp_lm_head or ps_.attn_dp_size == 1)):
+            raise RuntimeError("ARC_SHARDED_VERIFY=1 needs the LM head vocab-sharded over attention TP > 1: "
+                               "--enable-dp-lm-head, or pure TP without attention DP")
+        if self.sharded_verify and self.sparse_q:
+            # sharded_verify reads q's support from the dense [batch, K-1, vocab] probs (cand_out gather)
+            raise RuntimeError("ARC_SHARDED_VERIFY=1 and ARC_DFLASH_SPARSE_Q=1 are two verify-q paths; set one")
         self.check_agree = os.environ.get("ARC_DFLASH_CHECK_AGREE") == "1"
         directory = Path(drafter_dir())
         raw = json.loads((directory / "config.json").read_text())
@@ -517,6 +562,12 @@ class DFlashDraftWorker:
         if dense:
             kept = [f"dense {self.model.config.dense_intermediate_size}"] * self.model.config.num_layers
             local = [f"fp8 {len(self.model.fp8_modules)} linears"]
+            if self.model.w4a8_modules:
+                dtype, zero_point, group, scope = self.model.w4a8_spec
+                local.append(f"w4a8 {dtype}{'z' if zero_point else ''}:{group}:{scope} {len(self.model.w4a8_modules)} linears"
+                             f" ({len(self.model.w4a8_batch_invariant)} batch-invariant)")
+            sel = self.model.candidate_selector
+            local.append(f"selector rows {sel.predecessor_codebook.shape[0]}/{sel.successor_codebook.shape[0]}")
         else:
             experts = [self.model.layers[i].mlp.experts for i in range(self.model.config.num_layers)]
             kept = [len(keep[str(i)]) for i in range(self.model.config.num_layers)]
@@ -589,16 +640,19 @@ class DFlashDraftWorker:
         sizes = graph_sizes(self.max_running_requests)
         begin = time.monotonic()
         free_before = torch.cuda.mem_get_info(self.device)[0]
-        # the group's all-reduce / all-gather inside the graphs go through pynccl, which SGLang enables only here
-        capture = self.group.graph_capture() if self.group.world_size > 1 else contextlib.nullcontext()
         # ARC_DFLASH_SHARED_GRAPH_POOL (default 1): on one rank the drafter graphs go into the target's graph memory
-        # pool on its capture stream (G4 c110: drafter graphs 0.44 -> 0.08 GiB, accept unchanged). Attention-TP
-        # groups (L4) keep their own pool: not validated under the group's graph_capture.
+        # pool on its capture stream (G4 c110: drafter graphs 0.44 -> 0.08 GiB, accept unchanged).
+        # ARC_DFLASH_SHARED_GRAPH_POOL_GROUP (default 0, opt-in): the same on an attention-TP group (L4 pairs); the
+        # group's graph_capture then runs on the target's capture stream as well, so the pool hands the drafter the
+        # target's freed blocks (a block goes back only to the stream that allocated it).
         shared = os.environ.get("ARC_DFLASH_SHARED_GRAPH_POOL", "1")
         if shared not in ("0", "1"):
             raise ValueError(f"ARC_DFLASH_SHARED_GRAPH_POOL must be 0 or 1, got {shared!r}")
+        group_shared = os.environ.get("ARC_DFLASH_SHARED_GRAPH_POOL_GROUP", "0")
+        if group_shared not in ("0", "1"):
+            raise ValueError(f"ARC_DFLASH_SHARED_GRAPH_POOL_GROUP must be 0 or 1, got {group_shared!r}")
         target_pool = target_stream = None
-        if shared == "1" and self.group.world_size == 1:
+        if shared == "1" and (self.group.world_size == 1 or group_shared == "1"):
             from sglang.srt.model_executor.runner_utils import (
                 get_global_graph_memory_pool,
                 get_or_create_global_graph_capture_stream,
@@ -607,6 +661,9 @@ class DFlashDraftWorker:
             target_pool = get_global_graph_memory_pool()  # None when the target runs without CUDA graphs
             if target_pool is not None:
                 target_stream = get_or_create_global_graph_capture_stream()
+        # the group's all-reduce / all-gather inside the graphs go through pynccl, which SGLang enables only here
+        capture = (self.group.graph_capture(stream=target_stream) if self.group.world_size > 1
+                   else contextlib.nullcontext())
         with capture:
             self.pool.capture(sizes, target_pool=target_pool, target_stream=target_stream)
         torch.cuda.synchronize(self.device)
@@ -994,11 +1051,17 @@ class DFlashDraftWorker:
             sparse_q = SparseDraftProbs(ids=ids, probs=probs, vocab_size=self.vocab)
         elif self.use_rejection_sampling:
             dense_q = q
-        return build_eagle_verify_input(
+        verify_input = build_eagle_verify_input(
             batch, draft_input, self.parents[:bs], self.score_index[:bs], tokens.clone(), dense_q,
             target_worker=self.target_worker, topk=1, num_steps=self.steps, num_draft_tokens=self.width,
             tree_mask_mode=self.tree_mask_mode, device=self.device, draft_probs_sparse=sparse_q,
         )
+        if self.sharded_verify:
+            # q's support (the selector candidates) for sharded_verify; the dense probs stay for batches that fall back
+            candidates = self.pool.cand_out[:bs]
+            verify_input.arc_q_ids = candidates
+            verify_input.arc_q_probs = q.gather(2, candidates)
+        return verify_input
 
     def _timing(self, start, end, bs):
         """GPU ms of each draft step and of each whole cycle (draft start to the next draft start), averaged over
