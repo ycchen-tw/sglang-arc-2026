@@ -1,0 +1,364 @@
+"""ARC_THINK_BUDGET (speculative/arc_think_budget.py): an over-budget thinking block is closed with exactly the text
+the chat template renders for it on the next turn (``...<non-ws>\\n</think>``), once, under a lagging output_ids.
+
+The verify loop here is a CPU stand-in for run_eagle_verify: a chain of K rows, greedy acceptance (a forced row is
+one-hot, so greedy and rejection sampling commit the same token), and output_ids that see a step's tokens only after
+the next step was launched (the overlap scheduler).
+"""
+
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+
+import os  # noqa: E402
+import random  # noqa: E402
+from array import array  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+import pytest  # noqa: E402
+import torch  # noqa: E402
+
+from sglang.srt.managers.schedule_batch import Req  # noqa: E402
+from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
+from sglang.srt.speculative import arc_think_budget as tb  # noqa: E402
+
+TOKENIZER_DIR = os.environ.get("ARC_THINK_BUDGET_TEST_TOKENIZER")
+# cuda: the verify-side tensors as the server has them (int32 draft tokens, fp32 logits over the model's padded vocab)
+DEVICE = os.environ.get("ARC_THINK_BUDGET_TEST_DEVICE", "cpu")
+
+
+@pytest.fixture(scope="module")
+def tokenizer():
+    if not TOKENIZER_DIR:
+        pytest.skip("set ARC_THINK_BUDGET_TEST_TOKENIZER to a Qwen3.5+ checkpoint directory")
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(TOKENIZER_DIR)
+
+
+@pytest.fixture(scope="module")
+def budget_cls(tokenizer):
+    state = tb.ThinkBudget(24, tokenizer)
+    vocab = len(tokenizer)
+    return state, tb.token_classes(tokenizer, vocab), vocab
+
+
+def prompt_ids(tokenizer, **kw):
+    text = tokenizer.apply_chat_template([{"role": "user", "content": "hi"}], tokenize=False,
+                                         add_generation_prompt=True, **kw)
+    return tokenizer.encode(text, add_special_tokens=False)
+
+
+def make_req(rid, prompt, slot):
+    """a real Req (the hook reads its attributes; a stand-in object would hide a renamed one)"""
+    req = Req(rid, "", list(prompt), SamplingParams(max_new_tokens=1 << 20))
+    req.kv.req_pool_idx = slot
+    return req
+
+
+def test_env_parsing(monkeypatch):
+    monkeypatch.delenv(tb.ENV, raising=False)
+    assert tb.budget_from_env() is None
+    monkeypatch.setenv(tb.ENV, "32768")
+    assert tb.budget_from_env() == 32768
+    for bad in ("0", "-5", "1e4", "abc"):
+        monkeypatch.setenv(tb.ENV, bad)
+        with pytest.raises(RuntimeError):
+            tb.budget_from_env()
+
+
+def test_setup_refuses_paths_it_cannot_act_on(monkeypatch, tokenizer):
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    monkeypatch.setenv(tb.ENV, "100")
+    with pytest.raises(RuntimeError):
+        tb.setup(SpeculativeAlgorithm.NONE, 1, tokenizer)
+    with pytest.raises(RuntimeError):
+        tb.setup(SpeculativeAlgorithm.DFLASH, 1, tokenizer)
+    with pytest.raises(RuntimeError):
+        tb.setup(SpeculativeAlgorithm.EAGLE, 4, tokenizer)
+    with pytest.raises(RuntimeError):
+        tb.setup(SpeculativeAlgorithm.EAGLE, 1, None)
+    assert tb.setup(SpeculativeAlgorithm.EAGLE, 1, tokenizer) is tb.active()
+    monkeypatch.delenv(tb.ENV)
+    assert tb.setup(SpeculativeAlgorithm.EAGLE, 1, tokenizer) is None and tb.active() is None
+
+
+def test_token_classes(tokenizer, budget_cls):
+    state, cls, _ = budget_cls
+    enc = lambda s: tokenizer.encode(s, add_special_tokens=False)  # noqa: E731
+    assert (state.start_id, state.end_id) == tuple(tokenizer.convert_tokens_to_ids(["<think>", "</think>"]))
+    assert cls[state.nl_id] == tb.CLS_NL
+    for ws in ("\n\n", " ", "  ", "\t"):
+        ids = enc(ws)
+        assert len(ids) == 1 and cls[ids[0]] == tb.CLS_WS, ws
+    for word in ("the", " level", ".", "0"):
+        assert cls[enc(word)[-1]] == tb.CLS_NORMAL, word
+
+
+def test_open_at_prompt_end(tokenizer, budget_cls):
+    state, _, _ = budget_cls
+    on = prompt_ids(tokenizer)
+    off = prompt_ids(tokenizer, enable_thinking=False)
+    assert state._open_at_prompt_end(make_req("a", on, 1))
+    assert not state._open_at_prompt_end(make_req("b", off, 2))
+
+
+class Sim:
+    """A chain verify loop over CPU tensors with output_ids lagging one step."""
+
+    def __init__(self, state, cls, vocab, k, rng, lag=1):
+        self.state, self.vocab, self.k, self.rng, self.lag = state, vocab, k, rng, lag
+        self.cls = cls
+        self.words = [i for i in range(1000, 60000) if cls[i] == tb.CLS_NORMAL][:2000]
+        self.ws = [i for i in range(vocab) if cls[i] == tb.CLS_WS][:50]
+        state.cls = torch.tensor(cls, dtype=torch.int8, device=DEVICE)
+        state.banned = (state.cls == tb.CLS_NL) | (state.cls == tb.CLS_WS) | (state.cls == tb.CLS_PAD)
+        state.banned[[state.start_id, state.end_id]] = True
+        state.state = torch.zeros(64, dtype=torch.int8, device=DEVICE)
+
+    def natural(self, context):
+        """The 'model' at the position after ``context``: keeps thinking (never closes on its own); after a
+        </think> it writes a blank line and, 30% of the time, a second one (what forced closes did 0.5% of the time
+        on G4), then text."""
+        st = self.state
+        if st.end_id in context:
+            after = len(context) - 1 - context.index(st.end_id)
+            if after == 0:
+                return st.nn_id if self.rng.random() < 0.9 else self.rng.choice(self.words)
+            if after == 1 and context[-1] == st.nn_id and self.rng.random() < 0.3:
+                return st.nn_id
+            return self.rng.choice(self.words)
+        r = self.rng.random()
+        if r < 0.08:
+            return st.nl_id
+        if r < 0.16:
+            return self.rng.choice(self.ws)
+        return self.rng.choice(self.words)
+
+    def run(self, reqs, steps):
+        st, k = self.state, self.k
+        pending = []  # committed tokens not yet visible in output_ids: [(req, [tokens])]
+        committed = {r.rid: [] for r in reqs}
+        last = {r.rid: r.origin_input_ids[-1] for r in reqs}
+        for _ in range(steps):
+            bs = len(reqs)
+            cand = torch.zeros(bs, k, dtype=torch.int32)
+            for i, r in enumerate(reqs):
+                cand[i, 0] = last[r.rid]
+                for j in range(1, k):  # drafts: sometimes the very tokens the close needs
+                    x = self.rng.random()
+                    cand[i, j] = (st.nl_id if x < 0.2 else st.end_id if x < 0.35 else st.nn_id if x < 0.5
+                                  else self.rng.choice(self.words))
+            logits = torch.zeros(bs * k, self.vocab, device=DEVICE)
+            # the natural distribution of each row: one dominant token
+            nat = torch.zeros(bs, k, dtype=torch.int64)
+            for i, r in enumerate(reqs):
+                for j in range(k):
+                    # row j sees the committed tokens (ending in candidates[:, 0]) and the drafts up to j
+                    context = committed[r.rid] + [int(c) for c in cand[i, 1 : j + 1]]
+                    nat[i, j] = self.natural(context)
+                    logits[i * k + j, nat[i, j]] += 100.0
+            batch = SimpleNamespace(reqs=reqs, req_pool_indices=torch.tensor([r.kv.req_pool_idx for r in reqs],
+                                                                             device=DEVICE))
+            rows = st.select(batch)
+            handle = None
+            if rows:
+                handle = st.apply(batch, rows, cand.flatten().to(DEVICE), logits, k, 64)
+            pred = logits.view(bs, k, -1).argmax(-1).cpu()
+            accept_index = torch.full((bs, k), -1, dtype=torch.int32)
+            for i, r in enumerate(reqs):
+                toks = []
+                for j in range(k):
+                    accept_index[i, j] = i * k + j
+                    toks.append(int(pred[i, j]))
+                    if j + 1 < k and int(cand[i, j + 1]) == int(pred[i, j]):
+                        continue
+                    break
+                committed[r.rid].extend(toks)
+                last[r.rid] = toks[-1]
+                pending.append((r, toks))
+            if handle is not None:
+                st.commit(handle, pred.flatten().to(DEVICE, torch.int32), accept_index.to(DEVICE))
+            # overlap: this step's tokens become visible after the next launch
+            while len(pending) > self.lag * len(reqs):
+                r, toks = pending.pop(0)
+                r.output_ids.extend(toks)
+        return committed
+
+
+class ToolCallSim(Sim):
+    """a model that, while thinking, starts a tool call after ``at`` output tokens and never writes </think>; it never
+    writes a newline itself, so any \\n / </think> in the output was forced"""
+
+    def __init__(self, *a, at, **kw):
+        super().__init__(*a, **kw)
+        self.at = at
+
+    def natural(self, context):
+        if len(context) >= self.at and self.state.tool_id not in context:
+            return self.state.tool_id
+        return self.rng.choice(self.words)
+
+
+@pytest.mark.parametrize("at", [10, 23, 24, 26, 30])
+@pytest.mark.parametrize("lag", [0, 1])
+def test_a_tool_call_inside_thinking_ends_it(tokenizer, budget_cls, at, lag):
+    """the reasoning parser ends reasoning at <tool_call>: before the budget nothing is armed; after it, forcing stops
+    at the call; either way nothing is forced after the <tool_call>"""
+    state, cls, vocab = budget_cls
+    prompt = prompt_ids(tokenizer)
+    reqs = [make_req(f"t{i}", prompt, slot=20 + i) for i in range(4)]
+    sim = ToolCallSim(state, cls, vocab, k=4, rng=random.Random(at * 7 + lag), lag=lag, at=at)
+    committed = sim.run(reqs, steps=40)
+    for r in reqs:
+        toks = committed[r.rid]
+        assert state.tool_id in toks, toks[:40]
+        after = toks[toks.index(state.tool_id) + 1 :]
+        assert state.end_id not in after and state.nl_id not in after and state.nn_id not in after, after[:10]
+        assert not r.arc_think_armed
+
+
+def round_trips(tokenizer, toks, state, cls):
+    """generated text == what the template renders (the session replay criterion): the reasoning ends in one newline
+    after a non-whitespace character, and the close is followed by exactly one blank line and then something that
+    is not whitespace"""
+    assert toks.count(state.end_id) == 1, f"{toks.count(state.end_id)} </think> in the output"
+    text = tokenizer.decode(toks, skip_special_tokens=False)
+    reasoning, _, _ = text.partition("</think>")
+    # the template renders "<think>\n" + reasoning|trim + "\n</think>"; the sim may start on whitespace, which is the
+    # model's own business, so only the end is checked
+    ok_reasoning = reasoning.endswith("\n") and len(reasoning) > 1 and reasoning[:-1] == reasoning[:-1].rstrip()
+    after = toks[toks.index(state.end_id) + 1 :]
+    assert len(after) >= 2, after
+    banned = {tb.CLS_NL, tb.CLS_WS, tb.CLS_PAD}
+    ok_after = after[0] == state.nn_id and cls[after[1]] not in banned and after[1] != state.start_id
+    return ok_reasoning and ok_after
+
+
+@pytest.mark.parametrize("seed", range(25))
+@pytest.mark.parametrize("lag", [0, 1])
+def test_close_round_trips_once(tokenizer, budget_cls, seed, lag):
+    state, cls, vocab = budget_cls
+    rng = random.Random(seed)
+    prompt = prompt_ids(tokenizer)
+    reqs = [make_req(f"r{i}", prompt, slot=3 + i) for i in range(6)]
+    sim = Sim(state, cls, vocab, k=4, rng=rng, lag=lag)
+    committed = sim.run(reqs, steps=45)
+    for r in reqs:
+        toks = committed[r.rid]
+        assert round_trips(tokenizer, toks, state, cls), tokenizer.decode(toks[-40:])
+        cut = toks.index(state.end_id)
+        assert state.budget <= cut <= state.budget + 4 * 8, cut  # a few steps for whitespace waits and the lag
+        assert not r.arc_think_armed and r.arc_think_open is False
+
+
+def test_untouched_below_budget_and_when_closed(tokenizer, budget_cls):
+    state, cls, vocab = budget_cls
+    prompt = prompt_ids(tokenizer, enable_thinking=False)
+    req = make_req("off", prompt, slot=5)
+    req.output_ids.extend([sim_tok for sim_tok in range(1000, 1200)])
+    batch = SimpleNamespace(reqs=[req], req_pool_indices=torch.tensor([5]))
+    assert state.select(batch) == []
+    on = prompt_ids(tokenizer)
+    short = make_req("short", on, slot=6)
+    short.output_ids.extend(range(1000, 1010))
+    assert state.select(SimpleNamespace(reqs=[short], req_pool_indices=torch.tensor([6]))) == []
+
+
+def test_grammar_requests_are_left_alone(tokenizer, budget_cls):
+    state, _, _ = budget_cls
+    on = prompt_ids(tokenizer)
+    req = make_req("g", on, slot=7)
+    req.grammar = object()
+    req.output_ids.extend(range(1000, 1000 + state.budget))
+    assert state.select(SimpleNamespace(reqs=[req], req_pool_indices=torch.tensor([7]))) == []
+    assert req.arc_think_open is False and not req.arc_think_armed
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the rejection-sampling kernels are Triton")
+@pytest.mark.parametrize("fused", [True, False])
+@pytest.mark.parametrize("token", [198, 151667, 248069, 248319])
+def test_rejection_sampling_commits_a_forced_row(fused, token):
+    """A forced row (one finite logit, -inf elsewhere) through the deployed verify kernels: the committed token is the
+    forced one whether the draft matches it or not, wherever it sits in the vocab. (The fused kernel's softmax stats
+    used to turn a row into NaN when a whole leading 4096-block was -inf: </think> came out as vocab_size - 1.)"""
+    from sglang.kernels.ops.speculative.reject_sampling import (
+        chain_speculative_sampling_sparse_q_from_logits,
+        chain_speculative_sampling_sparse_q_triton,
+    )
+
+    torch.manual_seed(token)
+    bs, k, vocab, support = 8, 4, 248320, 16
+    dev = "cuda"
+    logits = torch.randn(bs, k, vocab, device=dev) * 3
+    logits[:, 0, :] = float("-inf")
+    logits[:, 0, token] = 0.0
+    candidates = torch.randint(0, vocab, (bs, k), device=dev)
+    match = torch.arange(bs, device=dev) % 2 == 0  # half the drafts propose the forced token
+    candidates[:, 1] = torch.where(match, torch.full_like(candidates[:, 1], token), (token + 1) % vocab)
+    draft_ids = torch.randint(0, vocab, (bs, k - 1, support), device=dev)
+    draft_ids[:, :, 0] = candidates[:, 1:]
+    draft_q = torch.softmax(torch.randn(bs, k - 1, support, device=dev), dim=-1)
+    retrive_index = torch.arange(bs * k, device=dev).view(bs, k)
+    temps = torch.full((bs, 1), 0.7, device=dev)
+    for _ in range(20):
+        predicts = torch.zeros(bs * k, dtype=torch.int32, device=dev)
+        accept_index = torch.full((bs, k), -1, dtype=torch.int32, device=dev)
+        accept_num = torch.zeros(bs, dtype=torch.int32, device=dev)
+        coins = torch.rand(bs, k, device=dev)
+        final = torch.rand(bs, device=dev)
+        common = dict(predicts=predicts, accept_index=accept_index, accept_token_num=accept_num,
+                      candidates=candidates, retrive_index=retrive_index, uniform_samples=coins,
+                      uniform_samples_for_final_sampling=final, draft_ids=draft_ids, draft_q=draft_q)
+        if fused:
+            chain_speculative_sampling_sparse_q_from_logits(logits=logits, temperatures=temps, **common)
+        else:
+            chain_speculative_sampling_sparse_q_triton(target_probs=torch.softmax(logits / temps[:, :, None], -1),
+                                                       **common)
+        first = predicts.view(bs, k)[:, 0]
+        assert torch.equal(first, torch.full_like(first, token)), first.tolist()
+        assert torch.equal(accept_num.bool(), match), (accept_num.tolist(), match.tolist())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the rejection-sampling kernels are Triton")
+@pytest.mark.parametrize("fused", [True, False])
+def test_rejection_sampling_respects_a_masked_row(fused):
+    """The row after a forced </think>\\n\\n masks whitespace, <think>, </think>: never committed, even when the model
+    (and the draft) put almost all mass on a second blank line."""
+    from sglang.kernels.ops.speculative.reject_sampling import (
+        chain_speculative_sampling_sparse_q_from_logits,
+        chain_speculative_sampling_sparse_q_triton,
+    )
+
+    torch.manual_seed(1)
+    bs, k, vocab, support = 8, 4, 248320, 16
+    dev = "cuda"
+    banned = torch.tensor([198, 271, 220, 1022, 248068, 248069], device=dev)
+    logits = torch.randn(bs, k, vocab, device=dev)
+    logits[:, 0, 271] = 30.0  # the double blank line the model wanted
+    logits[:, 0, banned] = float("-inf")
+    candidates = torch.randint(0, vocab, (bs, k), device=dev)
+    candidates[:, 1] = 271  # and the drafter proposed it
+    draft_ids = torch.randint(0, vocab, (bs, k - 1, support), device=dev)
+    draft_ids[:, :, 0] = candidates[:, 1:]
+    draft_q = torch.softmax(torch.randn(bs, k - 1, support, device=dev), dim=-1)
+    retrive_index = torch.arange(bs * k, device=dev).view(bs, k)
+    temps = torch.full((bs, 1), 0.7, device=dev)
+    for _ in range(50):
+        predicts = torch.zeros(bs * k, dtype=torch.int32, device=dev)
+        accept_index = torch.full((bs, k), -1, dtype=torch.int32, device=dev)
+        accept_num = torch.zeros(bs, dtype=torch.int32, device=dev)
+        common = dict(predicts=predicts, accept_index=accept_index, accept_token_num=accept_num,
+                      candidates=candidates, retrive_index=retrive_index, uniform_samples=torch.rand(bs, k, device=dev),
+                      uniform_samples_for_final_sampling=torch.rand(bs, device=dev), draft_ids=draft_ids,
+                      draft_q=draft_q)
+        if fused:
+            chain_speculative_sampling_sparse_q_from_logits(logits=logits, temperatures=temps, **common)
+        else:
+            chain_speculative_sampling_sparse_q_triton(target_probs=torch.softmax(logits / temps[:, :, None], -1),
+                                                       **common)
+        first = predicts.view(bs, k)[:, 0].to(torch.int64)
+        assert not torch.isin(first, banned).any(), first.tolist()
+        assert (first < vocab - 1).all(), first.tolist()
+        assert not accept_num.any()

@@ -574,6 +574,13 @@ class Scheduler(
         # Init tokenizer
         self.init_tokenizer()
 
+        # ARC_THINK_BUDGET (opt-in): validated here so a deployment it cannot act on fails at startup
+        from sglang.srt.speculative import arc_think_budget
+
+        arc_think_budget.setup(
+            self.spec_algorithm, get_spec().speculative_eagle_topk, self.tokenizer
+        )
+
         # Init moe config and GEMM config (FP8 GEMM, etc.)
         self.init_moe_gemm_config()
 
