@@ -15,6 +15,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear import gdn_state_fmt  # arc-forge h24
+from sglang.srt.layers.attention.mamba import track_host as mamba_track_host
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnBackends,
     LinearAttnKernelBackend,
@@ -545,9 +546,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 raise ValueError("GDN MIS metadata requires --enable-mis")
             self.mis_metadata = build_gdn_mis_metadata(forward_batch)
         if self.forward_metadata.has_mamba_track_mask:
-            self.forward_metadata.mamba_track_mask_indices = (
-                forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
-            )
+            rows = self.forward_metadata.mamba_track_rows
+            if rows is None:
+                rows = forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
+            elif mamba_track_host.MAMBA_TRACK_HOST == "check":
+                mamba_track_host.assert_same(
+                    "mamba_track_mask_indices",
+                    forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0],
+                    rows,
+                )
+            # ARC_MAMBA_TRACK_HOST: rows planned on the host; nonzero() synchronizes.
+            self.forward_metadata.mamba_track_mask_indices = rows
             self.forward_metadata.conv_states_mask_indices = (
                 forward_batch.mamba_track_indices[
                     self.forward_metadata.mamba_track_mask_indices

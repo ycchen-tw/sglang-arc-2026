@@ -4518,6 +4518,7 @@ class Scheduler(
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
+        forward_weight_version = get_serving().weight_version
         self.metrics_reporter.record_scheduler_active()
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
@@ -4715,6 +4716,7 @@ class Scheduler(
             else:
                 batch_result.extend_logprob_start_len_per_req = None
 
+            batch_result.forward_weight_version = forward_weight_version
             ret = batch_result
         else:  # embedding or reward model
             if self.enable_overlap:

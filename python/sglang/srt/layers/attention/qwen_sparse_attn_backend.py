@@ -53,11 +53,25 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_fwd_interface_triton,
     sparse_gqa_fwd_interface_triton_ck,
 )
+from sglang.srt.layers.attention.qsa.union_prefill import (
+    ARC_QSA_UNION_PREFILL,
+    PrefillDump,
+    UnionPrefillCheck,
+    UnionPrefillPlan,
+    union_prefill_attention,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils.common import is_sm100_supported
 
 logger = logging.getLogger(__name__)
 from sglang.srt.environ import envs
+
+_UNION_CHECK = UnionPrefillCheck() if ARC_QSA_UNION_PREFILL == "check" else None
+_QSA_PREFILL_DUMP = (
+    PrefillDump(os.environ["ARC_QSA_PREFILL_DUMP"])
+    if os.environ.get("ARC_QSA_PREFILL_DUMP")
+    else None
+)
 
 
 _TRTLLM_SPARSE_PAGE_SIZE = 64
@@ -179,6 +193,8 @@ class _QSAExtendPlan:
         self.device_segments: Optional[torch.Tensor] = None  # NVFP4: int64 [bs, 4]
         self.device_max = 0
         self.zone_segments: Optional[List[Tuple[torch.Tensor, int]]] = None
+        # ARC_QSA_UNION_PREFILL: tile layout + scratch, built by the first QSA layer
+        self.union: Optional[UnionPrefillPlan] = None
 
     def check_same(self, forward_batch) -> None:
         if (
@@ -1192,8 +1208,15 @@ class QwenSparseAttnBackend(AttentionBackend):
         # h15: what the indexer's extend path read back per layer, from host lengths
         prefill_compressed_locs = None
         max_position_cpu = None
+        prefill_extend_lens_cpu = None
+        prefill_seq_lens_cpu = None
         if not decode_like and forward_batch.seq_lens_cpu is not None:
             host_lengths = [int(x) for x in forward_batch.seq_lens_cpu[:batch_size]]
+            if forward_batch.extend_seq_lens_cpu is not None:
+                prefill_seq_lens_cpu = host_lengths
+                prefill_extend_lens_cpu = [
+                    int(x) for x in forward_batch.extend_seq_lens_cpu[:batch_size]
+                ]
             prefill_compressed_locs = self._prefill_compressed_locs(
                 token_slot_table, host_lengths
             )
@@ -1238,6 +1261,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             hisparse=hisparse,
             prefill_compressed_locs=prefill_compressed_locs,
             max_position_cpu=max_position_cpu,
+            prefill_extend_lens_cpu=prefill_extend_lens_cpu,
+            prefill_seq_lens_cpu=prefill_seq_lens_cpu,
         )
         return QwenSparseAttnMetadata(
             sequence_lengths=sequence_lengths,
@@ -1893,9 +1918,17 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             return self._pad_extend_output(output, num_output_rows)
 
+        if ARC_QSA_UNION_PREFILL != "0":
+            output = self._union_prefill(q, layer, plan, topk_indices)
+            return self._pad_extend_output(output, num_output_rows)
+
         # The validated chunk-prefill kernel consumes tightly packed full-context
         # K/V. Current-chunk K/V has already been committed to the cache above.
         k_context, v_context = self._extend_context(layer, plan, q)
+        if _QSA_PREFILL_DUMP is not None and _QSA_PREFILL_DUMP.wants(plan, layer.layer_id):
+            _QSA_PREFILL_DUMP.save(
+                plan, layer.layer_id, q, k_context, v_context, topk_indices, layer.scaling
+            )
         output = sparse_gqa_fwd_interface_triton_ck(
             q.contiguous(),
             k_context,
@@ -1908,6 +1941,52 @@ class QwenSparseAttnBackend(AttentionBackend):
             max_q=plan.max_q,
         )
         return self._pad_extend_output(output, num_output_rows)
+
+    def _union_prefill(self, q, layer, plan: "_QSAExtendPlan", topk_indices) -> torch.Tensor:
+        """ARC_QSA_UNION_PREFILL (qsa/union_prefill.py): the prefix chunk prefill with the
+        selected keys read once per tile of neighbouring queries, straight from the pool."""
+        if self.arc_nvfp4 or self.hisparse_coordinator is not None:
+            raise RuntimeError(
+                "ARC_QSA_UNION_PREFILL covers the plain FP8/BF16 KV pool without QSA HiSparse"
+            )
+        if plan.union is None:
+            plan.union = UnionPrefillPlan(
+                plan.extend_lens,
+                plan.seq_lens,
+                ratio=self.compress_ratio,
+                topk_width=topk_indices.shape[1],
+                device=q.device,
+            )
+        pool = self.token_to_kv_pool
+        q = q.contiguous()
+        output = union_prefill_attention(
+            plan.union,
+            q,
+            pool.get_key_buffer(layer.layer_id),
+            pool.get_value_buffer(layer.layer_id),
+            plan.slot_table,
+            plan.slot_rows,
+            topk_indices,
+            plan.cu_seqlens_q,
+            plan.seq_lens_t,
+            layer.scaling,
+        )
+        if ARC_QSA_UNION_PREFILL == "check":
+            k_context, v_context = self._extend_context(layer, plan, q)
+            reference = sparse_gqa_fwd_interface_triton_ck(
+                q,
+                k_context,
+                v_context,
+                topk_indices,
+                plan.cu_seqlens_q,
+                plan.cu_seqlens_k,
+                plan.seq_lens_t,
+                layer.scaling,
+                max_q=plan.max_q,
+            )
+            rows = sum(plan.extend_lens)
+            _UNION_CHECK.compare(output[:rows], reference[:rows], layer.layer_id, logger)
+        return output
 
     # ------------------------------------------------------------ extend plan (arc-forge h15)
 

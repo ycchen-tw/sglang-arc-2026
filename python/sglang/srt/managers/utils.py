@@ -46,6 +46,9 @@ def _async_d2h(t: torch.Tensor) -> torch.Tensor:
 
 @dataclasses.dataclass
 class GenerationBatchResult:
+    # Snapshot at target forward/verify launch; overlap processing may run after
+    # an in-place weight update. Never read the current version when committing.
+    forward_weight_version: Optional[str] = dataclasses.field(default=None, kw_only=True)
     logits_output: Optional[LogitsProcessorOutput] = None
     pp_hidden_states_proxy_tensors: Optional[PPProxyTensors] = None
     next_token_ids: Optional[

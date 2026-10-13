@@ -978,6 +978,14 @@ class MambaPool:
                 if enable_linear_replayssm_spec and not self.replayssm_spec_fold
                 else None
             )
+            # ARC_GDN_FOLD_IN_VERIFY=check (h20): per request row, the request whose
+            # advance last wrote the cursors (spec_utils._FoldInVerifyOwnerCheck)
+            self.replayssm_fold_owner = (
+                torch.full((spec_state_size + 1,), -1, dtype=torch.int64, device=device)
+                if self.replayssm_is_flush is not None
+                and os.environ.get("ARC_GDN_FOLD_IN_VERIFY", "0") == "check"
+                else None
+            )
             mem_usage_bytes = self.mamba_cache.mem_usage_bytes()
             if isinstance(self.mamba_cache, self.SpeculativeState):
                 # `intermediate_conv_window` is an as_strided view whose logical
@@ -1581,6 +1589,25 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 spec_write_pos.index_fill_(0, idx, 0)
                 self.mamba_pool.replayssm_cache_base.index_fill_(0, idx, 0)
                 self.mamba_pool.replayssm_is_flush.index_fill_(0, idx, 0)
+                from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode import (
+                    ARC_GDN_FOLD_IN_VERIFY_MODE,
+                )
+
+                # negative control for the check mode only: leave the race in
+                skip = os.environ.get("ARC_GDN_FOLD_IN_VERIFY_SKIP_FWD_RESET", "0")
+                if skip not in ("0", "1") or (skip == "1" and ARC_GDN_FOLD_IN_VERIFY_MODE != "check"):
+                    raise ValueError(
+                        "ARC_GDN_FOLD_IN_VERIFY_SKIP_FWD_RESET is 0, or 1 with ARC_GDN_FOLD_IN_VERIFY=check "
+                        f"(a negative control), got {skip!r} with {ARC_GDN_FOLD_IN_VERIFY_MODE!r}"
+                    )
+                if ARC_GDN_FOLD_IN_VERIFY_MODE != "0" and skip == "0":
+                    # h20: the zeroing above runs on the schedule stream, unordered
+                    # against the advance of the row's previous owner still in flight
+                    # (overlap scheduler); zero again on the forward stream before the
+                    # extend (gdn_replayssm_spec_decode.py, the h20 note)
+                    for req, fresh in zip(reqs, fresh_req_rows):
+                        if fresh:
+                            req.kv.replay_cursor_reset = True
 
         mamba_indices: list[torch.Tensor] = []
         mamba_ping_pong_track_buffers: list[torch.Tensor] = []

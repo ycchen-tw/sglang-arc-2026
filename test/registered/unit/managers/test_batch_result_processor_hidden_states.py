@@ -84,6 +84,8 @@ class _PrefillReq:
         self.hidden_states = []
         self.is_retracted = False
         self.output_ids = []
+        self.weight_version_events = []
+        self.multimodal_inputs = None
         self.time_stats = Mock()
         self.return_logprob = False
         self.return_sampling_mask = False
@@ -104,6 +106,7 @@ class _DecodeReq:
         self.return_hidden_states = "last"
         self.hidden_states = []
         self.output_ids = []
+        self.weight_version_events = []
         self.finished_len = None
         self.is_retracted = False
         self.return_logprob = False
@@ -158,6 +161,7 @@ class TestPrefillHiddenStateOffsets(CustomTestCase):
                     dp_cooperation_info=None,
                 )
                 result = SimpleNamespace(
+                    forward_weight_version="default",
                     copy_done=None,
                     auxiliary_host_output=None,
                     routed_experts_output=None,
@@ -212,6 +216,7 @@ class TestPrefillSkippedOutput(CustomTestCase):
             dp_cooperation_info=None,
         )
         result = SimpleNamespace(
+                    forward_weight_version="default",
             copy_done=None,
             auxiliary_host_output=None,
             routed_experts_output=None,
@@ -252,6 +257,7 @@ class TestDecodeWithoutLogits(CustomTestCase):
             batch_size=lambda: 1,
         )
         result = GenerationBatchResult(
+            forward_weight_version="default",
             logits_output=None,
             next_token_ids=torch.tensor([8]),
         )
@@ -286,6 +292,7 @@ class TestSamplingMaskStatusErrors(CustomTestCase):
             batch_size=lambda: 1,
         )
         result = GenerationBatchResult(
+            forward_weight_version="default",
             logits_output=LogitsProcessorOutput(
                 next_token_logits=None,
                 next_token_sampling_mask_status=[SamplingMaskStatus.OVERFLOW],
@@ -336,6 +343,7 @@ class TestDecodeHiddenStateRetention(CustomTestCase):
 
         def result(hidden_states):
             return GenerationBatchResult(
+            forward_weight_version="default",
                 logits_output=SimpleNamespace(
                     hidden_states=hidden_states, sampling_mask_output=None
                 ),

@@ -44,7 +44,7 @@ import logging
 from collections.abc import Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Union
 
 import torch
 import tqdm
@@ -52,6 +52,7 @@ import tqdm
 from sglang.kernels.ops.kvcache.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
 )
+from sglang.srt.configs.model_config import is_qwen4_exp
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.bcg import (
@@ -125,6 +126,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_capture_stream,
 )
 from sglang.srt.model_loader.utils import resolve_language_model
+from sglang.srt.models import qwen4_exp_prefill_bcg
 from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
@@ -282,6 +284,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     + replay mechanics; this runner handles dummy ForwardBatch construction,
     buffer population, attention metadata init, and output slicing.
     """
+
+    # ARC_QWEN4_EXP_PREFILL_BCG (models/qwen4_exp_prefill_bcg.py): set when __init__ finds a
+    # Qwen4-Exp body under the Breakable backend.
+    _body_output_unpacker: Optional[Callable[[Any], Any]] = None
 
     def __init__(self, model_runner: ModelRunner):
         if get_schedule().enable_mixed_chunk:
@@ -562,6 +568,21 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self._input_embeds_arg_idx = (
                 params.index("input_embeds") if "input_embeds" in params else None
             )
+
+        # ARC_QWEN4_EXP_PREFILL_BCG: Qwen4-Exp's body is capturable only with its QSA indexer and
+        # PLE as eager breaks (models/qwen4_exp_prefill_bcg.py); without the opt-in, or outside
+        # the configurations it covers, raise here rather than capture host-planned shapes.
+        if isinstance(self.backend, BreakableCudaGraphBackend) and is_qwen4_exp(
+            model_runner.model_config.hf_config
+        ):
+            qwen4_exp_prefill_bcg.validate_runner(model_runner)
+            # Batches with media replay too: the eager tail runs the outer forward on the static
+            # batch, so the ViT and the media merge write the input_embeds slot, the media
+            # positions' ids are rewritten in the static input_ids (what the PLE break reads, as
+            # eager reads the rewritten live ids), and M-RoPE positions come from their slot.
+            # The captured body returns (hidden, hc_hidden); replay hands the stored pair back
+            # through the model so logits_output.hidden_states is the replayed HC stream.
+            self._body_output_unpacker = self.layer_model.unpack_breakable_body_output
 
         # --- aiter chip info pre-warming (AMD) -------------------------
         maybe_pre_warm_aiter_chip_info()
@@ -1320,6 +1341,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         else:
             global_num_tokens_cpu = None
 
+        # ARC_MAMBA_TRACK_HOST plans an extend's track rows from host mirrors of the track mask and
+        # seqlens; give the capture batch mirrors of what its static slots hold (one read per
+        # bucket, at startup, outside any capture).
+        if registry.has_slot("mamba_track_mask"):
+            capture_track_mask_cpu = [
+                bool(x) for x in _slot("mamba_track_mask").tolist()
+            ]
+            capture_track_seqlens_cpu = [
+                int(x) for x in _slot("mamba_track_seqlens").tolist()
+            ]
+        else:
+            capture_track_mask_cpu = capture_track_seqlens_cpu = None
+
         if global_num_tokens_cpu is not None:
             global_dp_buffer_len = sum(global_num_tokens_cpu)
             num_tokens_tensor = torch.tensor(
@@ -1362,6 +1396,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     if registry.has_slot("mamba_track_seqlens")
                     else None
                 ),
+                mamba_extend_track_mask_cpu=capture_track_mask_cpu,
+                mamba_extend_track_seqlens_cpu=capture_track_seqlens_cpu,
                 encoder_lens=None,
                 return_logprob=False,
                 extend_num_tokens=num_tokens,
@@ -1649,6 +1685,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             input_ids=input_ids,
             input_embeds=input_embeds,
             req_pool_indices=forward_batch.req_pool_indices,
+            # Host mirror of req_pool_indices: without it QSA's prefix extend reads the
+            # device tensor back (.tolist()) inside the replay.
+            req_pool_indices_cpu=forward_batch.req_pool_indices_cpu,
             seq_lens=forward_batch.seq_lens,
             next_token_logits_buffer=self._next_token_logits_buffer(
                 self._prefill_logits_buffer_rows(forward_batch)
@@ -1660,6 +1699,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             mamba_track_indices=mamba_track_indices,
             mamba_track_mask=mamba_track_mask,
             mamba_track_seqlens=mamba_track_seqlens,
+            # bs-axis slots copied unpadded from the live batch, so its host mirrors hold.
+            mamba_extend_track_mask_cpu=forward_batch.mamba_extend_track_mask_cpu,
+            mamba_extend_track_seqlens_cpu=forward_batch.mamba_extend_track_seqlens_cpu,
             encoder_lens=forward_batch.encoder_lens,
             return_logprob=(
                 forward_batch.return_logprob
@@ -1813,7 +1855,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         1, static_num_tokens
                     )[: ie.shape[0]].copy_(ie)
             hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
-            return _slice_output_rows(hs, raw_num_tokens) if full_path else hs
+            if full_path:
+                hs = _slice_output_rows(hs, raw_num_tokens)
+            if self._body_output_unpacker is not None:
+                # ARC_QWEN4_EXP_PREFILL_BCG: the model's side outputs of the replayed body.
+                hs = self._body_output_unpacker(hs)
+            return hs
 
         original_layer_forward = self.layer_model.forward
         self.layer_model.forward = replay_layer_forward

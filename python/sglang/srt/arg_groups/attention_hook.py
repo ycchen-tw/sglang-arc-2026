@@ -438,26 +438,63 @@ def handle_linear_attn_backend(server_args: Any):
 
     # arc-forge h20: the next verify folds the accepted window (ARC_GDN_FOLD_IN_VERIFY,
     # gdn_replayssm_spec_decode.py). Between a commit and that verify the live
-    # checkpoint lags by the window, so only a server where nothing else reads it may
-    # turn it on: QSA HiSparse with its session cache (a snapshot comes from the
-    # commit's track rows, a restore goes into a fresh request row) -- not the mamba
-    # radix cache, whose donate path resets the cursors of a running request.
+    # checkpoint lags by the window, so only a server where nothing else reads it (or
+    # the row's cursors) may turn it on:
+    #   - QSA HiSparse with its session cache (a snapshot comes from the commit's track
+    #     rows, a restore goes into a fresh request row);
+    #   - the unified mamba radix cache in extra_buffer mode, or no radix cache: a
+    #     finished request donates its ping-pong track slot (written by the commit's
+    #     track rows, the same bytes in both modes), never the live slot, and nothing
+    #     in it touches the spec cursors. Not no_buffer (donates or copies the live
+    #     slot, which lacks the pending window) nor extra_buffer_lazy (untested).
+    # Everywhere else a running row's live state is read off the verify, so refused:
+    # mixed chunks (a running row decodes in an extend), streaming sessions (the next
+    # turn extends from the live slot with the cursors left over), PD disaggregation
+    # (retraction backup copies the live slot, not the ring), and the untested
+    # hierarchical cache, int8 checkpoints, unified memory and (off the HiSparse arm)
+    # the session radix cache.
     fold_in_verify = os.environ.get("ARC_GDN_FOLD_IN_VERIFY", "0")
-    if fold_in_verify not in ("0", "1"):
-        raise ValueError(f"ARC_GDN_FOLD_IN_VERIFY must be 0 or 1, got {fold_in_verify!r}")
-    if fold_in_verify == "1":
+    if fold_in_verify not in ("0", "1", "check"):
+        raise ValueError(
+            f"ARC_GDN_FOLD_IN_VERIFY must be 0, 1 or check, got {fold_in_verify!r}"
+        )
+    if fold_in_verify != "0":
+        hisparse_arm = (
+            bool(cfg.enable_hisparse)
+            and cfg.radix_cache_backend == "qsa_hisparse_session"
+            and bool(cfg.disable_radix_cache)
+        )
+        radix_arm = (
+            not cfg.enable_hisparse
+            and cfg.radix_cache_backend is None
+            and (
+                bool(cfg.disable_radix_cache)
+                or cfg.mamba_radix_cache_strategy == "extra_buffer"
+            )
+        )
         need = {
             "--enable-linear-replayssm-spec": bool(cfg.enable_linear_replayssm_spec),
             "--mamba-ssm-dtype float16 or bfloat16 (fold every commit)": cfg.mamba_ssm_dtype
             in ("float16", "bfloat16"),
-            "--enable-hisparse": bool(cfg.enable_hisparse),
-            "--radix-cache-backend qsa_hisparse_session": cfg.radix_cache_backend
-            == "qsa_hisparse_session",
-            "--disable-radix-cache": bool(cfg.disable_radix_cache),
+            "either QSA HiSparse (--enable-hisparse --radix-cache-backend "
+            "qsa_hisparse_session --disable-radix-cache) or the default radix cache with "
+            "--mamba-radix-cache-strategy extra_buffer (or --disable-radix-cache)": hisparse_arm
+            or radix_arm,
+            "no --enable-mixed-chunk": not cfg.enable_mixed_chunk,
+            "no --enable-streaming-session": not cfg.enable_streaming_session,
+            # the HiSparse arm runs with its session radix cache (G4 / hs110 deployment)
+            "no --enable-session-radix-cache outside QSA HiSparse": hisparse_arm
+            or not cfg.enable_session_radix_cache,
+            "no PD disaggregation": cfg.disaggregation_mode == "null",
+            "no --enable-hierarchical-cache": not cfg.enable_hierarchical_cache,
+            "no --enable-int8-mamba-checkpoint": not cfg.enable_int8_mamba_checkpoint,
+            "no --enable-unified-memory": not cfg.enable_unified_memory,
         }
         missing = [what for what, ok in need.items() if not ok]
         if missing:
-            raise ValueError("ARC_GDN_FOLD_IN_VERIFY=1 requires: " + "; ".join(missing))
+            raise ValueError(
+                f"ARC_GDN_FOLD_IN_VERIFY={fold_in_verify} requires: " + "; ".join(missing)
+            )
     # arc-forge h24: the packed GDN state (ARC_GDN_STATE_FMT) runs on h20's path only
     from sglang.srt.layers.attention.linear import gdn_state_fmt
 

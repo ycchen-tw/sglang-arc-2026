@@ -52,6 +52,7 @@ from sglang.srt.sampling.sampling_params import (
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
+from sglang.srt.utils.weight_versions import record_forward_weight_version
 
 if TYPE_CHECKING:
     from sglang.srt.beam_search.coordinator import BeamCoordinator
@@ -389,9 +390,11 @@ class SchedulerBatchResultProcessor:
                         self.beam_coordinator.commit_prefill(
                             req, up_to_tick=batch.forward_iter
                         )
+                        record_forward_weight_version(req, result.forward_weight_version)
                     else:
                         # req output_ids are set here
                         req.output_ids.append(next_token_id)
+                        record_forward_weight_version(req, result.forward_weight_version)
 
                         self._maybe_update_reasoning_tokens(req, next_token_id)
 
@@ -1035,7 +1038,11 @@ class SchedulerBatchResultProcessor:
         # states the loop below observes. Beam + spec is rejected at admission.
         newly_finished_beam_groups = set()
         if batch.spec_algorithm.is_none() and logits_output is not None:
+            beam_output_lengths = [len(req.output_ids) for req in batch.reqs]
             newly_finished_beam_groups = self.beam_coordinator.commit_decode(batch)
+            for req, previous_length in zip(batch.reqs, beam_output_lengths):
+                if len(req.output_ids) > previous_length:
+                    record_forward_weight_version(req, result.forward_weight_version)
 
         for i, req in enumerate(batch.reqs):
             req: Req
@@ -1078,6 +1085,8 @@ class SchedulerBatchResultProcessor:
                 new_accept_len = 0
             else:
                 req.output_ids.extend(next_token_id)
+                if next_token_id:
+                    record_forward_weight_version(req, result.forward_weight_version)
                 new_accept_len = len(next_token_id)
                 self._maybe_update_reasoning_tokens(req, next_token_id)
             req.update_finish_state(new_accept_len)

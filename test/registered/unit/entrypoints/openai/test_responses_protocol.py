@@ -425,5 +425,49 @@ class ToolChoiceObjectFormTestCase(CustomTestCase):
             )
 
 
+class ResponsesDefaultTemperatureTestCase(CustomTestCase):
+    """ARC_RESPONSES_DEFAULT_TEMPERATURE: replaces only the class default 0.7."""
+
+    def _temperature(self, override, request_temperature=None, default_params=None):
+        from unittest import mock
+
+        from sglang.srt.entrypoints.openai import protocol
+
+        request = ResponsesRequest(
+            model="x", input="hi", store=False, temperature=request_temperature
+        )
+        with mock.patch.object(protocol, "ARC_RESPONSES_DEFAULT_TEMPERATURE", override):
+            return request.to_sampling_params(
+                default_max_tokens=128, default_params=default_params or {}
+            )["temperature"]
+
+    def test_unset_keeps_the_class_default(self):
+        self.assertEqual(self._temperature(None), 0.7)
+
+    def test_set_replaces_the_class_default(self):
+        self.assertEqual(self._temperature(1.0), 1.0)
+
+    def test_request_value_and_generation_config_win(self):
+        self.assertEqual(self._temperature(1.0, request_temperature=0.3), 0.3)
+        self.assertEqual(self._temperature(1.0, default_params={"temperature": 0.6}), 0.6)
+
+    def test_env_parsing(self):
+        from unittest import mock
+
+        from sglang.srt.entrypoints.openai import protocol
+
+        for raw, expected in (("1.0", 1.0), ("0", 0.0)):
+            with mock.patch.dict("os.environ", {"ARC_RESPONSES_DEFAULT_TEMPERATURE": raw}):
+                self.assertEqual(protocol._arc_responses_default_temperature(), expected)
+        for raw in ("hot", "-1", "nan", "inf"):
+            with mock.patch.dict("os.environ", {"ARC_RESPONSES_DEFAULT_TEMPERATURE": raw}):
+                with self.assertRaises(ValueError):
+                    protocol._arc_responses_default_temperature()
+        with mock.patch.dict("os.environ", {}, clear=False):
+            os_env = __import__("os").environ
+            os_env.pop("ARC_RESPONSES_DEFAULT_TEMPERATURE", None)
+            self.assertIsNone(protocol._arc_responses_default_temperature())
+
+
 if __name__ == "__main__":
     unittest.main()

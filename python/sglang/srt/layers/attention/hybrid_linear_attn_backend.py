@@ -21,6 +21,7 @@ from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     SharedReadEnds,
 )
+from sglang.srt.layers.attention.mamba import track_host as mamba_track_host
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
@@ -134,6 +135,7 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_seq_idx = None
         track_ssm_end_locs = None
         track_ssm_recompute_dst = None
+        mamba_track_rows = None
 
         mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
             forward_batch.req_pool_indices
@@ -146,10 +148,22 @@ class MambaAttnBackendBase(AttentionBackend):
                 forward_batch.mamba_track_indices
             )
         # Resolve the tracked-row selection once per forward
-        has_mamba_track_mask = bool(
-            forward_batch.mamba_track_mask is not None
-            and forward_batch.mamba_track_mask.any()
-        )
+        track_host = self._use_track_host(forward_batch)
+        if track_host:
+            # ARC_MAMBA_TRACK_HOST: from the host mirror; mask.any() synchronizes.
+            has_mamba_track_mask = any(forward_batch.mamba_extend_track_mask_cpu)
+            if mamba_track_host.MAMBA_TRACK_HOST == "check" and has_mamba_track_mask != bool(
+                forward_batch.mamba_track_mask.any()
+            ):
+                raise RuntimeError(
+                    f"{mamba_track_host.MAMBA_TRACK_HOST_ENV}=check: has_mamba_track_mask differs: "
+                    f"host mirror {has_mamba_track_mask} vs device mask {not has_mamba_track_mask}"
+                )
+        else:
+            has_mamba_track_mask = bool(
+                forward_batch.mamba_track_mask is not None
+                and forward_batch.mamba_track_mask.any()
+            )
         _real_bs = forward_batch._original_batch_size
         if _real_bs is not None and _real_bs < mamba_cache_indices.shape[0]:
             mamba_cache_indices = mamba_cache_indices.clone()
@@ -258,7 +272,23 @@ class MambaAttnBackendBase(AttentionBackend):
                     forward_batch.extend_start_loc[-1]
                     + forward_batch.extend_seq_lens[-1]
                 )
-                if has_mamba_track_mask:
+                if has_mamba_track_mask and track_host:
+                    (
+                        mamba_track_rows,
+                        track_conv_indices,
+                        track_chunk_idx,
+                        track_ssm_h_src,
+                        track_ssm_h_dst,
+                        track_ssm_h_batch_src,
+                        track_ssm_final_src,
+                        track_ssm_final_dst,
+                        track_ssm_seq_idx,
+                        track_ssm_end_locs,
+                        track_ssm_recompute_dst,
+                    ) = self._init_track_indices_host(
+                        query_start_loc, mamba_cache_indices, forward_batch
+                    )
+                elif has_mamba_track_mask:
                     track_conv_indices = self._init_track_conv_indices(
                         query_start_loc, forward_batch
                     )
@@ -297,6 +327,7 @@ class MambaAttnBackendBase(AttentionBackend):
             track_ssm_end_locs=track_ssm_end_locs,
             track_ssm_recompute_dst=track_ssm_recompute_dst,
             has_mamba_track_mask=has_mamba_track_mask,
+            mamba_track_rows=mamba_track_rows,
             replayssm_write_pos=replayssm_write_pos,
             replayssm_force_flush=replayssm_force_flush,
         )
@@ -347,10 +378,16 @@ class MambaAttnBackendBase(AttentionBackend):
         )
 
     def _init_track_conv_indices(
-        self, query_start_loc: torch.Tensor, forward_batch: ForwardBatch
+        self,
+        query_start_loc: torch.Tensor,
+        forward_batch: ForwardBatch,
+        rows: Optional[torch.Tensor] = None,
     ):
         """Flattened input positions of conv states to track during extend (up to
-        the last complete chunk boundary, mamba_track_mask rows only)."""
+        the last complete chunk boundary, mamba_track_mask rows only). ``rows``
+        (ARC_MAMBA_TRACK_HOST) are those rows as int64 device indices, which
+        select without the boolean mask's nonzero sync; the upper clamp then also
+        stays on the device (see the end)."""
         conv_state_len = self.conv_states_shape[-1]
 
         # Shared with the Qwen4-Exp PLE side states so the boundary can never
@@ -361,7 +398,9 @@ class MambaAttnBackendBase(AttentionBackend):
             "this path should only run when the track mask is set on an extend batch"
         )
         start_indices = query_start_loc[:-1] + aligned_len - conv_state_len
-        start_indices = start_indices[forward_batch.mamba_track_mask]
+        start_indices = start_indices[
+            forward_batch.mamba_track_mask if rows is None else rows
+        ]
 
         indices = start_indices.unsqueeze(-1) + torch.arange(
             conv_state_len,
@@ -369,7 +408,133 @@ class MambaAttnBackendBase(AttentionBackend):
             dtype=start_indices.dtype,
         )
 
-        return indices.clamp(0, query_start_loc[-1] - 1)
+        if rows is None:
+            return indices.clamp(0, query_start_loc[-1] - 1)
+        # ARC_MAMBA_TRACK_HOST: clamp(0, <0-dim tensor>) binds the Scalar overload,
+        # which reads the bound with .item() (a stream sync). Same values and dtype.
+        return torch.minimum(indices.clamp_min(0), query_start_loc[-1] - 1)
+
+    def _use_track_host(self, forward_batch: ForwardBatch) -> bool:
+        """ARC_MAMBA_TRACK_HOST applies to plain extends that carry a track mask, which
+        ScheduleBatch.prepare_for_extend builds together with its host mirrors."""
+        if (
+            mamba_track_host.MAMBA_TRACK_HOST == "0"
+            or forward_batch.forward_mode != ForwardMode.EXTEND
+            or forward_batch.mamba_track_mask is None
+        ):
+            return False
+        host_mask = forward_batch.mamba_extend_track_mask_cpu
+        host_seqlens = forward_batch.mamba_extend_track_seqlens_cpu
+        if host_mask is None or host_seqlens is None:
+            raise RuntimeError(
+                f"{mamba_track_host.MAMBA_TRACK_HOST_ENV}: a plain extend with a mamba track mask but "
+                "no host mirrors (mamba_extend_track_mask_cpu / mamba_extend_track_seqlens_cpu); "
+                "this batch was not built by ScheduleBatch.prepare_for_extend"
+            )
+        bs = forward_batch.mamba_track_mask.shape[0]
+        if (
+            len(host_mask) != bs
+            or len(host_seqlens) != bs
+            or forward_batch.extend_seq_lens_cpu is None
+            or forward_batch.extend_prefix_lens_cpu is None
+            or len(forward_batch.extend_seq_lens_cpu) != bs
+            or len(forward_batch.extend_prefix_lens_cpu) != bs
+        ):
+            raise RuntimeError(
+                f"{mamba_track_host.MAMBA_TRACK_HOST_ENV}: host mirrors do not cover the "
+                f"{bs}-row track mask: mask {len(host_mask)}, seqlens {len(host_seqlens)}, "
+                f"extend_seq_lens_cpu {forward_batch.extend_seq_lens_cpu}, "
+                f"extend_prefix_lens_cpu {forward_batch.extend_prefix_lens_cpu}"
+            )
+        return True
+
+    def _init_track_indices_host(
+        self,
+        query_start_loc: torch.Tensor,
+        mamba_cache_indices: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        """ARC_MAMBA_TRACK_HOST: _init_track_conv_indices + _init_track_ssm_indices
+        with every row selection planned on the host (track_host.plan_track_ssm),
+        uploaded in one pinned copy, and the slot ids gathered on the device by
+        integer index. Returns (mask rows, conv indices, then the nine
+        _init_track_ssm_indices outputs); same values, dtypes and devices."""
+        mamba2 = isinstance(self, Mamba2AttnBackend)
+        plan = mamba_track_host.plan_track_ssm(
+            mask=forward_batch.mamba_extend_track_mask_cpu,
+            track_seqlens=forward_batch.mamba_extend_track_seqlens_cpu,
+            prefix_lens=forward_batch.extend_prefix_lens_cpu,
+            extend_seq_lens=forward_batch.extend_seq_lens_cpu,
+            state_chunk_size=self.mamba_chunk_size,
+            mamba2=mamba2,
+        )
+        (
+            rows,
+            final_rows,
+            unaligned_rows,
+            h_rows,
+            h_src,
+            seq_idx,
+            end_locs,
+        ) = mamba_track_host.upload_int64(
+            [
+                plan.rows,
+                plan.final_rows,
+                plan.unaligned_rows,
+                plan.h_rows if mamba2 else [],
+                plan.h_src,
+                plan.seq_idx if mamba2 else [],
+                plan.end_locs if mamba2 else [],
+            ],
+            self.device,
+        )
+        if not mamba2:
+            # GDN / KDA read h at every unaligned row.
+            h_rows = unaligned_rows
+        chunk_idx = mamba_track_host.to_device_pinned(
+            plan.chunk_idx, torch.int32, self.device
+        )
+        track_indices = forward_batch.mamba_track_indices
+        out = (
+            rows,
+            self._init_track_conv_indices(query_start_loc, forward_batch, rows=rows),
+            chunk_idx,
+            h_src,
+            track_indices[h_rows],
+            unaligned_rows,
+            mamba_cache_indices[final_rows],
+            track_indices[final_rows],
+            seq_idx if mamba2 else None,
+            end_locs if mamba2 else None,
+            track_indices[seq_idx] if mamba2 else None,
+        )
+        if mamba_track_host.MAMBA_TRACK_HOST == "check":
+            ref = (
+                forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0],
+                self._init_track_conv_indices(query_start_loc, forward_batch),
+            ) + tuple(self._init_track_ssm_indices(mamba_cache_indices, forward_batch))
+            names = (
+                "mamba_track_rows",
+                "track_conv_indices",
+                "track_chunk_idx",
+                "track_ssm_h_src",
+                "track_ssm_h_dst",
+                "track_ssm_h_batch_src",
+                "track_ssm_final_src",
+                "track_ssm_final_dst",
+                "track_ssm_seq_idx",
+                "track_ssm_end_locs",
+                "track_ssm_recompute_dst",
+            )
+            for name, a, b in zip(names, ref, out, strict=True):
+                mamba_track_host.assert_same(name, a, b)
+            mamba_track_host.note_checked(
+                "extend",
+                rows=len(plan.rows),
+                final=len(plan.final_rows),
+                unaligned=len(plan.unaligned_rows),
+            )
+        return out
 
     def _init_track_ssm_indices(
         self, mamba_cache_indices: torch.Tensor, forward_batch: ForwardBatch

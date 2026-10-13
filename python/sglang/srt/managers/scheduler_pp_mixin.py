@@ -26,7 +26,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.observability.req_time_stats import set_time_batch
-from sglang.srt.runtime_context import get_disagg, get_parallel
+from sglang.srt.runtime_context import get_disagg, get_parallel, get_serving
 from sglang.srt.sampling.sampling_observer_pp import (
     add_auxiliary_output_to_pp_tensors,
     pop_auxiliary_output_from_pp_tensors,
@@ -56,6 +56,7 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
 @dataclass
 class PPBatchMetadata:
     can_run_cuda_graph: bool
+    forward_weight_version: Optional[str] = None
 
 
 class SchedulerPPMixin:
@@ -885,6 +886,7 @@ class SchedulerPPMixin:
         # (pp_outputs is None gate). Placeholder carried in
         # batch_result.next_token_ids for process_batch_result_prefill.
         batch_result = GenerationBatchResult(
+            forward_weight_version=(mb_metadata.forward_weight_version if mb_metadata else None),
             logits_output=None,
             pp_hidden_states_proxy_tensors=None,
             next_token_ids=placeholder,
@@ -964,6 +966,7 @@ class SchedulerPPMixin:
         )
         batch.input_ids = None
         output_result = GenerationBatchResult(
+            forward_weight_version=mb_metadata.forward_weight_version,
             logits_output=logits_output,
             pp_hidden_states_proxy_tensors=None,
             next_token_ids=pp_outputs["next_token_ids"],
@@ -1236,6 +1239,7 @@ class SchedulerPPMixin:
                     "set_run_batch_cpu_start_time",
                     trace_only=True,
                 )
+                forward_weight_version = get_serving().weight_version
                 result = self.run_batch(cur_batch, pp_proxy_tensors)
                 set_time_batch(
                     cur_batch.reqs,
@@ -1245,6 +1249,7 @@ class SchedulerPPMixin:
                 )
                 mb_metadata[mb_id] = PPBatchMetadata(
                     can_run_cuda_graph=result.can_run_cuda_graph,
+                    forward_weight_version=forward_weight_version,
                 )
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())

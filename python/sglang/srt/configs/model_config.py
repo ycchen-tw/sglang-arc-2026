@@ -2212,7 +2212,9 @@ multimodal_breakable_cuda_graph_supported_model_archs = [
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
     # Qwen4-Exp is intentionally absent: QSA builds host-side sparse metadata
-    # per forward and cannot serve the breakable prefill capture.
+    # per forward and cannot serve the breakable prefill capture as-is.
+    # ARC_QWEN4_EXP_PREFILL_BCG=1 (arc-forge, opt-in) runs those parts as eager
+    # breaks and adds it (is_multimodal_breakable_cuda_graph_supported).
     "MuseGlimmerForConditionalGeneration",
     "KimiK3ForConditionalGeneration",
     "KimiK25ForConditionalGeneration",
@@ -2286,6 +2288,10 @@ def is_multimodal_piecewise_cuda_graph_supported(model_architectures: List[str])
 
 def is_multimodal_breakable_cuda_graph_supported(model_architectures: List[str]):
     """Whether a multimodal arch may keep prefill breakable CUDA graph enabled."""
+    from sglang.srt.models import qwen4_exp_prefill_bcg
+
+    if qwen4_exp_prefill_bcg.ENABLED and qwen4_exp_prefill_bcg.ARCH in model_architectures:
+        return True
     return any(
         arch in multimodal_breakable_cuda_graph_supported_model_archs
         for arch in model_architectures

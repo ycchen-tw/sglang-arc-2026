@@ -216,10 +216,8 @@ class SchedulerWeightUpdaterManager:
           exports, which always carry the same keys).
         - Success clears the poisoned state and records ``weight_version``
           (tokens of requests alive across the update are attributed per span;
-          under the overlap scheduler the batch in flight at the pause samples
-          one more token per request with the old weights -- under speculative
-          decoding one verify step, up to the verify width -- which is
-          attributed to the new version).
+          pending overlap tokens retain the version captured at their target
+          forward/verify launch, including accepted draft and bonus tokens).
         """
 
         def refuse(message: str) -> UpdateWeightFromDiskReqOutput:
