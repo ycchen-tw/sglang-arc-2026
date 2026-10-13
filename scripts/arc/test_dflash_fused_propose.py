@@ -26,6 +26,7 @@ class Selector(nn.Module):
         self.top_k = TOPK
         self.predecessor_codebook = nn.Parameter(torch.randn(VOCAB, RANK, device="cuda", generator=g).to(dtype) * 0.3)
         self.successor_codebook = nn.Parameter(torch.randn(VOCAB, RANK, device="cuda", generator=g).to(dtype) * 0.3)
+        self.pred_rows = self.succ_rows = None  # model.CandidateSelector: pruned-codebook row maps, None = unpruned
 
     def scores(self, unary, projected, successor, predecessor):  # model.CandidateSelector.scores
         context = self.predecessor_codebook[predecessor] * projected
