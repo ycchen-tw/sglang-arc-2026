@@ -14,12 +14,15 @@ them. Online softmax in fp32, P cast to the value dtype for the PV product (as t
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 
 import torch
 import triton
 import triton.language as tl
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -114,7 +117,9 @@ def _env_tile():
     0.177 ms per layer; 64: 0.154 -> 0.095) and keeps 32 for 75-98, where 128-row programs need two waves for about
     1.3 waves of work (96: 0.162 vs 0.175). Another tile reorders the softmax's accumulation, so the drafter's
     attention moves by rounding (not bitwise); the target's distribution is untouched (rejection sampling). The
-    choice is a function of the batch and the device only, so every rank of a group picks the same tile."""
+    choice is a function of the batch and the device only, so every rank of a group picks the same tile.
+    AUTO_BIG is taken only where its compiled kernel fits the device's shared memory (_big_fits): B200 (227 KB) yes;
+    RTX PRO 6000 / 4090 / L4 (99-101 KB) no -- the 128x64 tile needs 148 KB there and auto keeps the deployed tile."""
     value = os.environ.get("ARC_DFLASH_RING_TILE")
     if value is None:
         return None
@@ -135,6 +140,23 @@ def _env_tile():
 AUTO_BIG = (128, 64, 8, 2)
 AUTO_RATIO = 2.2
 _SMS: dict = {}
+_BIG_FITS: dict = {}  # (device index, D, NEW_N) -> whether AUTO_BIG's compiled kernel fits the shared memory
+
+
+def _big_fits(args, consts, grid, device) -> bool:
+    """Compile (no launch) AUTO_BIG for this shape once per device and compare its shared memory with the device's
+    limit; the same answer on every rank of identical GPUs."""
+    key = (device.index, consts["D"], consts["NEW_N"])
+    fits = _BIG_FITS.get(key)
+    if fits is None:
+        bm, bn, warps, stages = AUTO_BIG
+        kernel = _ring_attn_kernel.warmup(*args, **consts, BLOCK_M=bm, BLOCK_N=bn, num_warps=warps,
+                                          num_stages=stages, grid=grid)
+        limit = triton.runtime.driver.active.utils.get_device_properties(device.index)["max_shared_mem"]
+        fits = _BIG_FITS[key] = kernel.metadata.shared <= limit
+        logger.info("ARC_DFLASH_RING_TILE=auto: %s needs %d B shared memory, device limit %d B -> %s",
+                    AUTO_BIG, kernel.metadata.shared, limit, "eligible" if fits else "deployed tile only")
+    return fits
 
 
 def _auto_tile(rows, programs_per_row_tile, device):
@@ -182,14 +204,8 @@ def attend(q, k, v, positions, key: RingWindow, value: RingWindow, key_positions
         out = torch.empty_like(q)
     group = hq // hkv
     rows = group * n
-    bm, bn, warps, stages = TILES["large" if rows > 132 else "small"]
-    if _ENV_TILE == "auto" and rows <= 132:
-        bm, bn, warps, stages = _auto_tile(rows, hkv * batch, q.device)
-    if BLOCK_M is not None:
-        bm, bn, warps, stages = BLOCK_M, BLOCK_N, NUM_WARPS, NUM_STAGES
-    grid = (triton.cdiv(rows, bm), hkv, batch)
     kp, vp = key.pool, value.pool
-    _ring_attn_kernel[grid](
+    args = (
         q, kp, vp, key_positions, key.idx, k, v, positions, out,
         q.stride(0), q.stride(1), q.stride(2),
         kp.stride(0), kp.stride(1), kp.stride(2),
@@ -199,7 +215,16 @@ def attend(q, k, v, positions, key: RingWindow, value: RingWindow, key_positions
         positions.stride(0),
         out.stride(0), out.stride(1), out.stride(2),
         n, key.columns, window, rows, group, dim ** -0.5,
-        D=dim, BLOCK_M=bm, BLOCK_N=bn, NEW_N=max(16, triton.next_power_of_2(n)),
-        num_warps=warps, num_stages=stages,
     )
+    consts = dict(D=dim, NEW_N=max(16, triton.next_power_of_2(n)))
+    bm, bn, warps, stages = TILES["large" if rows > 132 else "small"]
+    if _ENV_TILE == "auto" and rows <= 132:
+        tile = _auto_tile(rows, hkv * batch, q.device)
+        if tile == AUTO_BIG and not _big_fits(args, consts, (triton.cdiv(rows, AUTO_BIG[0]), hkv, batch), q.device):
+            tile = TILES["small"]
+        bm, bn, warps, stages = tile
+    if BLOCK_M is not None:
+        bm, bn, warps, stages = BLOCK_M, BLOCK_N, NUM_WARPS, NUM_STAGES
+    grid = (triton.cdiv(rows, bm), hkv, batch)
+    _ring_attn_kernel[grid](*args, **consts, BLOCK_M=bm, BLOCK_N=bn, num_warps=warps, num_stages=stages)
     return out
