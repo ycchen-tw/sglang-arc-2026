@@ -7,6 +7,7 @@ from typing import Optional, Tuple
 
 import torch
 
+from sglang.srt.layers.attention.qsa import index_shard
 from sglang.srt.layers.attention.qsa.kernel import (
     average_pool_qsa_keys,
     expand_qsa_block_indices,
@@ -581,29 +582,9 @@ class QSAIndexer(MultiPlatformOp):
         for row_start in range(0, rows, row_chunk_size):
             row_end = min(row_start + row_chunk_size, rows)
             chunk_slice = slice(row_start, row_end)
-            if compressed_keys.shape[0] == 0:
-                block_indices = torch.full(
-                    (row_end - row_start, self.block_topk),
-                    -1,
-                    dtype=torch.int32,
-                    device=q.device,
-                )
-                logits = None
-            else:
-                logits = qsa_mqa_prefill(
-                    q[chunk_slice],
-                    compressed_keys,
-                    row_starts[chunk_slice],
-                    row_ends[chunk_slice],
-                )
-                block_indices = qsa_fast_topk(
-                    logits,
-                    row_starts[chunk_slice],
-                    row_ends[chunk_slice],
-                    topk=self.block_topk,
-                )
-                if _ARC_QSA_TOPK_SORT:
-                    block_indices = _sort_topk_blocks(block_indices)
+            block_indices = self._prefill_chunk_blocks(
+                q, compressed_keys, row_starts, row_ends, row_start, row_end
+            )
             selected = expand_qsa_block_indices(
                 block_indices,
                 query_positions[chunk_slice],
@@ -612,8 +593,65 @@ class QSAIndexer(MultiPlatformOp):
                 token_topk=self.token_topk,
             )
             output[chunk_slice].copy_(selected)
-            del logits, block_indices, selected
+            del block_indices, selected
         return output
+
+    def _prefill_chunk_blocks(
+        self,
+        q: torch.Tensor,
+        compressed_keys: torch.Tensor,
+        row_starts: torch.Tensor,
+        row_ends: torch.Tensor,
+        row_start: int,
+        row_end: int,
+    ) -> torch.Tensor:
+        """[row_end - row_start, block_topk] block top-k of one select_prefill_tokens row chunk."""
+        chunk_slice = slice(row_start, row_end)
+        if compressed_keys.shape[0] == 0:
+            return torch.full(
+                (row_end - row_start, self.block_topk),
+                -1,
+                dtype=torch.int32,
+                device=q.device,
+            )
+        logits = qsa_mqa_prefill(
+            q[chunk_slice],
+            compressed_keys,
+            row_starts[chunk_slice],
+            row_ends[chunk_slice],
+        )
+        block_indices = qsa_fast_topk(
+            logits,
+            row_starts[chunk_slice],
+            row_ends[chunk_slice],
+            topk=self.block_topk,
+        )
+        if _ARC_QSA_TOPK_SORT:
+            block_indices = _sort_topk_blocks(block_indices)
+        return block_indices
+
+    def select_prefill_blocks(
+        self,
+        q: torch.Tensor,
+        compressed_keys: torch.Tensor,
+        row_starts: torch.Tensor,
+        row_ends: torch.Tensor,
+    ) -> torch.Tensor:
+        """ARC_QSA_INDEX_SHARD owner: every row's block top-k of select_prefill_tokens (same row chunks and
+        kernels), not expanded: the [rows, block_topk] int32 tensor the pair receives."""
+        rows = q.shape[0]
+        blocks = torch.empty((rows, self.block_topk), dtype=torch.int32, device=q.device)
+        row_chunk_size = _qsa_prefill_row_chunk_size(
+            rows, compressed_keys.shape[0], q.shape[1]
+        )
+        for row_start in range(0, rows, row_chunk_size):
+            row_end = min(row_start + row_chunk_size, rows)
+            blocks[row_start:row_end].copy_(
+                self._prefill_chunk_blocks(
+                    q, compressed_keys, row_starts, row_ends, row_start, row_end
+                )
+            )
+        return blocks
 
     def select_prefill_tokens_local(
         self,
@@ -647,35 +685,15 @@ class QSAIndexer(MultiPlatformOp):
         if rows == 0:
             return output
         row_lens = (row_ends - row_starts).to(torch.int32)
-        heads = q.shape[1]
-        block_q = max(1, 128 // heads)
-        _, width_all = qsa_prefill_local_tiles(
-            extend_lens, seq_lens, self.compress_ratio, 0, rows, block_q
+        block_q, row_chunk_size = self._prefill_local_chunking(
+            extend_lens, seq_lens, rows, q.shape[1]
         )
-        row_chunk_size = _qsa_prefill_row_chunk_size(rows, max(width_all, 1), heads)
         for row_start in range(0, rows, row_chunk_size):
             row_end = min(row_start + row_chunk_size, rows)
             chunk_slice = slice(row_start, row_end)
-            tiles, width = qsa_prefill_local_tiles(
-                extend_lens, seq_lens, self.compress_ratio, row_start, row_end, block_q
+            block_indices = self._prefill_local_chunk_blocks(
+                q, compressed_keys, row_lens, extend_lens, seq_lens, row_start, row_end, block_q
             )
-            if compressed_keys.shape[0] == 0 or width == 0:
-                block_indices = torch.full(
-                    (row_end - row_start, self.block_topk), -1, dtype=torch.int32, device=q.device
-                )
-            else:
-                logits = tilelang_qsa_mqa_prefill_local(
-                    q[chunk_slice], compressed_keys, row_lens[chunk_slice], tiles, width
-                )
-                block_indices = qsa_fast_topk(
-                    logits,
-                    torch.zeros_like(row_lens[chunk_slice]),
-                    row_lens[chunk_slice],
-                    topk=self.block_topk,
-                )
-                if _ARC_QSA_TOPK_SORT:
-                    block_indices = _sort_topk_blocks(block_indices)
-                del logits
             output[chunk_slice].copy_(
                 expand_qsa_block_indices(
                     block_indices,
@@ -686,6 +704,80 @@ class QSAIndexer(MultiPlatformOp):
                 )
             )
         return output
+
+    def _prefill_local_chunking(self, extend_lens, seq_lens, rows: int, heads: int):
+        """(block_q, row chunk size) of select_prefill_tokens_local."""
+        block_q = max(1, 128 // heads)
+        _, width_all = qsa_prefill_local_tiles(
+            extend_lens, seq_lens, self.compress_ratio, 0, rows, block_q
+        )
+        return block_q, _qsa_prefill_row_chunk_size(rows, max(width_all, 1), heads)
+
+    def _prefill_local_chunk_blocks(
+        self,
+        q: torch.Tensor,
+        compressed_keys: torch.Tensor,
+        row_lens: torch.Tensor,
+        extend_lens,
+        seq_lens,
+        row_start: int,
+        row_end: int,
+        block_q: int,
+    ) -> torch.Tensor:
+        """[row_end - row_start, block_topk] block top-k of one select_prefill_tokens_local row chunk."""
+        chunk_slice = slice(row_start, row_end)
+        tiles, width = qsa_prefill_local_tiles(
+            extend_lens, seq_lens, self.compress_ratio, row_start, row_end, block_q
+        )
+        if compressed_keys.shape[0] == 0 or width == 0:
+            return torch.full(
+                (row_end - row_start, self.block_topk), -1, dtype=torch.int32, device=q.device
+            )
+        logits = tilelang_qsa_mqa_prefill_local(
+            q[chunk_slice], compressed_keys, row_lens[chunk_slice], tiles, width
+        )
+        block_indices = qsa_fast_topk(
+            logits,
+            torch.zeros_like(row_lens[chunk_slice]),
+            row_lens[chunk_slice],
+            topk=self.block_topk,
+        )
+        if _ARC_QSA_TOPK_SORT:
+            block_indices = _sort_topk_blocks(block_indices)
+        return block_indices
+
+    def select_prefill_blocks_local(
+        self,
+        q: torch.Tensor,
+        compressed_keys: torch.Tensor,
+        row_starts: torch.Tensor,
+        row_ends: torch.Tensor,
+        metadata,
+    ) -> torch.Tensor:
+        """ARC_QSA_INDEX_SHARD owner under ARC_QSA_INDEXER_LOCAL: select_prefill_tokens_local's block top-k of
+        every row, not expanded ([rows, block_topk] int32)."""
+        extend_lens = metadata.prefill_extend_lens_cpu
+        seq_lens = metadata.prefill_seq_lens_cpu
+        if extend_lens is None or seq_lens is None:
+            raise RuntimeError("ARC_QSA_INDEXER_LOCAL needs the extend's host lengths in the indexer metadata")
+        rows = q.shape[0]
+        if sum(extend_lens) != rows:
+            raise RuntimeError(f"ARC_QSA_INDEXER_LOCAL: {rows} query rows, host extend lengths sum to {sum(extend_lens)}")
+        if not q.is_cuda:
+            raise RuntimeError("ARC_QSA_INDEXER_LOCAL is a CUDA (TileLang) path")
+        blocks = torch.empty((rows, self.block_topk), dtype=torch.int32, device=q.device)
+        row_lens = (row_ends - row_starts).to(torch.int32)
+        block_q, row_chunk_size = self._prefill_local_chunking(
+            extend_lens, seq_lens, rows, q.shape[1]
+        )
+        for row_start in range(0, rows, row_chunk_size):
+            row_end = min(row_start + row_chunk_size, rows)
+            blocks[row_start:row_end].copy_(
+                self._prefill_local_chunk_blocks(
+                    q, compressed_keys, row_lens, extend_lens, seq_lens, row_start, row_end, block_q
+                )
+            )
+        return blocks
 
     def select_decode_tokens(
         self,
@@ -698,6 +790,7 @@ class QSAIndexer(MultiPlatformOp):
         sequence_lengths: torch.Tensor,
         verify_queries_per_request: Optional[int] = None,
         compressed_scale: Optional[torch.Tensor] = None,
+        shard=None,
     ) -> torch.Tensor:
         block_indices = self._select_decode_blocks(
             q,
@@ -707,6 +800,7 @@ class QSAIndexer(MultiPlatformOp):
             max_model_len,
             verify_queries_per_request=verify_queries_per_request,
             compressed_scale=compressed_scale,
+            shard=shard,
         )
         return expand_qsa_block_indices(
             block_indices,
@@ -731,6 +825,7 @@ class QSAIndexer(MultiPlatformOp):
         pool,
         verify_queries_per_request: Optional[int] = None,
         compressed_scale: Optional[torch.Tensor] = None,
+        shard=None,
     ) -> torch.Tensor:
         """DECODE / TARGET_VERIFY selection under HiSparse offload: swap the
         selected blocks into each request's hot buffer, then expand them to the
@@ -752,7 +847,34 @@ class QSAIndexer(MultiPlatformOp):
             max_model_len,
             verify_queries_per_request=verify_queries_per_request,
             compressed_scale=compressed_scale,
+            shard=shard,
         )
+        return self._resolve_hisparse_blocks(
+            block_indices,
+            compressed_lengths,
+            query_positions,
+            sequence_lengths,
+            hisparse=hisparse,
+            req_pool_indices=req_pool_indices,
+            pool=pool,
+            rows_per_req=k,
+        )
+
+    def _resolve_hisparse_blocks(
+        self,
+        block_indices: torch.Tensor,
+        compressed_lengths: Optional[torch.Tensor],
+        query_positions: torch.Tensor,
+        sequence_lengths: torch.Tensor,
+        *,
+        hisparse,
+        req_pool_indices: torch.Tensor,
+        pool,
+        rows_per_req: int,
+    ) -> torch.Tensor:
+        """select_decode_tokens_hisparse after the block top-k: swap-in, then the logical indices and hot rows.
+        compressed_lengths is read only by the ARC_HISPARSE_QSA_DEBUG check."""
+        k = rows_per_req
         rows = block_indices.shape[0]
         if (
             req_pool_indices.shape[0] != rows
@@ -772,6 +894,8 @@ class QSAIndexer(MultiPlatformOp):
             rows_per_req=k,
         )
         if _ARC_HISPARSE_QSA_DEBUG and not get_is_capture_mode():
+            if compressed_lengths is None:
+                raise RuntimeError("ARC_HISPARSE_QSA_DEBUG checks the selection against the compressed lengths")
             _check_hisparse_selection(
                 block_indices, compressed_lengths, device_blocks, self.block_topk
             )
@@ -796,6 +920,7 @@ class QSAIndexer(MultiPlatformOp):
         max_model_len: int,
         verify_queries_per_request: Optional[int] = None,
         compressed_scale: Optional[torch.Tensor] = None,
+        shard=None,
     ) -> torch.Tensor:
         use_fast_decode_topk = q.is_cuda and self.block_topk == 512
         logits = qsa_mqa_decode(
@@ -826,7 +951,95 @@ class QSAIndexer(MultiPlatformOp):
             )
         if _ARC_QSA_TOPK_SORT:
             block_indices = _sort_topk_blocks(block_indices)
+        if shard is not None:
+            # ARC_QSA_INDEX_SHARD owner: hand this layer's top-k to the pair (returned as is here)
+            block_indices = shard.exchange(
+                self.layer_id, block_indices, q.shape[0], self.block_topk, q.device
+            )
         return block_indices
+
+    def _index_shard(self, indexer_metadata):
+        """The pool's QSAIndexLayerShard under ARC_QSA_INDEX_SHARD, None when it is off."""
+        if not index_shard.enabled():
+            return None
+        shard = indexer_metadata.token_to_kv_pool.qsa_index_shard
+        if shard is None:
+            raise RuntimeError(
+                f"{index_shard.ENV}={index_shard.mode()} but layer {self.layer_id}'s QSA pool was built without the "
+                "shard"
+            )
+        return shard
+
+    def _forward_shard_partner(
+        self,
+        forward_batch,
+        indexer_metadata,
+        logical_positions: torch.Tensor,
+        shard,
+        *,
+        is_target_verify: bool,
+        device,
+        expect: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """ARC_QSA_INDEX_SHARD, a layer the pair owns: no projection, compression or scores here (this rank holds
+        no index state for the layer); take the owner's block top-k and expand it exactly as the owner does.
+        expect (layer-check): the top-k this rank computed itself, compared with the received one."""
+        forward_mode = forward_batch.forward_mode
+        rows = logical_positions.numel()
+        width = self.token_topk + self.compress_ratio - 1
+        if forward_mode.is_decode() or is_target_verify:
+            blocks = shard.exchange(self.layer_id, None, rows, self.block_topk, device)
+            if expect is not None:
+                shard.verify(self.layer_id, blocks, expect)
+            sequence_lengths = indexer_metadata.get_seqlens_int32()
+            hisparse = indexer_metadata.hisparse
+            if hisparse is None:
+                return expand_qsa_block_indices(
+                    blocks,
+                    logical_positions,
+                    sequence_lengths,
+                    compress_ratio=self.compress_ratio,
+                    token_topk=self.token_topk,
+                )
+            k = (
+                _qsa_grouped_queries_per_request(
+                    forward_batch, is_target_verify=is_target_verify, is_draft_extend=False
+                )
+                or 1
+            )
+            if hisparse.rows_per_req != k:
+                raise ValueError(
+                    f"QSA HiSparse state has {hisparse.rows_per_req} rows per request, the selection {k}"
+                )
+            return self._resolve_hisparse_blocks(
+                blocks,
+                (
+                    indexer_metadata.get_decode_compressed_lengths()
+                    if _ARC_HISPARSE_QSA_DEBUG and not get_is_capture_mode()
+                    else None
+                ),
+                logical_positions,
+                sequence_lengths,
+                hisparse=hisparse,
+                req_pool_indices=indexer_metadata.req_pool_indices,
+                pool=indexer_metadata.token_to_kv_pool,
+                rows_per_req=k,
+            )
+        if rows == 0:
+            return torch.empty((0, width), dtype=torch.int32, device=device)
+        blocks = shard.exchange(self.layer_id, None, rows, self.block_topk, device)
+        if expect is not None:
+            shard.verify(self.layer_id, blocks, expect)
+        row_sequence_lengths = indexer_metadata.sequence_lengths.to(torch.int32).index_select(
+            0, indexer_metadata.get_token_to_batch_idx().long()
+        )
+        return expand_qsa_block_indices(
+            blocks,
+            logical_positions,
+            row_sequence_lengths,
+            compress_ratio=self.compress_ratio,
+            token_topk=self.token_topk,
+        )
 
     def forward_cuda(
         self,
@@ -880,6 +1093,21 @@ class QSAIndexer(MultiPlatformOp):
             if positions.ndim == 2
             else positions[:num_valid_tokens]
         )
+        shard = self._index_shard(indexer_metadata)
+        if shard is not None:
+            if is_draft_extend:
+                raise NotImplementedError(
+                    f"{index_shard.ENV} covers the target's EXTEND / DECODE / TARGET_VERIFY, got {forward_mode}"
+                )
+            if not shard.owns(self.layer_id) and not shard.check:
+                return self._forward_shard_partner(
+                    forward_batch,
+                    indexer_metadata,
+                    logical_positions,
+                    shard,
+                    is_target_verify=is_target_verify,
+                    device=hidden_states.device,
+                )
         state_slots = indexer_metadata.pending_ring_slots
         if state_slots is None:
             state_slots = self._pending_ring_slots(
@@ -913,6 +1141,31 @@ class QSAIndexer(MultiPlatformOp):
                 indexer_metadata.get_decode_mqa_inputs(self.layer_id)
             )
             compressed_scale = indexer_metadata.get_decode_mqa_scale(self.layer_id)
+            if shard is not None and not shard.owns(self.layer_id):
+                # layer-check: this rank scored the pair's layer too; the receiving path checks the owner's top-k
+                # against this one
+                local = self._select_decode_blocks(
+                    q,
+                    compressed_cache,
+                    page_table,
+                    compressed_lengths,
+                    max_model_len,
+                    verify_queries_per_request=_qsa_grouped_queries_per_request(
+                        forward_batch,
+                        is_target_verify=is_target_verify,
+                        is_draft_extend=False,
+                    ),
+                    compressed_scale=compressed_scale,
+                )
+                return self._forward_shard_partner(
+                    forward_batch,
+                    indexer_metadata,
+                    logical_positions,
+                    shard,
+                    is_target_verify=is_target_verify,
+                    device=q.device,
+                    expect=local,
+                )
             hisparse = indexer_metadata.hisparse
             if hisparse is not None:
                 if not (forward_mode.is_decode() or is_target_verify):
@@ -936,6 +1189,7 @@ class QSAIndexer(MultiPlatformOp):
                         is_draft_extend=False,
                     ),
                     compressed_scale=compressed_scale,
+                    shard=shard,
                 )
             return self.select_decode_tokens(
                 q,
@@ -951,6 +1205,7 @@ class QSAIndexer(MultiPlatformOp):
                     is_draft_extend=is_draft_extend,
                 ),
                 compressed_scale=compressed_scale,
+                shard=shard,
             )
 
         compressed_keys, row_starts, row_ends, sequence_lengths = (
@@ -967,6 +1222,39 @@ class QSAIndexer(MultiPlatformOp):
         row_sequence_lengths = sequence_lengths.index_select(
             0, query_sequence_ids.long()
         )
+        if shard is not None:
+            # ARC_QSA_INDEX_SHARD owner: the same row chunks and kernels, then hand every row's block top-k to the
+            # pair and expand all rows at once (the expansion is per row, so it equals the per-chunk one)
+            rows = q.shape[0]
+            if rows == 0:
+                return torch.empty(
+                    (0, self.token_topk + self.compress_ratio - 1), dtype=torch.int32, device=q.device
+                )
+            if _ARC_QSA_INDEXER_LOCAL:
+                blocks = self.select_prefill_blocks_local(
+                    q, compressed_keys, row_starts, row_ends, indexer_metadata
+                )
+            else:
+                blocks = self.select_prefill_blocks(q, compressed_keys, row_starts, row_ends)
+            if not shard.owns(self.layer_id):
+                # layer-check: the receiving path, checked against this rank's own top-k
+                return self._forward_shard_partner(
+                    forward_batch,
+                    indexer_metadata,
+                    logical_positions,
+                    shard,
+                    is_target_verify=is_target_verify,
+                    device=q.device,
+                    expect=blocks,
+                )
+            blocks = shard.exchange(self.layer_id, blocks, rows, self.block_topk, q.device)
+            return expand_qsa_block_indices(
+                blocks,
+                logical_positions,
+                row_sequence_lengths,
+                compress_ratio=self.compress_ratio,
+                token_topk=self.token_topk,
+            )
         if _ARC_QSA_INDEXER_LOCAL:
             return self.select_prefill_tokens_local(
                 q,

@@ -1914,7 +1914,10 @@ class KVCacheConfigurator:
         qsa_profile = parse_qsa_profile(self.model_config.hf_config)
         if os.environ.get("ARC_FULL_NVFP4") == "1":
             qsa_profile = None  # No idle QSA cache or its token budget in full mode.
+        from sglang.srt.layers.attention.qsa import index_shard
+
         if qsa_profile is None:
+            index_shard.require_off("a hybrid pool without a QSA index cache (no QSA profile, or ARC_FULL_NVFP4=1)")
             pool_class = HybridLinearKVPool
             extra_args["use_mla"] = self.use_mla_backend
         else:
@@ -1926,6 +1929,14 @@ class KVCacheConfigurator:
                 qsa_token_topk=qsa_profile.budget,
                 num_request_slots=req_to_token_pool.req_to_token.shape[0],
                 qsa_max_verify_tokens=max_speculative_num_draft_tokens() or 0,
+                # ARC_QSA_INDEX_SHARD=layer: None when off; raises for a draft pool or an unsupported shape
+                qsa_index_shard=index_shard.build_layer_shard(
+                    full_attention_layer_ids,
+                    is_draft_worker=self.is_draft_worker,
+                    context_len=self.model_config.context_len,
+                    draft_tokens=max_speculative_num_draft_tokens() or 0,
+                    compress_ratio=qsa_profile.compress_ratio,
+                ),
             )
         size_args = {"size": max_total_num_tokens}
         qsa_hisparse = get_memory().enable_hisparse

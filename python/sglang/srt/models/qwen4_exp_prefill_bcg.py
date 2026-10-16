@@ -89,3 +89,7 @@ def validate_runner(model_runner) -> None:
         # The extend plan is keyed by ForwardBatch identity; a HiSparse forward builds it from the
         # live batch at metadata init and would rebuild (and refill) it for the replay batch.
         raise NotImplementedError(f"{ENV}=1 does not cover QSA HiSparse")
+    from sglang.srt.layers.attention.qsa import index_shard
+
+    # the indexer break would run the pair's top-k hand-off inside an eager break of the captured body
+    index_shard.require_off(f"{ENV}=1 (the breakable prefill CUDA graph)")

@@ -457,11 +457,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             qsa_profile = None  # No idle QSA cache or its token budget in full mode.
         if qsa_profile is None:
             return 0
+        from sglang.srt.layers.attention.qsa.index_shard import index_layers_per_rank
+
         return QSATokenToKVPool.qsa_bytes_per_token(
             kv_heads=qsa_profile.kv_heads,
             head_dim=qsa_profile.head_dim,
             compress_ratio=qsa_profile.compress_ratio,
-            num_layers=num_layers,
+            # ARC_QSA_INDEX_SHARD=layer: this rank holds the index of half the QSA layers
+            num_layers=index_layers_per_rank(num_layers),
         )
 
     def _compute_dsa_indexer_cell_size(
@@ -1397,6 +1400,15 @@ class QSAHiSparsePoolConfigurator(DefaultPoolConfigurator):
         profile = parse_qsa_profile(hf_config)
         self._block_tokens = profile.compress_ratio
         self._top_k = profile.block_topk
+        # what one rank's index would take without ARC_QSA_INDEX_SHARD (logged next to the sharded _index_cell)
+        from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+
+        self._index_cell_unsharded = QSATokenToKVPool.qsa_bytes_per_token(
+            kv_heads=profile.kv_heads,
+            head_dim=profile.head_dim,
+            compress_ratio=profile.compress_ratio,
+            num_layers=self._num_layers,
+        )
         self._context_len = kvc.model_config.context_len
         self._device = kvc.device
         from sglang.srt.mem_cache.sparsity import parse_hisparse_config
@@ -1565,6 +1577,21 @@ class QSAHiSparsePoolConfigurator(DefaultPoolConfigurator):
             self._draft_cell,
             self._draft_fixed,
         )
+        from sglang.srt.layers.attention.qsa import index_shard
+
+        if index_shard.enabled():
+            unsharded = self._index_cell_unsharded
+            logger.info(
+                "QSA HiSparse sizing: %s=%s -- index %d B/token on this rank (unsharded %d), "
+                "%.3f GiB at L=%d (unsharded %.3f GiB)",
+                index_shard.ENV,
+                index_shard.mode(),
+                self._index_cell,
+                unsharded,
+                plan.logical_tokens * self._index_cell / (1 << 30),
+                plan.logical_tokens,
+                plan.logical_tokens * unsharded / (1 << 30),
+            )
         return config
 
 
