@@ -1049,6 +1049,8 @@ class Req(ReqDllmMixin):
         # weight version of the first prefill forward after it.
         self.admitted_prefix_len: Optional[int] = None
         self.prefill_weight_version: Optional[str] = None
+        # The park's fallback reason: (len(ids), {n: digest of ids[:n]}).
+        self.session_lineage_digests: Optional[tuple] = None
         self.input_embeds = input_embeds
         self.positional_embed_overrides = positional_embed_overrides
         self.multi_item_delimiter_indices = multi_item_delimiter_indices

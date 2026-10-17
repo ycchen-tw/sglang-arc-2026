@@ -31,6 +31,15 @@ Life of a park (one per finished request; a session keeps at most two):
            (the claim is handed back, the park stays). reset (flush_cache) drops
            the parks; the caller clears the pools wholesale.
 
+Fallback reason of a request that claims nothing: "claimed" when a park it would
+have matched is taken (waiting or running claimant); otherwise the newest request
+of the session this one continues or repeats -- its ids extend that request's
+input -- decides: its park's mismatch (a repeat, a rewind inside its output,
+key_limit) or why it left no park (its tombstone: abort, stop_string, evicted,
+...). A tombstone lasts until a later request of its lineage ends (that one is the
+newest then). A request that extends none of the session's recent requests is a
+rewind or branch ("ids_mismatch"); a session with no record at all is "no_park".
+
 Accounting: an unclaimed park's KV pages and mamba slot count as evictable, a
 claimed park's as session-held; every park holds one req row, taken from
 ``session_park_rows`` reserved on top of max_running_requests.
@@ -41,6 +50,7 @@ wall clock), so all TP ranks take the same ones.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from array import array
 from collections import Counter, OrderedDict
@@ -81,7 +91,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 MAX_PARKS_PER_SESSION = 2
-TOMBSTONE_LIMIT = 1 << 16
+TOMBSTONE_LIMIT = 1 << 16  # sessions with tombstones
+TOMBSTONES_PER_SESSION = 4
 STATS_EVERY = 256  # parks between two stats log lines
 
 # meta_info["session_resume"]["reason"] of a fallback: the contract's fixed names
@@ -123,8 +134,6 @@ RESUME_REASONS = frozenset(
         SPEC_UNSUPPORTED,
     }
 )
-
-_REASON_RANK = {CLAIMED: 3, KEY_LIMIT: 2, IDS_MISMATCH: 1}
 
 EXACT = ("exact", None)
 NOT_A_SESSION = ("none", None)
@@ -176,6 +185,10 @@ def session_park_rows(max_running_requests: int) -> int:
     return n
 
 
+def _digest(ids: np.ndarray) -> bytes:
+    return hashlib.blake2b(np.ascontiguousarray(ids, dtype=np.int64), digest_size=16).digest()
+
+
 def _ids_view(tokens) -> np.ndarray:
     if isinstance(tokens, array):
         if tokens.typecode != "q":
@@ -200,6 +213,7 @@ class _Park:
     cache_salt: Optional[str]
     extra_key: Optional[str]
     producer_rid: str
+    input_len: int  # the producer's input: a request whose ids extend [0, input_len) continues or repeats it
     ids: np.ndarray  # int64 ids of positions [0, P)
     row: int  # the producer's req_pool_idx: its QSA pending ring holds [floor4(P), P)
     # that row; KV [cache_protected_len, P); mamba slot after [0, P) (None once consumed)
@@ -212,6 +226,18 @@ class _Park:
     @property
     def pos(self) -> int:
         return len(self.ids)
+
+
+@dataclass(eq=False)
+class _Tombstone:
+    """A request of the session that ended without a park, or whose park was released."""
+
+    seq: int
+    reason: str
+    cache_salt: Optional[str]
+    extra_key: Optional[str]
+    input_len: int  # a request whose ids extend its input [0, input_len) continues or repeats it
+    digest: bytes  # of those ids
 
 
 class SessionTailPark:
@@ -260,7 +286,8 @@ class SessionTailPark:
         # Parks consumed by requests still running, per session: a request of the
         # session that would have matched one sees "claimed", not "no_park".
         self.consumed: Dict[str, Dict[str, _Park]] = {}
-        self.tombstones: "OrderedDict[str, tuple[int, str]]" = OrderedDict()
+        # Per session, the newest few ends that left no park (oldest first).
+        self.tombstones: "OrderedDict[str, List[_Tombstone]]" = OrderedDict()
         self.seq = 0
         self._tokens = {False: 0, True: 0}  # KV tokens by claimed
         self._slots = {False: 0, True: 0}  # mamba slots by claimed
@@ -300,6 +327,8 @@ class SessionTailPark:
             req.session_resume = (_fallback(RETRACT), None)
             self.counters["retract"] += 1
             return False
+        salt, input_ids = req.cache_salt or None, _ids_view(req.origin_input_ids)
+        self._supersede(sid, salt, req.extra_key, input_ids)
         exact = self._resolve_exact_end(
             req, is_insert=is_insert, kv_len_to_handle=kv_len_to_handle
         )
@@ -307,7 +336,7 @@ class SessionTailPark:
         if exact is not None and not self._make_room(sid):
             reason = EVICTED  # every park row is claimed
         if reason is not None:
-            self._tombstone(sid, reason)
+            self._tombstone(sid, reason, salt, req.extra_key, input_ids)
             self.counters[f"no_park:{reason}"] += 1
             return False
         self._park(req, exact)
@@ -445,6 +474,9 @@ class SessionTailPark:
             req.kv.mamba_pool_idx = exact.mamba_slot
             req.kv.exact_end_slot = None  # the park owns it now
 
+        input_len = len(req.origin_input_ids)
+        if input_len > pos:
+            raise AssertionError(f"session park: exact end {pos} inside the input ({input_len})")
         kv = req.detach_kv()
         self.seq += 1
         park = _Park(
@@ -453,6 +485,7 @@ class SessionTailPark:
             cache_salt=req.cache_salt or None,  # as RadixKey normalizes it
             extra_key=req.extra_key,
             producer_rid=req.rid,
+            input_len=input_len,
             ids=_ids_view(token_ids).copy(),
             row=kv.req_pool_idx,
             kv=kv,
@@ -463,7 +496,6 @@ class SessionTailPark:
         req.lock_receipt = DecLockRefParams()
         self.parks.setdefault(park.session_id, []).append(park)
         self.lru[park.seq] = park
-        self.tombstones.pop(park.session_id, None)
         self._account(park, +1)
         self.counters["park"] += 1
         if self.counters["park"] % STATS_EVERY == 0:
@@ -500,11 +532,16 @@ class SessionTailPark:
         key = params.key
         candidates = self.parks.get(sid, [])
         consumed = self.consumed.get(sid, {})
-        reason = None
-        if candidates or consumed:
+        tombs = self.tombstones.get(sid, [])
+        reason = NO_PARK  # the session has no record
+        if candidates or consumed or tombs:
             if key.is_bigram:
                 raise AssertionError("session park: bigram (EAGLE) keys never park")
             tokens = _ids_view(key.token_ids)
+            # (seq, reason) of the newest request of the session this one continues
+            # or repeats; extending none of them is a rewind / branch.
+            newest = (-1, IDS_MISMATCH)
+            claimed = False
             for park in reversed(candidates):  # newest first
                 why = self._why_not(park, key, tokens)
                 if why is None:
@@ -514,19 +551,55 @@ class SessionTailPark:
                     self.claims[req.rid] = park
                     self.counters["claim"] += 1
                     return self._claimed_result(req, park, params)
-                if reason is None or _REASON_RANK[why] > _REASON_RANK[reason]:
-                    reason = why
+                claimed |= why == CLAIMED
+                if park.seq > newest[0] and self._continues(park, key, tokens, park.ids):
+                    newest = (park.seq, why)
             # one that a running request of the session already took
             for park in consumed.values():
-                if self._why_not(park, key, tokens) == CLAIMED:
-                    reason = CLAIMED
-        if reason is None:
-            tomb = self.tombstones.get(sid)
-            newest = candidates[-1].seq if candidates else -1
-            reason = tomb[1] if tomb is not None and tomb[0] > newest else NO_PARK
+                why = self._why_not(park, key, tokens)
+                claimed |= why == CLAIMED
+                if park.seq > newest[0] and self._continues(park, key, tokens, park.ids):
+                    newest = (park.seq, why)
+            if claimed:
+                reason = CLAIMED
+            else:
+                for tomb in reversed(tombs):  # newest first
+                    if tomb.seq < newest[0]:
+                        break
+                    if self._continues(tomb, key, tokens, None) and (
+                        self._input_digest(req, tokens, tomb.input_len) == tomb.digest
+                    ):
+                        newest = (tomb.seq, tomb.reason)
+                        break
+                reason = newest[1]
         req.session_resume = (_fallback(reason), None)
         self.counters[f"fallback:{reason}"] += 1
         return None
+
+    @staticmethod
+    def _continues(rec, key, tokens: np.ndarray, ids: Optional[np.ndarray]) -> bool:
+        """Same cache namespace and the ids reach past rec's input (and, with ``ids``
+        given, equal them there; a tombstone compares a digest instead)."""
+        if rec.cache_salt != key.cache_salt or rec.extra_key != key.extra_key:
+            return False
+        n = rec.input_len
+        return len(tokens) >= n and (ids is None or np.array_equal(tokens[:n], ids[:n]))
+
+    @staticmethod
+    def _input_digest(req: Req, tokens: np.ndarray, n: int) -> bytes:
+        """Digest of the request's ids [0, n), kept on the request: a waiting
+        request is matched again every scheduling round."""
+        memo = req.session_lineage_digests
+        if memo is None:
+            memo = req.session_lineage_digests = (len(tokens), {})
+        elif memo[0] != len(tokens):
+            raise AssertionError(
+                f"session park: {req.rid} matched with {len(tokens)} ids, earlier {memo[0]}"
+            )
+        digest = memo[1].get(n)
+        if digest is None:
+            digest = memo[1][n] = _digest(tokens[:n])
+        return digest
 
     @staticmethod
     def _why_not(park: _Park, key, tokens: np.ndarray) -> Optional[str]:
@@ -635,14 +708,58 @@ class SessionTailPark:
         pool.mamba_allocator.free(kv.mamba_pool_idx.unsqueeze(0))
         kv.mamba_pool_idx = None
         kv.mark_kv_released()
-        if reason == EVICTED and park.session_id not in self.parks:
-            self._tombstone(park.session_id, EVICTED)
+        # Evicted or replaced by a newer end of the session: a request that
+        # continues the producer sees "evicted".
+        self._tombstone(
+            park.session_id, EVICTED, park.cache_salt, park.extra_key, park.ids[: park.input_len]
+        )
         self.counters[f"release:{reason}"] += 1
 
-    def _tombstone(self, sid: str, reason: str) -> None:
+    def _supersede(
+        self, sid: str, cache_salt: Optional[str], extra_key: Optional[str], input_ids: np.ndarray
+    ) -> None:
+        """A request of the session ended: it is the newest of the lineage of every
+        tombstoned request it continues or repeats."""
+        mine = self.tombstones.get(sid)
+        if not mine:
+            return
+        keep = [
+            tomb
+            for tomb in mine
+            if not (
+                tomb.cache_salt == cache_salt
+                and tomb.extra_key == extra_key
+                and len(input_ids) >= tomb.input_len
+                and _digest(input_ids[: tomb.input_len]) == tomb.digest
+            )
+        ]
+        if keep:
+            mine[:] = keep
+        else:
+            del self.tombstones[sid]
+
+    def _tombstone(
+        self,
+        sid: str,
+        reason: str,
+        cache_salt: Optional[str],
+        extra_key: Optional[str],
+        input_ids: np.ndarray,
+    ) -> None:
         _fallback(reason)  # a contract name
         self.seq += 1
-        self.tombstones[sid] = (self.seq, reason)
+        mine = self.tombstones.setdefault(sid, [])
+        mine.append(
+            _Tombstone(
+                seq=self.seq,
+                reason=reason,
+                cache_salt=cache_salt,
+                extra_key=extra_key,
+                input_len=len(input_ids),
+                digest=_digest(input_ids),
+            )
+        )
+        del mine[:-TOMBSTONES_PER_SESSION]
         self.tombstones.move_to_end(sid)
         while len(self.tombstones) > TOMBSTONE_LIMIT:
             self.tombstones.popitem(last=False)

@@ -465,6 +465,75 @@ class TestSessionTailPark(SessionTailParkHarness):
         self._accounting()
         self._drain()
 
+    def test_reason_comes_from_the_newest_request_it_continues(self):
+        self._first_turn()
+        s1 = self._s1()
+        r2 = self._turn(s1 + _seq(7000, 40), _seq(8000, 30))
+        self.assertEqual(self._mrp(r2)[:2], ("exact", None))
+        s2 = r2.origin_input_ids.tolist() + r2.output_ids.tolist()
+        # A rewind to S1 with another tail continues r1 (whose park r2 took), not
+        # r2: ids_mismatch. It ends in its prefill, so it leaves no park.
+        r3 = self._admit(self._match(self._req(s1 + _seq(9000, 20))))
+        self.assertEqual(self._resume(r3)["reason"], "ids_mismatch")
+        self._run(r3, [11])
+        self._release(r3, FINISH_LENGTH(length=1))
+        self.assertEqual([p.producer_rid for p in self.park.parks["sess-A"]], [r2.rid])
+        s3 = r3.origin_input_ids.tolist() + [11]
+        # r3's continuation: r3's reason, not the mismatch of r2's (stale) park.
+        nxt = self._match(self._req(s3 + [1, 2]))
+        self.assertEqual(self._mrp(nxt), ("fallback", "prefill_finished", None))
+        self._abort_waiting(nxt)  # never admitted: no tombstone of its own
+        # r2's park goes after r3 ended: r3's continuation keeps r3's reason,
+        # r2's continuation sees "evicted".
+        self.assertTrue(self.park.evict_lru())
+        self.assertEqual(self.park.rows(), 0)
+        nxt = self._match(self._req(s3 + [1, 2]))
+        self.assertEqual(self._resume(nxt)["reason"], "prefill_finished")
+        cont2 = self._match(self._req(s2 + [3]))
+        self.assertEqual(self._resume(cont2)["reason"], "evicted")
+        # A branch from S1 that continues none of the session's recent requests.
+        branch = self._match(self._req(s1 + _seq(9500, 8)))
+        self.assertEqual(self._resume(branch)["reason"], "ids_mismatch")
+        # The ids a waiting request is matched with do not change; their digests are kept.
+        self.assertEqual(nxt.session_lineage_digests[0], len(s3) + 2)
+        self._match(nxt)
+        self.assertEqual(self._resume(nxt)["reason"], "prefill_finished")
+        for r in list(self.waiting):
+            self._abort_waiting(r)
+        self._accounting()
+
+        # sess-R: a ends on a stop string; b continues it (fallback stop_string)
+        # and parks. A retry of b's input repeats b: b's park decides
+        # (ids_mismatch), not a's older tombstone -- while b's park is there, while
+        # c (it took the park) runs, and after c ended.
+        ns = dict(session="sess-R", salt="R")
+        a = self._admit(self._match(self._req(self.S1_IN, **ns)))
+        self._run(a, self.S1_OUT)
+        self._release(a, FINISH_MATCHED_STR(matched="</tool>"))
+        tokens2 = s1 + _seq(7000, 40)
+        b = self._admit(self._match(self._req(tokens2, **ns)))
+        self.assertEqual(self._mrp(b)[:2], ("fallback", "stop_string"))
+        self._run(b, [1, 2, 3])
+        self._release(b, FINISH_MATCHED_TOKEN(matched=3))
+        self.assertNotIn("sess-R", self.park.tombstones)  # b ended: a is not the newest
+        retry = self._match(self._req(tokens2, **ns))
+        self.assertEqual(self._resume(retry)["reason"], "ids_mismatch")
+        c = self._admit(self._match(self._req(tokens2 + [1, 2, 3, 4], **ns)))
+        self.assertEqual(self._mrp(c)[:2], ("exact", None))
+        retry = self._match(self._req(tokens2, **ns))
+        self.assertEqual(self._resume(retry)["reason"], "ids_mismatch")
+        self._run(c, [8, 9])
+        self._release(c, FINISH_MATCHED_TOKEN(matched=9))
+        retry = self._match(self._req(tokens2, **ns))
+        self.assertEqual(self._resume(retry)["reason"], "ids_mismatch")
+        # Under another cache_salt it continues none of the session's requests.
+        other = self._match(self._req(s1 + [5], session="sess-R", salt="R2"))
+        self.assertEqual(self._resume(other)["reason"], "ids_mismatch")
+        for r in list(self.waiting):
+            self._abort_waiting(r)
+        self._accounting()
+        self._drain()
+
     def test_abort_before_admission_hands_the_claim_back(self):
         self._first_turn()
         tokens = self._s1() + _seq(7000, 40)
