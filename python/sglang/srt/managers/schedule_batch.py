@@ -1355,6 +1355,14 @@ class Req(ReqDllmMixin):
         # arc-forge QSA HiSparse h09: the session record match_prefix found for
         # this request to resume from, until adopt_resumed_prefixes takes it
         self.hisparse_resume = None
+        # Session exact resume / chunked continuation: this request's own QSA
+        # pending-ring row (its req_pool_idx, kept since it was written) holds
+        # the index keys and RoPE coordinates of positions [floor4(P), P),
+        # P = len(prefix_indices) at its next extend, so that extend may start
+        # inside a compress group. Set by whoever hands the row over (session
+        # park claim; PrefillAdder.add_chunked_req under --session-exact-resume),
+        # consumed by the next ScheduleBatch.prepare_for_extend.
+        self.qsa_ring_resume = False
 
         # Snapshot of the scheduler prefill-token counter taken at waiting_queue entry; used by HRRN aging.
         self.arrival_processed_tokens: int = 0
@@ -2392,6 +2400,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # otherwise, and always None with the flag unset). Not the decode-only mamba_track_mask_cpu above.
     mamba_extend_track_mask_cpu: Optional[List[bool]] = None  # shape: [b]
     mamba_extend_track_seqlens_cpu: Optional[List[int]] = None  # shape: [b]
+    # The extend's Req.qsa_ring_resume per request (None when none is set; an
+    # extend-only host list, see QwenSparseAttnBackend._qsa_ring_resume_plan).
+    qsa_ring_resume_cpu: Optional[List[bool]] = None  # shape: [b]
     mamba_decode_batch_idx_cpu: Optional[List[int]] = None  # shape: [b]
     # Lazy + spec: this iteration's per-req scatter positions
     # (see mamba_lazy_spec_prepare).
@@ -2682,6 +2693,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         orig_seq_lens = [max(r.extend_range.end, len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
         extend_lens = [r.extend_range.length for r in reqs]
+        # Consume Req.qsa_ring_resume: it describes this extend only. A marked
+        # request must still own the row whose ring it vouches for.
+        ring_resume = [r.qsa_ring_resume for r in reqs]
+        for r in reqs:
+            if r.qsa_ring_resume and not r.kv.holds_kv:
+                raise RuntimeError(
+                    f"{r.rid}: qsa_ring_resume is set but the request holds no "
+                    "request row (its pending ring is gone)"
+                )
+            r.qsa_ring_resume = False
+        self.qsa_ring_resume_cpu = ring_resume if any(ring_resume) else None
         extend_logprob_start_lens = [
             compute_extend_logprob_start_len(
                 logprob_start_len=r.logprob_start_len,
@@ -3186,6 +3208,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_logprob_start_lens = (
             self.extend_logprob_start_lens + [0] * running_bs
         )
+        if self.qsa_ring_resume_cpu is not None:
+            self.qsa_ring_resume_cpu = self.qsa_ring_resume_cpu + [False] * running_bs
         self.is_prefill_only = False
 
     def convert_decode_to_extend(self):
@@ -3538,6 +3562,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # ARC_MAMBA_TRACK_HOST mirrors describe the extend this object last ran, never a decode.
         self.mamba_extend_track_mask_cpu = None
         self.mamba_extend_track_seqlens_cpu = None
+        self.qsa_ring_resume_cpu = None
 
         # Clear context parallel metadata - CP is only for prefill, not decode
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
@@ -3688,6 +3713,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_mask_next_cpu = None
         self.mamba_extend_track_mask_cpu = None
         self.mamba_extend_track_seqlens_cpu = None
+        self.qsa_ring_resume_cpu = None
         self.mamba_decode_batch_idx_cpu = None
         self.mamba_lazy_spec_track_positions_cpu = None
         self.mamba_cow_src_indices = None
@@ -3759,6 +3785,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_mask_next_cpu = None
         self.mamba_extend_track_mask_cpu = None
         self.mamba_extend_track_seqlens_cpu = None
+        self.qsa_ring_resume_cpu = None
         self.mamba_decode_batch_idx_cpu = None
         self.mamba_lazy_spec_track_positions_cpu = None
         if self.return_logprob and other.return_logprob:

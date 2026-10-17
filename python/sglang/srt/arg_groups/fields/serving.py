@@ -347,3 +347,11 @@ class Serving(msgspec.Struct):
         "Memory budget of the in-memory session records (int32 ids); the least "
         "recently used session is evicted beyond it.",
     ] = 8 << 30
+    # arc-forge session exact resume (docs/plans/session_exact_resume.md). Owned by
+    # exp/ser-park; declared here by exp/ser-qsa-misaligned with the same name and
+    # default so the two branches merge on one line.
+    session_exact_resume: A[
+        bool,
+        "Resume a session's next turn exactly where its previous request stopped "
+        "(every position forwarded once). Off: identical to the base server.",
+    ] = False

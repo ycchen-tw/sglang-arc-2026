@@ -37,6 +37,29 @@ def qsa_index_fp8_enabled() -> bool:
     return value == "1"
 
 
+def qsa_resume_ring_slack(draft_tokens: int, exact_resume: bool) -> int:
+    """Extra pending-ring slots per request row for ``--session-exact-resume`` (0 = the base ring).
+
+    A parked request resumes on its own ring row, whose [floor_r(P), P) keys
+    (r = compress ratio) feed the group that straddles the resume point. The ring
+    is ``r + K + slack`` slots (K = verify window = draft tokens), slot ``pos % size``.
+    Under the overlap scheduler a speculative request that has already finished
+    runs one more verify window: its last verify started at s with L accepted
+    tokens and the stop token at P = s + i + 1 (i < L), and the extra window writes
+    [s + L, s + L + K), i.e. up to P + L + K - 2 - i <= P + 2K - 2. The head starts
+    as low as P - r + 1, so a write can land 2K + r - 3 positions past a head key
+    (9 for K = 4, r = 4); it hits the head's slot iff that distance reaches the
+    ring size. The base ring r + K (slack 0) is too short once K >= 3, and an
+    overwritten head key is lost for good (its hidden state is gone). Any slack
+    > K - 3 keeps the window off the head; K is used (ring r + 2K = 12 > 9).
+    Without speculation nothing is written past P, so 0. The resume extend checks
+    the head's RoPE coordinates (QwenSparseAttnBackend._ring_resume_rope).
+    """
+    if draft_tokens < 0:
+        raise ValueError(f"draft token count must be nonnegative, got {draft_tokens}")
+    return int(draft_tokens) if exact_resume else 0
+
+
 QSA_INDEX_FP8_DTYPE = torch.float8_e4m3fn
 QSA_INDEX_FP8_MAX = 448.0
 
@@ -103,6 +126,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         qsa_token_topk: int,
         num_request_slots: int,
         qsa_max_verify_tokens: int = 0,
+        qsa_ring_slack: int = 0,
         enable_memory_saver: bool = False,
         enable_kv_cache_copy: bool = False,
         start_layer: Optional[int] = None,
@@ -180,7 +204,13 @@ class QSATokenToKVPool(HybridLinearKVPool):
         self.qsa_num_request_slots = int(num_request_slots)
         if qsa_max_verify_tokens < 0:
             raise ValueError("QSA verify token capacity must be nonnegative")
-        self.qsa_pending_ring_size = self.qsa_compress_ratio + int(qsa_max_verify_tokens)
+        if qsa_ring_slack < 0:
+            raise ValueError(f"QSA ring slack must be nonnegative, got {qsa_ring_slack}")
+        # qsa_ring_slack (qsa_resume_ring_slack): session exact resume keeps a parked
+        # row's [floor_r(P), P) keys out of reach of the overshoot verify window.
+        self.qsa_pending_ring_size = (
+            self.qsa_compress_ratio + int(qsa_max_verify_tokens) + int(qsa_ring_slack)
+        )
         ring_slots = self.qsa_num_request_slots * self.qsa_pending_ring_size
         # These buffers participate in Mooncake PD transfer just like the base
         # KV and Mamba pools.  Keep their allocation in the same memory-saver

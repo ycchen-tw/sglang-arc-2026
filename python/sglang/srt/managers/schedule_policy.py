@@ -8,6 +8,7 @@ from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
 from sglang.srt.runtime_context import (
     get_disagg,
     get_schedule,
+    get_serving,
 )
 from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
 
@@ -1275,6 +1276,11 @@ class PrefillAdder:
             # a continuation's context (prefix + chunk) is packed like a resumed one
             self.resume_context_tokens += len(req.prefix_indices) + new_len
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
+        if get_serving().session_exact_resume:
+            # The previous chunk of this request wrote its pending tail
+            # [floor4(prefix), prefix) into the request's own QSA ring row (kept
+            # across chunks), so this chunk may start inside a compress group.
+            req.qsa_ring_resume = True
         self.can_run_list.append(req)
         self._update_prefill_budget(
             0,

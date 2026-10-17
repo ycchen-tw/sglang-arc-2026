@@ -223,6 +223,36 @@ class _QSAExtendPlan:
             raise RuntimeError("a forward_batch changed its lengths between QSA layers")
 
 
+class _QSARingResume:
+    """One extend forward's ring-held heads (session exact resume / chunked continuation).
+
+    head_*: one entry per head key, rows in batch order and positions ascending
+    (row i's head is positions [floor_r(prefix_i), prefix_i)); head_offsets[i] is
+    row i's first entry. The indexer compresses from its chunk keys
+    (num_chunk_rows) followed by the head keys it reads from head_ring_slots
+    before storing the chunk; member_locs index that combined source."""
+
+    def __init__(
+        self,
+        *,
+        head_offsets: torch.Tensor,
+        num_chunk_rows: int,
+        head_ring_slots: torch.Tensor,
+        head_chunk_rows: torch.Tensor,
+        head_distances: torch.Tensor,
+        head_rows_cpu: List[int],
+        head_positions_cpu: List[int],
+    ):
+        self.head_offsets = head_offsets
+        self.num_chunk_rows = num_chunk_rows
+        self.head_ring_slots = head_ring_slots
+        self.head_chunk_rows = head_chunk_rows
+        self.head_distances = head_distances
+        self.head_rows_cpu = head_rows_cpu
+        self.head_positions_cpu = head_positions_cpu
+        self.member_locs: Optional[torch.Tensor] = None
+
+
 def _pool_kv_quant_name(pool) -> Optional[str]:
     if pool is None:
         return None
@@ -966,9 +996,17 @@ class QwenSparseAttnBackend(AttentionBackend):
         compress_ratio,
         row_token_starts=None,
         prefix_lens=None,
+        head_offsets=None,
+        num_chunk_rows=None,
     ):
         """Compact per-row block ranges into ``capacity`` write entries,
-        a shape-derived bound (no sync); padding writes the inert reserved slot 0."""
+        a shape-derived bound (no sync); padding writes the inert reserved slot 0.
+
+        ``head_offsets`` (ring resume, extend only): [rows] first index of each row's
+        ring-held head in the head list appended after the ``num_chunk_rows`` chunk
+        rows; then a fifth result, the [capacity, ratio] member locations of every
+        group in that combined source (a member below the row's prefix is a head
+        row, the rest are chunk rows)."""
         device = token_slot_table.device
         # The table width is a host-side bound;
         # assert on device so a short table fails loudly without a sync.
@@ -999,7 +1037,26 @@ class QwenSparseAttnBackend(AttentionBackend):
                 row_token_starts[rows] + blocks * compress_ratio - prefix_lens[rows],
                 torch.zeros_like(blocks),
             )
-        return write_locs, group_end_positions, rows, member_rows
+        if head_offsets is None:
+            return write_locs, group_end_positions, rows, member_rows
+        if member_rows is None or num_chunk_rows is None:
+            raise ValueError("QSA ring resume member locations are extend-only")
+        member = torch.arange(compress_ratio, dtype=torch.long, device=device)
+        positions = blocks[:, None] * compress_ratio + member[None, :]
+        prefix = prefix_lens[rows][:, None]
+        chunk_locs = member_rows[:, None] + member[None, :]
+        # head row k of a row holds position floor_r(prefix) + k
+        head_locs = (
+            num_chunk_rows
+            + head_offsets[rows][:, None]
+            + positions
+            - (prefix // compress_ratio) * compress_ratio
+        )
+        member_locs = torch.where(positions < prefix, head_locs, chunk_locs)
+        member_locs = torch.where(
+            valid[:, None], member_locs, member[None, :].expand_as(member_locs)
+        ).to(torch.int32)
+        return write_locs, group_end_positions, rows, member_rows, member_locs
 
     def _qsa_build_write_plan(
         self,
@@ -1008,7 +1065,10 @@ class QwenSparseAttnBackend(AttentionBackend):
         speculative_paged: bool,
         token_slot_table,
         sequence_lengths,
+        row_req_pool_indices,
     ):
+        """(write_locs, group end positions, group rows, member rows, ring resume);
+        the last is a _QSARingResume for an extend with a ring-held head, else None."""
         ratio = self.token_to_kv_pool.qsa_compress_ratio
         lengths = sequence_lengths.long()
         end_blocks = lengths // ratio
@@ -1022,21 +1082,32 @@ class QwenSparseAttnBackend(AttentionBackend):
                 end_blocks=end_blocks,
                 capacity=int(lengths.numel()),
                 compress_ratio=ratio,
-            )
+            ) + (None,)
         extend_lens = forward_batch.extend_seq_lens
         if extend_lens is None:
             raise ValueError("QSA extend write plan requires extend_seq_lens")
         extend_lens = extend_lens.long()[: lengths.numel()]
         prefix_lens = (lengths - extend_lens).clamp_min(0)
-        # Prefix sharing is page-granular and the page is a ratio
-        # multiple, so a matched prefix always covers whole groups. A
-        # misaligned prefix would leave a shared group half-written.
-        torch._assert_async((prefix_lens % ratio == 0).all())
+        ring_resume = forward_batch.qsa_ring_resume_cpu
+        resume = None
+        if ring_resume is None:
+            # Prefix sharing is page-granular and the page is a ratio
+            # multiple, so a matched prefix always covers whole groups. A
+            # misaligned prefix would leave a shared group half-written.
+            torch._assert_async((prefix_lens % ratio == 0).all())
+        else:
+            # Session exact resume / chunked continuation: a row may start inside a
+            # group whose earlier members sit in the row's own pending ring
+            # (validated on the host below; misaligned unmarked rows raise).
+            resume = self._qsa_ring_resume_plan(
+                forward_batch, ring_resume, row_req_pool_indices, int(lengths.numel())
+            )
         # Each row spans at most ceil(extend_len / ratio) blocks, so the
         # token count and row count bound the plan without a sync.
+        # (A misaligned row spans (prefix + e) // r - prefix // r <= ceil(e / r).)
         capacity = int(forward_batch.input_ids.numel()) // ratio + int(lengths.numel())
         row_token_starts = torch.cumsum(extend_lens, 0) - extend_lens
-        return self._qsa_write_plan(
+        plan = self._qsa_write_plan(
             token_slot_table=token_slot_table,
             start_blocks=prefix_lens // ratio,
             end_blocks=end_blocks,
@@ -1044,7 +1115,144 @@ class QwenSparseAttnBackend(AttentionBackend):
             compress_ratio=ratio,
             row_token_starts=row_token_starts,
             prefix_lens=prefix_lens,
+            head_offsets=None if resume is None else resume.head_offsets,
+            num_chunk_rows=None if resume is None else resume.num_chunk_rows,
         )
+        if resume is None:
+            return plan + (None,)
+        write_locs, group_positions, group_rows, member_rows, member_locs = plan
+        resume.member_locs = member_locs
+        return write_locs, group_positions, group_rows, member_rows, resume
+
+    def _qsa_ring_resume_plan(
+        self, forward_batch, ring_resume, row_req_pool_indices, batch_size: int
+    ) -> Optional["_QSARingResume"]:
+        """Host plan of the rows whose prefix ends inside a compress group.
+
+        Such a row's group floor_r(prefix) // r is compressed partly from the row's
+        pending ring (its positions [floor_r(prefix), prefix), the "head") and
+        partly from this chunk. That is only valid when the request kept its
+        request row since those keys were written (``ring_resume[i]``: a parked
+        session resumed on its own req_pool_idx, or a chunked continuation);
+        any other misaligned row raises. None when no row is misaligned.
+        """
+        ratio = self.token_to_kv_pool.qsa_compress_ratio
+        seq_cpu = forward_batch.seq_lens_cpu
+        ext_cpu = forward_batch.extend_seq_lens_cpu
+        if seq_cpu is None or ext_cpu is None:
+            raise RuntimeError(
+                "QSA ring resume needs the scheduler's host lengths "
+                "(seq_lens_cpu, extend_seq_lens_cpu)"
+            )
+        seqs = [int(x) for x in seq_cpu[:batch_size]]
+        exts = [int(x) for x in ext_cpu[:batch_size]]
+        if len(seqs) != batch_size or len(exts) != batch_size:
+            raise RuntimeError(
+                f"QSA ring resume: {len(seqs)} host lengths / {len(exts)} extend "
+                f"lengths for {batch_size} rows"
+            )
+        head_rows: List[int] = []
+        head_positions: List[int] = []
+        offsets: List[int] = []
+        prefixes: List[int] = []
+        for i, (seq, ext) in enumerate(zip(seqs, exts)):
+            prefix = seq - ext
+            if prefix < 0 or ext < 0:
+                raise RuntimeError(f"QSA extend row {i}: seq {seq}, extend {ext}")
+            offsets.append(len(head_positions))
+            prefixes.append(prefix)
+            rem = prefix % ratio
+            if rem == 0:
+                continue
+            if i >= len(ring_resume) or not ring_resume[i]:
+                raise ValueError(
+                    f"QSA extend row {i}: prefix {prefix} is not a multiple of the "
+                    f"compress ratio {ratio} and the request is not marked as "
+                    f"holding positions [{prefix - rem}, {prefix}) in its pending "
+                    "ring (qsa_ring_resume)"
+                )
+            if self.hisparse_coordinator is not None:
+                raise NotImplementedError(
+                    "QSA HiSparse resumes on page multiples only; a misaligned "
+                    f"prefix {prefix} (row {i}) reached its extend"
+                )
+            head_rows.extend([i] * rem)
+            head_positions.extend(range(prefix - rem, prefix))
+        if not head_positions:
+            return None
+        device = row_req_pool_indices.device
+        ring = self.token_to_kv_pool.qsa_pending_ring_size
+        rows_t = _host_ints_to_device(head_rows, torch.long, device)
+        positions_t = _host_ints_to_device(head_positions, torch.long, device)
+        starts = list(accumulate(exts, initial=0))[:-1]
+        return _QSARingResume(
+            head_offsets=_host_ints_to_device(offsets, torch.long, device),
+            num_chunk_rows=sum(exts),
+            head_ring_slots=row_req_pool_indices.long()[rows_t] * ring + positions_t % ring,
+            # the row's first chunk token (position prefix) and its distance to each head key
+            head_chunk_rows=_host_ints_to_device(
+                [starts[r] for r in head_rows], torch.long, device
+            ),
+            head_distances=_host_ints_to_device(
+                [prefixes[r] - p for r, p in zip(head_rows, head_positions)],
+                torch.long,
+                device,
+            ),
+            head_rows_cpu=head_rows,
+            head_positions_cpu=head_positions,
+        )
+
+    def _ring_resume_rope(
+        self, chunk_rope: torch.Tensor, resume: "_QSARingResume"
+    ) -> torch.Tensor:
+        """The extend's RoPE matrix with the head's ring coordinates appended.
+
+        Read here, before any layer runs: the RoPE ring is shared by all QSA
+        layers and the first layer's store may overwrite a head slot.
+
+        Overwrite guard: a head key at position h must carry the coordinates this
+        chunk's first token (position prefix) carries minus (prefix - h) on every
+        axis -- the head is the text right before the resume point (positions
+        [floor_r(P), P) for text-only requests; shifted by the M-RoPE delta after
+        an image). Anything else means the row's ring slots were overwritten or the
+        row is not the one that wrote them. The overwrite to expect: a request that
+        finished at P under overlap speculative decoding runs one more verify window
+        [s + L, s + L + K) past its last verify [s, s + K) (P = s + i + 1, L its
+        accepted length), i.e. up to P + 2K - 2; from the head's first position
+        P - r + 1 that is 2K + r - 3 (9 for K = 4) positions, beyond the base ring
+        r + K but within r + 2K (qsa_resume_ring_slack). Checked on the device (no
+        host read on the extend path, h15): a device-side assert, or under
+        ARC_HISPARSE_QSA_DEBUG=1 a RuntimeError naming the slots.
+        """
+        pool = self.token_to_kv_pool
+        head_rope = pool.qsa_rope_position_buffer.index_select(0, resume.head_ring_slots)
+        expected = (
+            chunk_rope.index_select(0, resume.head_chunk_rows)
+            - resume.head_distances[:, None]
+        )
+        bad = (head_rope != expected).any(dim=1)
+        if _ARC_HISPARSE_QSA_DEBUG:
+            hits = bad.nonzero().flatten().tolist()
+            if hits:
+                raise RuntimeError(
+                    "QSA ring resume: the pending-ring head does not hold the RoPE "
+                    "coordinates of the resumed positions (ring row overwritten, or "
+                    "not the request row that wrote it); (batch row, position, ring "
+                    "coordinates, expected): "
+                    + ", ".join(
+                        f"({resume.head_rows_cpu[k]}, {resume.head_positions_cpu[k]}, "
+                        f"{head_rope[k].tolist()}, {expected[k].tolist()})"
+                        for k in hits
+                    )
+                )
+        else:
+            # torch._assert_async takes < 255 characters
+            torch._assert_async(
+                ~bad.any(),
+                "QSA ring resume: a pending-ring head slot was overwritten "
+                "(ARC_HISPARSE_QSA_DEBUG=1 names it)",
+            )
+        return torch.cat([chunk_rope, head_rope])
 
     def _metadata_from_forward_batch(self, forward_batch) -> QwenSparseAttnMetadata:
         self._require_chain_speculation(
@@ -1165,13 +1373,18 @@ class QwenSparseAttnBackend(AttentionBackend):
         pending_ring_slots = None
         compress_group_ring_locs = None
         extend_rope_matrix = None
-        write_locs, group_positions, group_sequence_ids, group_member_rows = (
-            self._qsa_build_write_plan(
-                forward_batch=forward_batch,
-                speculative_paged=speculative_paged,
-                token_slot_table=token_slot_table,
-                sequence_lengths=sequence_lengths,
-            )
+        (
+            write_locs,
+            group_positions,
+            group_sequence_ids,
+            group_member_rows,
+            resume,
+        ) = self._qsa_build_write_plan(
+            forward_batch=forward_batch,
+            speculative_paged=speculative_paged,
+            token_slot_table=token_slot_table,
+            sequence_lengths=sequence_lengths,
+            row_req_pool_indices=row_req_pool_indices,
         )
         decode_like = speculative_paged or forward_batch.forward_mode.is_decode()
         if decode_like:
@@ -1216,6 +1429,10 @@ class QwenSparseAttnBackend(AttentionBackend):
                     extend_rope_matrix = build_rope_position_matrix(
                         rope_source, token_to_batch_idx.numel()
                     )
+                    if resume is not None:
+                        extend_rope_matrix = self._ring_resume_rope(
+                            extend_rope_matrix, resume
+                        )
                 else:
                     compress_group_ring_locs = build_group_ring_slots(
                         req_pool_indices=row_req_pool_indices,
@@ -1277,6 +1494,10 @@ class QwenSparseAttnBackend(AttentionBackend):
             pending_ring_slots=pending_ring_slots,
             compress_group_ring_locs=compress_group_ring_locs,
             extend_rope_matrix=extend_rope_matrix,
+            compress_member_locs=None if resume is None else resume.member_locs,
+            resume_head_ring_slots=(
+                None if resume is None else resume.head_ring_slots
+            ),
             hisparse=hisparse,
             prefill_compressed_locs=prefill_compressed_locs,
             max_position_cpu=max_position_cpu,

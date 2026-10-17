@@ -418,11 +418,19 @@ class QSAIndexer(MultiPlatformOp):
         metadata,
         state_slots: torch.Tensor | None = None,
         state_stored: bool = False,
+        head_keys: torch.Tensor | None = None,
     ) -> None:
-        """Store the pending-group ring and compress each completed group."""
+        """Store the pending-group ring and compress each completed group.
+
+        head_keys: the ring-held head keys of a ring-resumed extend
+        (metadata.resume_head_ring_slots), read before this layer's ring store."""
 
         pool = metadata.token_to_kv_pool
         is_extend = metadata.compress_member_rows is not None
+        if (head_keys is None) != (metadata.resume_head_ring_slots is None):
+            raise RuntimeError(
+                "QSA ring resume: head keys and resume_head_ring_slots must come together"
+            )
         if not state_stored:
             if state_slots is None:
                 state_slots = self._pending_ring_slots(
@@ -448,7 +456,34 @@ class QSAIndexer(MultiPlatformOp):
             return
         group_end_positions = metadata.compress_group_positions.long()
         compressed_locs = metadata.write_locs
-        if is_extend:
+        if is_extend and metadata.compress_member_locs is not None:
+            # Ring resume: a row's first group starts in its pending ring. Compress
+            # from the chunk keys followed by the head keys read before the store;
+            # member_locs and extend_rope_matrix (chunk rows, then head rows) index
+            # that source. Same members, same order, same kernel as a group that
+            # lies wholly in one chunk.
+            if head_keys is None:
+                raise RuntimeError("QSA ring resume compress needs the head keys")
+            num_chunk_rows = metadata.token_to_batch_idx.numel()
+            if token_k.shape[0] != num_chunk_rows:
+                raise RuntimeError(
+                    f"QSA ring resume: {token_k.shape[0]} chunk keys, "
+                    f"{num_chunk_rows} mapped rows"
+                )
+            source_keys = torch.cat(
+                [token_k.to(pool.index_state_dtype), head_keys.to(pool.index_state_dtype)]
+            )
+            group_locs = metadata.compress_member_locs.long().clamp_max(
+                source_keys.shape[0] - 1
+            )
+            source_rope = metadata.extend_rope_matrix
+            if source_rope is None or source_rope.shape[0] != source_keys.shape[0]:
+                raise RuntimeError(
+                    "QSA ring resume: extend_rope_matrix must hold the chunk and head "
+                    f"coordinates ({source_keys.shape[0]} rows), got "
+                    f"{None if source_rope is None else source_rope.shape[0]}"
+                )
+        elif is_extend:
             # Extend chunks are group-aligned; each planned group lies in this forward,
             # so read its members from the packed chunk tensors.
             member_rows = metadata.compress_member_rows.long()
@@ -887,6 +922,13 @@ class QSAIndexer(MultiPlatformOp):
                 logical_positions,
                 indexer_metadata.compress_member_rows is not None,
             )
+        head_keys = None
+        if indexer_metadata.resume_head_ring_slots is not None:
+            # Ring resume: read the head before project_qk / the compress step store
+            # this chunk's pending tail, which can map onto the same ring slots.
+            head_keys = indexer_metadata.token_to_kv_pool.get_qsa_key_state_buffer(
+                self.layer_id
+            ).index_select(0, indexer_metadata.resume_head_ring_slots)
         q, token_k, state_stored = self.project_qk(
             hidden_states,
             positions,
@@ -907,6 +949,7 @@ class QSAIndexer(MultiPlatformOp):
             indexer_metadata,
             state_slots=state_slots,
             state_stored=state_stored,
+            head_keys=head_keys,
         )
         if forward_mode.is_decode() or is_target_verify or is_draft_extend:
             compressed_cache, page_table, compressed_lengths, max_model_len = (

@@ -539,6 +539,7 @@ def test_qsa_indexer_ignores_dp_attention_token_padding():
             compress_member_rows=None,
             decode_logical_positions=None,
             pending_ring_slots=None,
+            resume_head_ring_slots=None,
             get_token_to_batch_idx=lambda: mapping,
             get_prefill_mqa_inputs=lambda layer_id, logical_positions: (
                 torch.empty(0, 1, 128),
@@ -994,6 +995,7 @@ class _DispatchMetadata:
     compress_member_rows = None
     decode_logical_positions = None
     pending_ring_slots = None
+    resume_head_ring_slots = None
     # Consumed by the real _pending_ring_slots helper the dispatch indexer
     # borrows: one token row owned by request slot 1.
     token_to_batch_idx = torch.zeros(2, dtype=torch.int32)

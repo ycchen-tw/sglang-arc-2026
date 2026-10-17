@@ -91,7 +91,9 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     # Parallel per-group arrays for the groups compressed this forward:
     # slot, sequence-local group-end position, and owning metadata row.
     # The first member's token row in this forward's packed tensors is extend only,
-    # where group-aligned chunks keep every member in-chunk; None on paged forwards.
+    # where group-aligned chunks keep every member in-chunk (a ring-resumed row's
+    # straddling group starts before the chunk: see compress_member_locs); None on
+    # paged forwards.
     write_locs: Optional[torch.Tensor] = None
     compress_group_positions: Optional[torch.Tensor] = None
     compress_sequence_ids: Optional[torch.Tensor] = None
@@ -107,6 +109,15 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     pending_ring_slots: Optional[torch.Tensor] = None
     compress_group_ring_locs: Optional[torch.Tensor] = None
     extend_rope_matrix: Optional[torch.Tensor] = None
+    # Ring resume (extend only; None otherwise): a row whose prefix ends inside a
+    # group compresses that group from its pending-ring "head" (positions
+    # [floor_r(prefix), prefix)) plus this chunk. resume_head_ring_slots [H] are
+    # the head's ring slots, read by every layer before it stores the chunk;
+    # compress_member_locs [groups, ratio] index the chunk keys followed by those
+    # H head keys, and extend_rope_matrix then holds the H head coordinates after
+    # the chunk's.
+    compress_member_locs: Optional[torch.Tensor] = None
+    resume_head_ring_slots: Optional[torch.Tensor] = None
     graph_ring_group_locs: Optional[torch.Tensor] = None
     # DECODE forwards with HiSparse offload on; None otherwise.
     hisparse: Optional[QSAHiSparseDecode] = None
