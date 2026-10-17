@@ -82,6 +82,7 @@ logger = logging.getLogger(__name__)
 
 MAX_PARKS_PER_SESSION = 2
 TOMBSTONE_LIMIT = 1 << 16
+STATS_EVERY = 256  # parks between two stats log lines
 
 # meta_info["session_resume"]["reason"] of a fallback: the contract's fixed names
 # (arc-forge docs/plans/session_exact_resume.md); exp/ser-spec-snapshot uses the
@@ -465,6 +466,8 @@ class SessionTailPark:
         self.tombstones.pop(park.session_id, None)
         self._account(park, +1)
         self.counters["park"] += 1
+        if self.counters["park"] % STATS_EVERY == 0:
+            logger.info("session park: %s", self.stats())
 
     # ---- claim (scheduling match) -------------------------------------------
 
@@ -695,7 +698,9 @@ class SessionTailPark:
     def stats(self) -> dict:
         return {
             "parks": len(self.lru),
+            "capacity": self.capacity,
             "claimed": len(self.claims),
-            "kv_tokens": dict(self._tokens),
-            "counters": dict(self.counters),
+            "running_consumers": sum(len(v) for v in self.consumed.values()),
+            "kv_tokens": {"unclaimed": self._tokens[False], "claimed": self._tokens[True]},
+            "counters": dict(sorted(self.counters.items())),
         }
