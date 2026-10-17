@@ -273,6 +273,14 @@ def retraction_discard(req: Req, tree_cache: BasePrefixCache, backend: str) -> N
     req.kv.retraction_backup = None
 
 
+def _release_exact_end(req: Req, tree_cache: BasePrefixCache) -> None:
+    # --session-exact-resume: the end snapshot slot no consumer took
+    if req.kv.exact_end_slot is not None:
+        from sglang.srt.speculative import exact_end
+
+        exact_end.release(tree_cache.req_to_token_pool, req)
+
+
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
     # MambaRadixCache may alloc mamba state before alloc KV cache
@@ -286,6 +294,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
                 req.kv.mamba_pool_idx.unsqueeze(-1)
             )
             req.kv.mamba_pool_idx = None
+        _release_exact_end(req, tree_cache)
         return
 
     effective_kv_committed_len = req.effective_kv_committed_len()
@@ -302,6 +311,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     # internally, then sets req_pool_idx = None.
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
     if not req.kv.holds_kv:
+        _release_exact_end(req, tree_cache)
         return
 
     start_p, end_p = effective_kv_committed_len, req.kv.kv_allocated_len
@@ -319,6 +329,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     # c4/c128 state pages; other ReqToTokenPool subclasses are a no-op here.
     tree_cache.req_to_token_pool.free(req)
     req.kv.mark_kv_released()
+    _release_exact_end(req, tree_cache)
 
 
 def _release_overallocated_kv_indices(

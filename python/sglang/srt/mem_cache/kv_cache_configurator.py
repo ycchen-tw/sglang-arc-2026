@@ -1136,7 +1136,9 @@ class KVCacheConfigurator:
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs + park_rows,
             mamba_size=get_schedule().max_mamba_cache_size,
-            mamba_spec_state_size=max_num_reqs,
+            # per request row (the spec ReplaySSM ring and its cursors): a parked row
+            # is a running request's again once its next turn takes it
+            mamba_spec_state_size=max_num_reqs + park_rows,
             max_context_len=self.model_config.context_len + extra_max_context_len,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,

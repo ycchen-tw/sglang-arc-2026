@@ -759,7 +759,7 @@ class TestSessionTailPark(SessionTailParkHarness):
                 "no_park", "claimed", "ids_mismatch", "key_limit", "evicted",
                 "retract", "abort", "prefill_finished", "stop_string", "grammar",
                 "think_budget", "snapshot_mismatch", "unsupported",
-                "qsa_misaligned", "spec_unsupported",
+                "qsa_misaligned",
             },
         )
         with self.assertRaises(AssertionError):

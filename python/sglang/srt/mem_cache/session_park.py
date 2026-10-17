@@ -113,7 +113,9 @@ GRAMMAR = "grammar"
 THINK_BUDGET = "think_budget"
 SNAPSHOT_MISMATCH = "snapshot_mismatch"  # spec: the end snapshot does not reconcile
 QSA_MISALIGNED = "qsa_misaligned"  # (the transition before exp/ser-qsa-misaligned; unused)
-SPEC_UNSUPPORTED = "spec_unsupported"  # spec decode (until exp/ser-spec-snapshot)
+# Under spec decoding speculative/exact_end.py names the finish's fallback (the same
+# constants: retract, abort, prefill_finished, stop_string, grammar, think_budget,
+# snapshot_mismatch).
 # (ABORT, UNSUPPORTED -- positional embed overrides, beam search -- as well.)
 RESUME_REASONS = frozenset(
     {
@@ -131,7 +133,6 @@ RESUME_REASONS = frozenset(
         SNAPSHOT_MISMATCH,
         UNSUPPORTED,
         QSA_MISALIGNED,
-        SPEC_UNSUPPORTED,
     }
 )
 
@@ -346,8 +347,10 @@ class SessionTailPark:
     def _resolve_exact_end(
         self, req: Req, *, is_insert: bool, kv_len_to_handle: int
     ) -> Optional[ExactEnd]:
+        if self.spec:
+            return self._spec_exact_end(req, is_insert=is_insert)
         if req.exact_end is not None or req.exact_end_fallback is not None:
-            return req.exact_end  # a decode path (spec snapshot) decided
+            raise AssertionError(f"session park: non-spec {req.rid} has an exact end already")
         reason = self._nonspec_fallback(
             req, is_insert=is_insert, kv_len_to_handle=kv_len_to_handle
         )
@@ -360,11 +363,39 @@ class SessionTailPark:
         )
         return req.exact_end
 
+    def _spec_exact_end(self, req: Req, *, is_insert: bool) -> Optional[ExactEnd]:
+        """Spec decoding: the end snapshot of the finishing verify's commit, reconciled
+        by speculative/exact_end.py (on_spec_finish / on_prefill_finish), which names
+        the fallback too. Here only what it does not see: an abort outside a decode
+        result (the scheduler's abort, a sampling-mask abort) and KV another request
+        with the same ids must not take. exact_end.release frees an untaken slot."""
+        fr = req.finished_reason
+        why = None
+        if isinstance(fr, FINISH_ABORT) or not is_insert:
+            why = ABORT
+        elif req.beam_group is not None or req.positional_embed_overrides is not None:
+            why = UNSUPPORTED
+        if why is not None:
+            req.exact_end, req.exact_end_fallback = None, why
+            return None
+        if req.exact_end is None:
+            if req.exact_end_fallback is None:
+                raise AssertionError(
+                    f"session park: spec finish of {req.rid} was not reconciled "
+                    "(exact_end.on_spec_finish / on_prefill_finish)"
+                )
+            return None
+        if req.exact_end_fallback is not None:
+            raise AssertionError(f"session park: {req.rid} has an exact end and a fallback")
+        if req.exact_end.mamba_slot is not req.kv.exact_end_slot:
+            raise AssertionError(f"session park: {req.rid} ExactEnd slot is not its end snapshot slot")
+        if not req.kv.holds_mamba:
+            raise AssertionError(f"session park: req {req.rid} holds no mamba slot")
+        return req.exact_end
+
     def _nonspec_fallback(
         self, req: Req, *, is_insert: bool, kv_len_to_handle: int
     ) -> Optional[str]:
-        if self.spec:
-            return SPEC_UNSUPPORTED
         fr = req.finished_reason
         if isinstance(fr, FINISH_ABORT) or not is_insert:
             return ABORT  # not inserted: a sampling-mask abort
@@ -440,6 +471,13 @@ class SessionTailPark:
                 cache.free_kv_row(req.kv, [(start, req.kv.kv_allocated_len)])
             req.kv.kv_allocated_len = pos
         req.kv.kv_committed_len = pos
+        track = req.kv.mamba_last_track_seqlen
+        if track is not None and track > pos:
+            # Spec: the finishing verify (or the overshoot) tracked past the end, over
+            # ids accepted after the stop -- a checkpoint of no prefix of S. The tree
+            # takes nothing here; the park keeps [cache_protected_len, P).
+            req.kv.mamba_last_track_seqlen = None
+            self.counters["track_past_end"] += 1
 
         token_ids = (req.origin_input_ids + req.output_ids)[:pos]
         # The tree takes [0, T) the way a chunk boundary does; the row keeps the
@@ -477,6 +515,14 @@ class SessionTailPark:
             pool.mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(0))
             req.kv.mamba_pool_idx = exact.mamba_slot
             req.kv.exact_end_slot = None  # the park owns it now
+        if req.kv.exact_end_slot is not None:
+            raise AssertionError(f"session park: {req.rid} parks with an end snapshot slot left")
+        # The record goes to the next turn: its own end snapshot is armed afresh at its
+        # alloc (exact_end.arm_on_alloc), and its first verify writes the row's device
+        # table again (exact_end_row_written False).
+        req.kv.exact_end_epoch = 0
+        req.kv.exact_end_row_written = False
+        req.kv.exact_end_unarmed = None
 
         input_len = len(req.origin_input_ids)
         if input_len > pos:
@@ -678,6 +724,14 @@ class SessionTailPark:
         park.claimant = None
         self.consumed.setdefault(park.session_id, {})[req.rid] = park
         req.qsa_ring_resume = True  # consumed by its next prepare_for_extend
+        mamba_pool = self.cache.req_to_token_pool.mamba_pool
+        if mamba_pool.replayssm_spec_write_pos is not None:
+            # Spec ReplaySSM: the row's ring cursors are the producer's, past its end
+            # (an overshoot verify still in flight may advance them); the slot holds
+            # the whole state after [0, P). Zero them like a fresh row's, again on the
+            # forward stream before this request's extend (HybridReqToTokenPool.alloc,
+            # ModelRunner: replay_cursor_reset_rows).
+            req.kv.replay_cursor_reset = True
         self.counters["consume"] += 1
 
     # ---- release ------------------------------------------------------------

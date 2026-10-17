@@ -876,13 +876,14 @@ class ReqLogprob:
 
 @dataclasses.dataclass(frozen=True)
 class ExactEnd:
-    """arc-forge session exact resume: where a finished request's state is final.
-    Positions [0, pos) are forwarded and their KV and mamba state are final values;
-    the session's next request prefills from pos. mamba_slot holds the state after
-    [0, pos) (temporal + conv + PLE side states) and belongs to the request until
-    the session park takes it (mem_cache/session_park.py). mamba_slot is a 0-dim
-    int64 device tensor like ReqKvInfo.mamba_pool_idx (never read back on the host:
-    the overlap finish path must not sync)."""
+    """--session-exact-resume: where a finished request's sequence is exactly forwarded.
+
+    pos: P -- positions [0, P) are forwarded; their KV and the mamba state after them are
+    final, and the next request of the session prefills from P.
+    mamba_slot: the mamba pool slot holding the state after [0, P) (temporal, conv and
+    the PLE side states), the request's until a consumer (mem_cache/session_park.py)
+    takes it. A device tensor of shape () like ``ReqKvInfo.mamba_pool_idx``: the
+    pool's slot ids live on the device, and an int would cost a host sync per finish."""
 
     pos: int
     mamba_slot: torch.Tensor
@@ -924,10 +925,15 @@ class ReqKvInfo:
     # Deferred ReplaySSM spec cursor reset (arc-forge h20, ARC_GDN_FOLD_IN_VERIFY): a
     # fresh request row zeroes its cursors again on the forward stream before its extend
     replay_cursor_reset: bool = False
-    # arc-forge session exact resume, spec decode: the extra mamba slot holding the
-    # state at the request's ExactEnd; release_kv_cache frees it unless the session
-    # park took it (set to None there).
-    exact_end_slot: Optional[torch.Tensor] = None
+    # --session-exact-resume under spec decoding (speculative/exact_end.py): the mamba
+    # slot the commit of the request's finishing verify writes the state after [0, P)
+    # into (the request's until a consumer takes it by setting this to None;
+    # release_kv_cache frees it otherwise), the arm epoch that seals it, whether this
+    # lifetime wrote the request's row of the device tables, and why it was not armed.
+    exact_end_slot: Optional[torch.Tensor] = None  # shape (), like mamba_pool_idx
+    exact_end_epoch: int = 0
+    exact_end_row_written: bool = False
+    exact_end_unarmed: Optional[str] = None
     # arc-forge session exact resume: whole KV pages (their slot indices) this record
     # owns below cache_protected_len -- its own copy of ids whose tree node holds a
     # concurrent duplicate's pages (an insert keeps the copy the tree has). A session
@@ -1130,6 +1136,10 @@ class Req(ReqDllmMixin):
         # set to_finish instead of directly setting finished_reason.
         # Note: We should never set finished_reason in the middle, the req will get filtered and never respond
         self.to_finish: Optional[BaseFinishReason] = None
+        # (Req.exact_end / exact_end_fallback are declared above, with the session park's
+        # fields.) Verify launches that carried this request (spec exact end: an
+        # overshoot is a launch after the one whose result finishes the request).
+        self.exact_end_verifies = 0
         self.stream = stream
         self.eos_token_ids = eos_token_ids
         self.vocab_size = vocab_size
@@ -1989,6 +1999,11 @@ class Req(ReqDllmMixin):
         self.kv.mamba_cow_src_index = None
         self.kv.mamba_needs_clear = False
         self.kv.mamba_host_restore = None
+        # release_kv_cache freed the exact-end slot; the next lifetime arms afresh
+        assert self.kv.exact_end_slot is None, "exact-end slot not released before retract"
+        self.kv.exact_end_epoch = 0
+        self.kv.exact_end_row_written = False
+        self.kv.exact_end_unarmed = None
         self.already_computed = 0
         assert not self.kv.holds_kv, "expect it is already released"
         self.kv.kv_committed_len = 0

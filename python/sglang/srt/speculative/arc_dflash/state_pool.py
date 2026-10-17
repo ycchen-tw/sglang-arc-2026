@@ -169,14 +169,17 @@ class StatePool:
             done.record(stream)
         return host, done
 
-    def settle(self, slot, snapshot=None) -> int:
+    def settle(self, slot, snapshot=None, upto=None):
         """A parked slot as prefill leaves one: no pending commit, the cursor at the end of the clean window.
 
         The pending rows are the finished request's last verify block, or, under overlap scheduling, the block of the
         one cycle a finished request still runs before the scheduler sees it finish (whose step already folded the
         last verify in). Either way they are dropped, not folded in: the window stays exactly what the drafter
         committed, and the next request appends whatever lies past it. The GR at the window's end is the pending
-        block's first predecessor. Returns that end (one host sync, or none from a `snapshot` taken at park time)."""
+        block's first predecessor. Returns that end (one host sync, or none from a `snapshot` taken at park time)
+        and the fold: None, or -- with `upto` (session exact resume: the finished sequence S is forwarded through
+        len(S) - 2) past the window's end -- (tokens, gr) of the pending rows end + 1 .. min(upto, cursor), copied
+        before they are dropped, for the caller to commit (gr: one predecessor per token plus the new cursor's)."""
         if snapshot is None:
             last, pending, end = torch.stack(
                 (self.last_position[slot], self.pending_length[slot], self.positions[slot].max())
@@ -188,13 +191,17 @@ class StatePool:
             last, pending, end = host.tolist()
         if end != last - pending:
             raise RuntimeError(f"DFlash: parked slot {slot}: window ends at {end}, cursor {last}, {pending} pending")
+        fold = None
+        if upto is not None and upto > end and pending > 0:
+            m = min(upto, last) - end
+            fold = self.pending_tokens[slot, :m].clone(), self.pending_gr[slot, : m + 1].clone()
         gr = self.pending_gr[slot, 0].clone()
         self.last_gr[slot] = gr
         self.pending_gr[slot] = gr  # a step reads row 0 as the cursor's GR when nothing is pending
         self.last_position[slot].fill_(end)
         self.pending_length[slot].fill_(0)
         self.pending_tokens[slot].fill_(0)
-        return end
+        return end, fold
 
     def live(self):
         return len(self.slot_of)

@@ -634,6 +634,14 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+        if get_serving().session_exact_resume and not self.spec_algorithm.is_none():
+            # --session-exact-resume under spec decoding: end snapshots in the
+            # verify commit (speculative/exact_end.py)
+            from sglang.srt.speculative import exact_end
+
+            exact_end.validate_and_init(
+                self.tp_worker.model_runner, self.draft_worker, self.req_to_token_pool
+            )
         if self.enable_hierarchical_cache:
             cache_controller = self.tree_cache.cache_controller
             if cache_controller is not None:

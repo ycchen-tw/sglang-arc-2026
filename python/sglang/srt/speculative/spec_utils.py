@@ -1033,6 +1033,7 @@ def commit_mamba_states_after_verify(
     accept_index: torch.Tensor,
     draft_token_num: int,
     mamba_track_interval: Optional[int] = None,
+    exact_end=None,
 ) -> None:
     """Commit accepted per-step mamba states into the persistent caches.
 
@@ -1044,10 +1045,23 @@ def commit_mamba_states_after_verify(
 
     mamba_track_interval: see _verify_commit_step_indices (arc-forge M5 h18).
 
+    exact_end: --session-exact-resume's exact_end.Plan for this verify (None:
+    off); the GDN ReplaySSM circular commit writes its end snapshots.
+
     No-op for models without mamba-style state or backends without the
     commit hook.
     """
     model_runner = target_worker.model_runner
+    if exact_end is not None:
+        _pool = model_runner.req_to_token_pool
+        if (
+            mambaish_config(model_runner.model_config) is None
+            or _pool.mamba_pool.replayssm_cache_base is None
+            or _pool.mamba_pool.replayssm_is_kda
+        ):
+            raise RuntimeError(
+                "--session-exact-resume end snapshots are written by the GDN ReplaySSM circular commit only"
+            )
     if mambaish_config(model_runner.model_config) is None:
         return
 
@@ -1138,6 +1152,20 @@ def commit_mamba_states_after_verify(
             fold_every_commit=spec_state.temporal.dtype != torch.float32,
             null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
         )
+        if exact_end is not None:
+            # --session-exact-resume: the finishing rows' end snapshots, from the
+            # same ring window and (no FOLD) the checkpoint before the fold below
+            from sglang.srt.speculative.exact_end import snapshot_after_advance
+
+            snapshot_after_advance(
+                req_pool=req_pool,
+                spec_state=spec_state,
+                state_batch_indices=state_batch_indices,
+                replay_indices=replay_indices,
+                accept_lens=accept_lens,
+                commit_has_track=batch.mamba_track_indices is not None,
+                plan=exact_end,
+            )
         # Capacity rows fold all layers in one launch; track rows snapshot the
         # exact crossing state without disturbing the active circular history.
         commit_gdn_replayssm_circular(
