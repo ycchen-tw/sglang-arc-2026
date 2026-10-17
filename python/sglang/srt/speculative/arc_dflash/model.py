@@ -195,6 +195,40 @@ def canonical(tensor):
     return torch.empty_like(tensor, memory_format=torch.contiguous_format).copy_(tensor)
 
 
+# The fewest tokens a refresh forwards (MTP3.refresh pads a shorter one after its own tokens). torch.compile
+# specializes sizes 0 and 1, and the layers slice one row off the block (GroupedConv's previous rows), so a refresh of
+# one token and one of two were each a compiled variant of their own; from three on, one dynamic graph. Padding after
+# the refresh's own tokens leaves its rows' math alone: attention is causal by position, the convolutions read earlier
+# rows, everything else is per row.
+REFRESH_MIN = 3
+
+
+def layer_view(cache):
+    """A clean prefix in the one layout the decoder layers see on the refresh (prefill) path: positions and K/V with
+    default strides, and each boundary's last row only -- `Decoder.forward` reads `boundaries[i][:, -1:]` and
+    nothing else, so the values the layers compute are the same.
+
+    The layers are compiled (fast_drafter.compile_layers, dynamic=True) and a refresh hands them prefixes from
+    several producers: a previous chunk's `append_cache` (a transposed slice, or a concatenation sized to its trace),
+    a pool slot's `read_request` copy (contiguous K/V, one boundary row). torch.compile guards on every stride and
+    specializes sizes 0 and 1, so each producer was a compiled variant of its own, and with decode's the drafter's
+    code objects ran past dynamo's recompile limit (8) once ARC_DFLASH_EXACT_PREFILL / SESSION_PARK added theirs: the
+    variants after it ran eager. Through this view (and REFRESH_MIN) a refresh is one of two variants of the
+    layers' refresh entry (Decoder.refresh_forward), with or without a prefix, which fast_drafter.warm compiles at
+    start-up."""
+    if cache is None:
+        return None
+    return CleanCache(
+        canonical(cache.positions),
+        tuple(
+            LayerCache(
+                canonical(layer.key), canonical(layer.value), tuple(canonical(b[:, -1:]) for b in layer.boundaries)
+            )
+            for layer in cache.layers
+        ),
+    )
+
+
 def swa_mask(query_positions, key_positions, window):
     distance = query_positions[:, :, None] - key_positions[:, None, :]
     return (distance >= 0) & (distance < window)
@@ -534,6 +568,14 @@ class Decoder(nn.Module):
         h = h + y.unsqueeze(-2) * gate.unsqueeze(-1)
         return h, LayerCache(k, v, (raw_a, raw_b, raw_c, raw_d))
 
+    def refresh_forward(self, h, positions, prefix, prefix_positions):
+        """`forward` for MTP3.refresh. The same computation under a code object of its own: torch.compile keeps its
+        compiled variants per code object, and a refresh's (a prefix of clean K/V, attention inlined) passed the
+        guards of decode's (a ring-window prefix, a graph break at the ring attention), so a refresh could run
+        decode's graphs and compile attention variants of its own mid-traffic. fast_drafter.compile_layers compiles
+        both entries."""
+        return Decoder.forward(self, h, positions, prefix, prefix_positions)
+
 
 class CandidateSelector(nn.Module):
     def __init__(self, c):
@@ -610,8 +652,9 @@ class MTP3(nn.Module):
         self.target_reducer = GatedResidual(c, combine=False).requires_grad_(False)
         self.candidate_selector = CandidateSelector(c)
 
-    def forward(self, embeddings, predecessor_gr, positions, prefix=None):
-        # predecessor_gr[i] pairs with embeddings[i]: the target GR one position back.
+    def forward(self, embeddings, predecessor_gr, positions, prefix=None, *, refresh=False):
+        # predecessor_gr[i] pairs with embeddings[i]: the target GR one position back. `refresh`: MTP3.refresh's
+        # call, through the layers' refresh entry (Decoder.refresh_forward).
         if predecessor_gr.shape != (*embeddings.shape[:-1], self.config.hc_count, self.config.hidden_size):
             raise ValueError("invalid final pre-collapse target GR shape")
         h = self.pre_fc_norm_hidden(predecessor_gr.flatten(-2)).unflatten(
@@ -620,7 +663,7 @@ class MTP3(nn.Module):
         h = self.fc_hidden(h) + self.fc_embedding(self.pre_fc_norm_embedding(embeddings)).unsqueeze(-2)
         caches = []
         for i, layer in enumerate(self.layers):
-            h, cache = layer(
+            h, cache = (layer.refresh_forward if refresh else layer)(
                 h, positions, None if prefix is None else prefix.layers[i], None if prefix is None else prefix.positions
             )
             caches.append(cache)
@@ -659,13 +702,24 @@ class MTP3(nn.Module):
                 raise ValueError("position 0 has no predecessor GR; the draft context starts at position 1")
             if prefix is not None and not torch.equal(positions[:, 0], prefix.positions[:, -1] + 1):
                 raise ValueError("refresh must append each committed position exactly once")
-        # Deliberately the class function, not `self(...)`: serving replaces the
-        # instance's `forward` with a compiled one specialized on shape, and a
-        # prefill chunk is as long as the prompt leaves it. Compiling those is
-        # unbounded work -- we measured 10 to 30 second stalls, one per distinct
-        # prompt length, paid as time to first token. Prefill runs once per
-        # request over the prompt, so eager is the right trade.
-        hidden, new = MTP3.forward(self, self.embed_tokens(tokens), predecessor_gr, positions, prefix)
+        # Deliberately the class function, not `self(...)`: a compiled instance `forward` would specialize on the
+        # prefill chunk's length, which is as long as the prompt leaves it -- we measured 10 to 30 second stalls, one
+        # per distinct prompt length, paid as time to first token. What is compiled is the layers' refresh entry
+        # (fast_drafter.compile_layers, dynamic shapes, compiled at start-up by fast_drafter.warm): it sees one layout
+        # of positions and prefix whoever produced them (layer_view), and at least REFRESH_MIN tokens -- a shorter
+        # refresh runs with dummy tokens after its own and keeps its own rows. The trace keeps the caller's layout.
+        n = tokens.shape[1]
+        pad = max(0, REFRESH_MIN - n)
+        if pad:
+            after = positions[:, -1:] + torch.arange(1, pad + 1, device=positions.device)
+            hidden, new = MTP3.forward(
+                self, self.embed_tokens(F.pad(tokens, (0, pad))), F.pad(predecessor_gr, (0, 0, 0, 0, 0, pad)),
+                torch.cat((positions, after), 1), layer_view(prefix), refresh=True,
+            )
+            hidden, new = hidden[:, :n], keep_prefix_of_block(new, positions, n)
+        else:
+            hidden, new = MTP3.forward(self, self.embed_tokens(tokens), predecessor_gr, canonical(positions),
+                                       layer_view(prefix), refresh=True)
         new = append_cache(prefix, new, positions, None if retain_trace else self.config.window)
         return hidden, new
 
