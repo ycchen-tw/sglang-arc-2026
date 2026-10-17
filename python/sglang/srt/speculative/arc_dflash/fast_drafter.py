@@ -20,7 +20,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from . import ring_attention
 from . import serving
-from .model import Attention, GroupedConv, swa_mask
+from .model import REFRESH_MIN, Attention, GroupedConv, swa_mask
 
 _SDPA_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.FLASH_ATTENTION]
 
@@ -129,6 +129,9 @@ def compile_layers(model, deterministic: bool = False):
     fp8.HummingW4A8Linear.forward = torch.compiler.disable(fp8.HummingW4A8Linear.forward)
     for layer in model.layers:
         layer.forward = torch.compile(layer.forward, dynamic=True, options=options)
+        # MTP3.refresh's entry: the same layer under its own code object, so refresh and decode variants never share
+        # (or match) one cache (model.Decoder.refresh_forward)
+        layer.refresh_forward = torch.compile(layer.refresh_forward, dynamic=True, options=options)
     model.hyper_connection_mixer.forward = torch.compile(model.hyper_connection_mixer.forward, dynamic=True,
                                                          options=options)
 
@@ -173,6 +176,27 @@ def advance(worker, states, anchor, temperature):
 
 
 def warm(worker):
-    """Nothing to compile on the eager path; CUDA-graph capture hooks in here."""
+    """Before the CUDA-graph capture (whose eager warm-up compiles decode's variants): compile the refresh variants
+    (warm_refresh); nothing to compile on the eager path."""
+    if worker.model.compile_mode != "0":
+        warm_refresh(worker.model, worker.device, worker.prefill_chunk)
     if os.environ.get("ARC_DFLASH_CHECK_FAST") == "1":
         print("DFlash fast-path check:", check(worker.model), flush=True)
+
+
+@torch.no_grad()
+def warm_refresh(model, device, chunk):
+    """Compile what a refresh (prefill, EXACT_PREFILL's appends, SESSION_PARK's adopted windows) runs through the
+    compiled layers and mixer: a refresh without a prefix and one with. Lengths are one dynamic graph from
+    model.REFRESH_MIN tokens on (a shorter refresh is padded to it) and model.layer_view gives every prefix one
+    layout, so these two are all of them; compiled here, no request waits on a compile and none falls back to eager
+    past dynamo's recompile limit. Sizes as served (a `chunk`-token forward, then one after a window-wide prefix):
+    the first compile's sizes are the kernels' size hints."""
+    c = model.config
+    n = max(REFRESH_MIN, chunk)
+    tokens = torch.zeros((1, 2 * n), dtype=torch.long, device=device)
+    gr = torch.zeros((1, 2 * n, c.hc_count, c.hidden_size), dtype=torch.bfloat16, device=device)
+    positions = torch.arange(1, 2 * n + 1, device=device)[None]
+    _, prefix = model.refresh(tokens[:, :n], gr[:, :n], positions[:, :n])  # no prefix
+    model.refresh(tokens[:, n:], gr[:, n:], positions[:, n:], prefix)  # a prefix
+
