@@ -3574,6 +3574,13 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.tail_park is not None:
             self.tail_park.on_prefill_admitted(req)
 
+    @rank_consensus(same_params=True)
+    def on_session_close(self, session_id: str) -> None:
+        """/close_session: the session's unclaimed parks are released now
+        (session_park.py)."""
+        if self.tail_park is not None:
+            self.tail_park.on_session_close(session_id)
+
     def _assert_track_len_on_grid(self, comp: TreeComponent, cache_len: int) -> None:
         """A MAMBA cache length is where a tracked state sits, and the insert files
         the state under the page-aligned node of that length: off the page grid (a

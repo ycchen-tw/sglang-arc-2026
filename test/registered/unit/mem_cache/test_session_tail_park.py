@@ -733,6 +733,48 @@ class TestSessionTailPark(SessionTailParkHarness):
         self._accounting()
         self._drain()
 
+    def test_close_session_releases_its_unclaimed_parks(self):
+        # sess-A: two ends parked (the per-session limit); sess-B: one.
+        for out in ([1, 2], [3, 4]):
+            self._turn(self.S1_IN, out)
+        self._turn(self.S1_IN, self.S1_OUT, session="sess-B", salt="sess-B")
+        self.assertEqual(self.park.rows(), 3)
+        rows, slots = len(self.pool.free_slots), self.pool.mamba_allocator.available_size()
+        free = self.allocator.available_size()
+        self.cache.on_session_close("sess-A")
+        # Released at once (not left to eviction): rows, mamba slots, the KV past the tree.
+        self.assertEqual(sorted(self.park.parks), ["sess-B"])
+        self.assertEqual(self.park.counters["release:closed"], 2)
+        self.assertEqual(len(self.pool.free_slots), rows + 2)
+        self.assertEqual(self.pool.mamba_allocator.available_size(), slots + 2)
+        self.assertGreater(self.allocator.available_size(), free)
+        b_park = self.park.parks["sess-B"][0]
+        self.assertEqual(self.park.kv_tokens(claimed=False), self.park._park_tokens(b_park))
+        self.assertNotIn("sess-A", self.park.tombstones)
+        self._accounting()
+        # The id is a new session now: no park, no tombstone ("no_park", not "evicted").
+        nxt = self._match(self._req(self.S1_IN + [1, 9]))
+        self.assertEqual(self._resume(nxt)["reason"], "no_park")
+        self._abort_waiting(nxt)
+        # A claimed park stays with its claimant, which consumes it at admission.
+        claimant = self._match(self._req(self._s1() + [1], session="sess-B", salt="sess-B"))
+        self.assertEqual(self._resume(claimant)["mode"], "exact")
+        self.cache.on_session_close("sess-B")
+        self.assertEqual(self.park.parks["sess-B"], [b_park])
+        self.assertEqual(self.park.counters["close:claimed_kept"], 1)
+        self._accounting()
+        self._admit(claimant)
+        self.assertEqual(self._mrp(claimant), ("exact", None, len(self._s1()) - 1))
+        self._run(claimant, [7, 8, 9])
+        self._release(claimant, FINISH_MATCHED_TOKEN(matched=9))
+        self.assertEqual(self.park.rows(), 1)  # its own end, left to eviction
+        self._accounting()
+        # Closing a session with nothing parked is a no-op.
+        self.cache.on_session_close("sess-none")
+        self.assertEqual(self.park.counters["close"], 3)
+        self._accounting()
+        self._drain()
+
     def test_capacity_and_per_session_limit(self):
         for i in range(PARK_ROWS + 1):
             self._turn(self.S1_IN, self.S1_OUT, session=f"s{i}", salt=f"s{i}")

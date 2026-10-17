@@ -370,6 +370,9 @@ class StreamingSession(BasePrefixCache):
     def on_prefill_admitted(self, req: Req) -> None:
         self.inner.on_prefill_admitted(req)
 
+    def on_session_close(self, session_id: str) -> None:
+        self.inner.on_session_close(session_id)
+
     def release_aborted_request(self, handle: CacheRequestHandle) -> None:
         self.inner.release_aborted_request(handle)
 

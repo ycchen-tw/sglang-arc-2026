@@ -27,9 +27,10 @@ Life of a park (one per finished request; a session keeps at most two):
            park's lock is released and the request takes the record (row, KV, mamba
            slot) and extends from P in place.
   release  alloc shortfall the tree cannot cover (evict_for_alloc, last resort),
-           capacity, the per-session limit, or a claimant aborted while waiting
-           (the claim is handed back, the park stays). reset (flush_cache) drops
-           the parks; the caller clears the pools wholesale.
+           capacity, the per-session limit, or /close_session of the session (its
+           unclaimed parks; a claimed one stays with its claimant). A claimant
+           aborted while waiting hands the claim back (the park stays). reset
+           (flush_cache) drops the parks; the caller clears the pools wholesale.
 
 Fallback reason of a request that claims nothing: "claimed" when a park it would
 have matched is taken (waiting or running claimant); otherwise the newest request
@@ -753,6 +754,16 @@ class SessionTailPark:
             del self.parks[park.session_id]
 
     def _release(self, park: _Park, reason: str) -> None:
+        self._free(park)
+        # Evicted or replaced by a newer end of the session: a request that
+        # continues the producer sees "evicted".
+        self._tombstone(
+            park.session_id, EVICTED, park.cache_salt, park.extra_key, park.ids[: park.input_len]
+        )
+        self.counters[f"release:{reason}"] += 1
+
+    def _free(self, park: _Park) -> None:
+        """Unlink an unclaimed park and give back its lock, KV, row and mamba slot."""
         if park.claimed_by is not None:
             raise AssertionError("session park: releasing a claimed park")
         cache = self.cache
@@ -767,12 +778,26 @@ class SessionTailPark:
         pool.mamba_allocator.free(kv.mamba_pool_idx.unsqueeze(0))
         kv.mamba_pool_idx = None
         kv.mark_kv_released()
-        # Evicted or replaced by a newer end of the session: a request that
-        # continues the producer sees "evicted".
-        self._tombstone(
-            park.session_id, EVICTED, park.cache_salt, park.extra_key, park.ids[: park.input_len]
-        )
-        self.counters[f"release:{reason}"] += 1
+
+    # ---- session close --------------------------------------------------------
+
+    def on_session_close(self, sid: str) -> None:
+        """/close_session: the client is done with the session. Its unclaimed parks
+        are released now instead of waiting for eviction, and its tombstones go, so
+        a later request under the same id starts like a new session ("no_park").
+        A claimed park stays with its claimant: admission consumes it as usual (an
+        abort before admission hands it back, an unclaimed park of a closed
+        session then, left to eviction). Requests still running are not touched:
+        one that ends cleanly parks again, likewise left to eviction."""
+        mine = self.parks.get(sid, [])
+        for park in [p for p in mine if p.claimed_by is None]:
+            self._free(park)
+            self.counters["release:closed"] += 1
+        kept = len(self.parks.get(sid, []))
+        if kept:
+            self.counters["close:claimed_kept"] += kept
+        self.tombstones.pop(sid, None)
+        self.counters["close"] += 1
 
     def _supersede(
         self, sid: str, cache_salt: Optional[str], extra_key: Optional[str], input_ids: np.ndarray

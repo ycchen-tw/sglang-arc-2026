@@ -369,6 +369,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def on_prefill_admitted(self, req: Req) -> None:
         """PrefillAdder committed ``req``'s admission (its tree lock is taken)."""
 
+    def on_session_close(self, session_id: str) -> None:
+        """/close_session: the client is done with ``session_id``; a cache holding
+        per-session state drops it (Scheduler.close_session)."""
+
     def finish(self, handle: CacheRequestHandle, outcome: CacheRequestOutcome) -> None:
         """Finish an attempt without cancelling successful asynchronous cache work."""
         if outcome != CacheRequestOutcome.SUCCESS:

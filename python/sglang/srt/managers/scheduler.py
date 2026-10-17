@@ -6013,6 +6013,8 @@ class Scheduler(
     def close_session(self, recv_req: CloseSessionReqInput):
         if self.enable_session_radix_cache:
             self.tree_cache.release_radix_session(recv_req.session_id)
+        # --session-exact-resume: the session's unclaimed tail parks go now.
+        self.tree_cache.on_session_close(recv_req.session_id)
         if (
             recv_req.session_id in self.session_controller
             or not self.enable_session_radix_cache
