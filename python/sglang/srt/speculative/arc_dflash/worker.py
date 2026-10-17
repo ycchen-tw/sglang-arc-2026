@@ -53,9 +53,14 @@ tail with the true predecessor GR). Only a chunk whose history never reached the
 finished request of a session whose whole prompt reached the drafter keeps its slot (parked, given back oldest first
 when a slot is needed; a request ended between prompt chunks is released), and the session's next request takes the
 window over when its ids equal the parked request's on every position the window has read; it then appends only
-what lies past the window. ARC_DFLASH_REFRESH_ASYNC=1 (opt-in, needs EXACT_PREFILL) runs that refresh without a host
-read of device state: the windows' cursors come from a host mirror kept by prefill (`window_end`, dropped once the
-request decodes), a parked slot's from a snapshot copied at park time, and the position checks are device asserts.
+what lies past the window. With --session-exact-resume the next request's target resumes at len(S) - 1 (S: the
+finished request's sequence through its stop), so the adopt also commits the parked pending block's rows through
+len(S) - 2 (StatePool.settle's fold) -- the finishing verify's block when no overshoot cycle folded it in (no overlap
+scheduler, or a prefill batch ran next); without it the window ends at that verify's anchor and the resume misses
+("gap"). A window an overshoot cycle took past the stop hits only where the next ids repeat the accepted rows.
+ARC_DFLASH_REFRESH_ASYNC=1 (opt-in, needs EXACT_PREFILL) runs that refresh without a host read of device state: the
+windows' cursors come from a host mirror kept by prefill (`window_end`, dropped once the request decodes), a parked
+slot's from a snapshot copied at park time, and the position checks are device asserts.
 """
 
 from __future__ import annotations
@@ -72,6 +77,8 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch import nn
+
+from sglang.srt.runtime_context import get_serving
 
 from . import drafter_dir, fast_drafter, serving
 from .heads import TargetEmbedding, build_head
@@ -598,7 +605,8 @@ class DFlashDraftWorker:
         # rid -> Req, SESSION_PARK only: session requests whose last prefill chunk completed their prompt, the ones a
         # finish parks (a request decodes only from here)
         self.live_reqs = {}
-        # session id -> (slot, ids of the request that parked it, REFRESH_ASYNC's StatePool.snapshot or None), oldest first
+        # session id -> (slot, ids of the request that parked it, REFRESH_ASYNC's StatePool.snapshot or None,
+        # --session-exact-resume's len(S) - 2 or None), oldest first
         self.parked = collections.OrderedDict()
         self.adopted = set()  # rids holding a parked window: it may already cover the start of their next chunk
         self.carry = {}  # rid -> (position, GR) of the last row of a chunk that lies wholly before the prompt's tail
@@ -717,7 +725,13 @@ class DFlashDraftWorker:
             self.pool.free_slot(old[0])
             self.state_stats["park_replaced"] += 1
         snapshot = self.pool.snapshot(slot, self.forward_stream) if ASYNC_REFRESH else None
-        self.parked[req.session_id] = (slot, _ids(req), snapshot)
+        # --session-exact-resume: the finished sequence S = prompt + output[:finished_len] is forwarded through
+        # len(S) - 2, where the session's next request resumes the target: the window may take the pending block's
+        # rows through there (settle); off, the pending block is dropped as before
+        upto = None
+        if get_serving().session_exact_resume:
+            upto = len(req.origin_input_ids) + len(req.output_ids_through_stop) - 2
+        self.parked[req.session_id] = (slot, _ids(req), snapshot, upto)
         self.state_stats["park"] += 1
 
     def _make_room(self, rid):
@@ -955,8 +969,10 @@ class DFlashDraftWorker:
         if parked is None:
             self.state_stats["park_none" if req.session_id is not None else "no_session"] += 1
             return None
-        slot, parked_ids, snapshot = parked
-        cursor = self.pool.settle(slot, snapshot)
+        slot, parked_ids, snapshot, upto = parked
+        end, fold = self.pool.settle(slot, snapshot, upto)
+        # the window's end once the pending rows through len(S) - 2 are in (they are the parked request's ids)
+        cursor = end if fold is None else end + fold[0].shape[0]
         ids = _ids(req)
         if cursor < 1:
             why = "blank"  # a one-token prompt's placeholder window
@@ -971,6 +987,11 @@ class DFlashDraftWorker:
         else:
             self.pool.attach(req.rid, slot)
             self.adopted.add(req.rid)
+            if fold is not None:
+                tokens, gr = fold
+                self._append(req.rid, tokens, gr[1:], end + 1)
+                self.state_stats["park_fold"] += 1
+                self.state_stats["park_fold_tokens"] += tokens.shape[0]
             self.state_stats["park_hit"] += 1
             self.state_stats["park_reused_tokens"] += cursor + 1 - start
             return cursor
