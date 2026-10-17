@@ -874,6 +874,21 @@ class ReqLogprob:
     output_token_ids_logprobs_idx: Optional[list] = None
 
 
+@dataclasses.dataclass(frozen=True)
+class ExactEnd:
+    """--session-exact-resume: where a finished request's sequence is exactly forwarded.
+
+    pos: P -- positions [0, P) are forwarded; their KV and the mamba state after them are
+    final, and the next request of the session prefills from P.
+    mamba_slot: the mamba pool slot holding the state after [0, P) (temporal, conv and
+    the PLE side states), the request's until a consumer takes it. A device tensor of
+    shape () like ``ReqKvInfo.mamba_pool_idx``: the pool's slot ids live on the device,
+    and an int would cost a host sync per finish."""
+
+    pos: int
+    mamba_slot: torch.Tensor
+
+
 @dataclasses.dataclass(slots=True, kw_only=True)
 class ReqKvInfo:
     # Device KV a request holds outside the prefix cache. Always present on the Req;
@@ -910,6 +925,15 @@ class ReqKvInfo:
     # Deferred ReplaySSM spec cursor reset (arc-forge h20, ARC_GDN_FOLD_IN_VERIFY): a
     # fresh request row zeroes its cursors again on the forward stream before its extend
     replay_cursor_reset: bool = False
+    # --session-exact-resume under spec decoding (speculative/exact_end.py): the mamba
+    # slot the commit of the request's finishing verify writes the state after [0, P)
+    # into (the request's until a consumer takes it by setting this to None;
+    # release_kv_cache frees it otherwise), the arm epoch that seals it, whether this
+    # lifetime wrote the request's row of the device tables, and why it was not armed.
+    exact_end_slot: Optional[torch.Tensor] = None  # shape (), like mamba_pool_idx
+    exact_end_epoch: int = 0
+    exact_end_row_written: bool = False
+    exact_end_unarmed: Optional[str] = None
 
     def swa_dead_lo(self, page_size: int) -> int:
         # Lowest SWA position this request may free itself: above the tree-owned
@@ -1089,6 +1113,14 @@ class Req(ReqDllmMixin):
         # set to_finish instead of directly setting finished_reason.
         # Note: We should never set finished_reason in the middle, the req will get filtered and never respond
         self.to_finish: Optional[BaseFinishReason] = None
+        # --session-exact-resume (arc-forge docs/plans/session_exact_resume.md), set when
+        # the request finishes. exact_end: [0, pos) is forwarded and its KV / mamba state
+        # is final; None with the reason in exact_end_fallback.
+        self.exact_end: Optional[ExactEnd] = None
+        self.exact_end_fallback: Optional[str] = None
+        # verify launches that carried this request (spec exact end: an overshoot is a
+        # launch after the one whose result finishes the request)
+        self.exact_end_verifies = 0
         self.stream = stream
         self.eos_token_ids = eos_token_ids
         self.vocab_size = vocab_size
@@ -1940,6 +1972,11 @@ class Req(ReqDllmMixin):
         self.kv.mamba_cow_src_index = None
         self.kv.mamba_needs_clear = False
         self.kv.mamba_host_restore = None
+        # release_kv_cache freed the exact-end slot; the next lifetime arms afresh
+        assert self.kv.exact_end_slot is None, "exact-end slot not released before retract"
+        self.kv.exact_end_epoch = 0
+        self.kv.exact_end_row_written = False
+        self.kv.exact_end_unarmed = None
         self.already_computed = 0
         assert not self.kv.holds_kv, "expect it is already released"
         self.kv.kv_committed_len = 0

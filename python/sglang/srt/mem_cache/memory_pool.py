@@ -1366,6 +1366,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
     """A memory pool that maps a request to its token locations."""
 
     mamba_pool_cls = MambaPool
+    # --session-exact-resume under spec decoding: speculative/exact_end.SpecState,
+    # set by exact_end.validate_and_init (None: off)
+    exact_end_spec = None
 
     def __init__(
         self,
@@ -1651,6 +1654,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
             self.req_index_to_mamba_ping_pong_track_buffer_mapping[rows] = (
                 ping_pong_tensor
             )
+        if self.exact_end_spec is not None:
+            from sglang.srt.speculative import exact_end
+
+            for req in reqs:
+                exact_end.arm_on_alloc(self, req)
         return select_index
 
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:

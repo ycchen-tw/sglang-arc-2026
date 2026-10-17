@@ -15,6 +15,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.runtime_context import get_serving
 from sglang.srt.speculative import arc_think_budget
 from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
@@ -656,6 +657,17 @@ def run_eagle_verify(
     mamba_track_interval = (
         None if before_mamba_commit is None else before_mamba_commit(batch, accept_lens)
     )
+    # --session-exact-resume (speculative/exact_end.py): which rows finish in this
+    # verify, where, and the snapshot slot the commit writes their end state into
+    exact_end_plan = None
+    if get_serving().session_exact_resume and not batch.forward_mode.is_idle():
+        exact_end_state = target_worker.model_runner.req_to_token_pool.exact_end_spec
+        if exact_end_state is None:
+            raise RuntimeError(
+                "--session-exact-resume: this spec worker did not set up the end "
+                "snapshots (speculative/exact_end.validate_and_init)"
+            )
+        exact_end_plan = exact_end_state.plan(batch, predict, accept_index, accept_lens)
     # Update mamba state for hybrid GDN models after verification
     commit_mamba_states_after_verify(
         target_worker,
@@ -664,6 +676,7 @@ def run_eagle_verify(
         accept_index,
         num_draft_tokens,
         mamba_track_interval=mamba_track_interval,
+        exact_end=exact_end_plan,
     )
 
     if not batch.forward_mode.is_idle():
@@ -715,4 +728,6 @@ def run_eagle_verify(
         routed_experts_output=forward_batch_output.routed_experts_output,
         indexer_topk_output=forward_batch_output.indexer_topk_output,
         extra_keep_alive_refs=[verify_forward_batch],
+        exact_end_pos=None if exact_end_plan is None else exact_end_plan.pos,
+        exact_end_verify_ct=None if exact_end_plan is None else exact_end_plan.verify_ct,
     )

@@ -961,11 +961,18 @@ def gdn_replayssm_compact_commit_kernel(
     HAS_RESIDUAL: tl.constexpr,
     LIVE_ROWS: tl.constexpr,
     FOLD_IN_VERIFY: tl.constexpr = False,
+    TRACK_FMA: tl.constexpr = False,
 ):
     """Materialize the checkpoint directly from compact ReplaySSM D/K/G.
 
     FOLD_IN_VERIFY (arc-forge h20): the active checkpoint is left to the next
-    verify; only track rows are written, from the same loads as before."""
+    verify; only track rows are written, from the same loads as before.
+
+    TRACK_FMA (--session-exact-resume's end snapshot, no FOLD): the track store
+    is one FMA. Without HAS_TRACK the fold store compiles to an FMA, with it the
+    product is rounded first, as in the default track store; a snapshot taken
+    in a launch beside a HAS_TRACK=False commit uses this to write the bytes
+    that commit's fold does (otherwise 1 ulp apart in ~5e-5 of the elements)."""
     i_v = tl.program_id(0)
     i_n = tl.program_id(1)
     i_hvl = tl.program_id(2)
@@ -1128,6 +1135,16 @@ def gdn_replayssm_compact_commit_kernel(
                         )
                         + track_delta
                     ).to(h0.dtype.element_ty),
+                    mask=mask_v[None, :],
+                )
+            elif TRACK_FMA:
+                tl.store(
+                    h0
+                    + track_idx * stride_state_slot
+                    + i_hv * V * K
+                    + o_v[None, :] * K
+                    + o_k[:, None],
+                    tl.fma(old_state, tl.exp(track_total), track_delta).to(h0.dtype.element_ty),
                     mask=mask_v[None, :],
                 )
             else:
@@ -1994,13 +2011,21 @@ def launch_gdn_replayssm_compact_commit(
     live_rows: bool,
     fold_in_verify: bool = False,
     compact: str | None = None,
+    track_fma: bool = False,
+    slots: int = _FOLD_COMMIT_SLOTS,
 ) -> None:
     """The compact commit kernel alone (no cursor finish): reads the cursors,
     writes the checkpoint and track slots. ``live_rows`` is patch 0030's switch;
     ``fold_in_verify`` (h20) writes the track slots only; ``compact`` (ARC_GDN_FOLD_COMMIT_COMPACT, read when
-    None) launches them over the compacted track rows."""
+    None) launches them over the compacted track rows, ``slots`` programs per (V-tile, layer x head) (the row
+    split only: the bytes do not depend on it; fewer programs cost less when few rows are active, e.g. 1 for
+    --session-exact-resume's end snapshots: ~30 us instead of ~120 us at 36 layers x 48 heads); ``track_fma``
+    (no FOLD only) stores the track rows with the fold store's rounding (gdn_replayssm_compact_commit_kernel's
+    TRACK_FMA)."""
     if compact is None:
         compact = ARC_GDN_FOLD_COMMIT_COMPACT
+    if track_fma and fold_in_verify:
+        raise ValueError("track_fma is the no-FOLD track store (the FOLD store has the verify fold's rounding)")
     if checkpoint_state.dtype == torch.uint8:
         # arc-forge h24: the packed state commits h20's track rows only
         from sglang.kernels.ops.attention.fla.gdn_state_fmt_kernels import launch_track_packed
@@ -2042,7 +2067,7 @@ def launch_gdn_replayssm_compact_commit(
             state_batch_indices=state_batch_indices, replay_indices=replay_indices, write_pos=write_pos,
             cache_base=cache_base, is_flush=is_flush, accept_lens=accept_lens,
             mamba_track_indices=mamba_track_indices, mamba_steps_to_track=mamba_steps_to_track,
-            null_block_id=null_block_id, live_rows=live_rows, BV=BV,
+            null_block_id=null_block_id, live_rows=live_rows, BV=BV, slots=slots,
         )
         if compact == "1":
             return
@@ -2103,6 +2128,7 @@ def launch_gdn_replayssm_compact_commit(
         HAS_RESIDUAL=has_residual,
         LIVE_ROWS=live_rows,
         FOLD_IN_VERIFY=fold_in_verify,
+        **({"TRACK_FMA": True} if track_fma else {}),
         num_warps=4,
         num_stages=2,
     )
@@ -2126,7 +2152,7 @@ def launch_gdn_replayssm_compact_commit(
 def _launch_fold_track_compact(
     *, checkpoint_state, d_cache, k_cache, g_cache, d_residual_buf, k_residual_buf, has_residual,
     state_batch_indices, replay_indices, write_pos, cache_base, is_flush, accept_lens, mamba_track_indices,
-    mamba_steps_to_track, null_block_id, live_rows, BV,
+    mamba_steps_to_track, null_block_id, live_rows, BV, slots=_FOLD_COMMIT_SLOTS,
 ) -> None:
     """ARC_GDN_FOLD_COMMIT_COMPACT: compact the track rows on the device, then the track kernel over them only."""
     num_layers, _, HV, V, K = checkpoint_state.shape
@@ -2148,7 +2174,7 @@ def _launch_fold_track_compact(
         NULL_BLOCK_ID=null_block_id,
         BLOCK=triton.next_power_of_2(max(1, B)),
     )
-    grid = (triton.cdiv(V, BV), _FOLD_COMMIT_SLOTS, HV * num_layers)
+    grid = (triton.cdiv(V, BV), slots, HV * num_layers)
     gdn_replayssm_fold_track_kernel[grid](
         checkpoint_state,
         d_cache,
@@ -2191,7 +2217,7 @@ def _launch_fold_track_compact(
         MAX_CACHE_LEN=max_cache_len,
         HAS_RESIDUAL=has_residual,
         LIVE_ROWS=live_rows,
-        SLOTS=_FOLD_COMMIT_SLOTS,
+        SLOTS=slots,
         num_warps=4,
         num_stages=2,
     )

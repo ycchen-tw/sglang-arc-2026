@@ -100,6 +100,11 @@ class GenerationBatchResult:
     # arc-forge M5 h18: the staging mamba slot each verify row's commit tracked a GDN
     # snapshot into (int64 [bs], -1: none); the result processor issues the D2H.
     hisparse_track_slots: Optional[torch.Tensor] = None
+    # --session-exact-resume (speculative/exact_end.py): per verify row, P of the
+    # end snapshot this verify's commit wrote (int64 [bs], -1: none), copied with
+    # the result; and each request's verify launch count at this verify (host)
+    exact_end_pos: Optional[torch.Tensor] = None
+    exact_end_verify_ct: Optional[List[int]] = None
 
     block_accept_lens: Optional[torch.Tensor] = None
 
@@ -182,6 +187,9 @@ class GenerationBatchResult:
 
         if self.hisparse_track_slots is not None:
             self.hisparse_track_slots = _async_d2h(self.hisparse_track_slots)
+
+        if self.exact_end_pos is not None:
+            self.exact_end_pos = _async_d2h(self.exact_end_pos)
 
         if self.block_accept_lens is not None:
             self.block_accept_lens = _async_d2h(self.block_accept_lens)

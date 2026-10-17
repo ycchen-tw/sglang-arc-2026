@@ -347,3 +347,15 @@ class Serving(msgspec.Struct):
         "Memory budget of the in-memory session records (int32 ids); the least "
         "recently used session is evicted beyond it.",
     ] = 8 << 30
+
+    # -------------------------------------------------------------------------
+    # arc-forge session exact resume (arc-forge docs/plans/session_exact_resume.md)
+    # -------------------------------------------------------------------------
+    session_exact_resume: A[
+        bool,
+        "Resume a session's next request exactly where the previous one ended: every "
+        "finished request reports where its sequence is exactly forwarded "
+        "(Req.exact_end, or the reason it is not in Req.exact_end_fallback). Under "
+        "speculative decoding the commit of the finishing verify snapshots the mamba "
+        "state at that point into a slot of its own. Off: bitwise the base server.",
+    ] = False

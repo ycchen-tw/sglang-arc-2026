@@ -43,12 +43,14 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_memory,
     get_observability,
+    get_serving,
     mamba_track_grid,
     max_speculative_num_draft_tokens,
 )
 from sglang.srt.sampling.sampling_params import (
     get_request_reasoning_end_token_ids,
 )
+from sglang.srt.speculative import exact_end
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
@@ -409,6 +411,8 @@ class SchedulerBatchResultProcessor:
                     ):
                         req.kv.kv_committed_len += 1
                     if req.finished():
+                        if get_serving().session_exact_resume and not batch.spec_algorithm.is_none():
+                            exact_end.on_prefill_finish(req, self.req_to_token_pool, self.enable_overlap)
                         # A request that finishes in its prefill step (max_new_tokens=1: /health_generate,
                         # /health on an idle server, scoring) never reaches the decode path's hook below.
                         # Without this the DFlash drafter keeps its draft-state slot until ARC_DFLASH_EVICT_CYCLES
@@ -1065,6 +1069,8 @@ class SchedulerBatchResultProcessor:
             ):
                 # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
+                if req.finished() and result.exact_end_pos is not None:
+                    exact_end.on_overshoot(req, result, i, self.req_to_token_pool)
                 continue
 
             # next_token_id is a per-req list: 1 token for non-spec, the verified
@@ -1383,6 +1389,10 @@ class SchedulerBatchResultProcessor:
             self.decode_offload_manager.offload_kv_cache(req)
 
         if req.finished():
+            if get_serving().session_exact_resume and not batch.spec_algorithm.is_none():
+                # --session-exact-resume: the end snapshot this result's verify
+                # wrote, reconciled against finished_len (before the release)
+                exact_end.on_spec_finish(req, result, i, self.req_to_token_pool)
             # isinstance narrowing: create_worker may also return plain
             # TpModelWorker-based drafts, which carry no spec-worker hooks.
             if isinstance(self.draft_worker, BaseSpecWorker):
