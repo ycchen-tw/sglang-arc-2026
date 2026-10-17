@@ -295,7 +295,8 @@ class SessionTailPark:
     # ---- accounting ---------------------------------------------------------
 
     def _park_tokens(self, park: _Park) -> int:
-        return ceil_align(park.pos, self.page_size) - park.kv.cache_protected_len
+        kv = park.kv
+        return ceil_align(park.pos, self.page_size) - kv.cache_protected_len + kv.private_kv_tokens
 
     def _account(self, park: _Park, sign: int) -> None:
         claimed = park.claimed_by is not None
@@ -441,8 +442,11 @@ class SessionTailPark:
         req.kv.kv_committed_len = pos
 
         token_ids = (req.origin_input_ids + req.output_ids)[:pos]
-        # The tree takes [0, T) the way a chunk boundary does.
-        cache._cache_unfinished_tokens(req, token_ids, chunked=False)
+        # The tree takes [0, T) the way a chunk boundary does; the row keeps the
+        # producer's own pages where the tree has a duplicate's copy (private_kv).
+        if not cache.keeps_own_pages(req):
+            raise AssertionError(f"session park: {req.rid} does not keep its own pages")
+        cache._cache_unfinished_tokens(req, token_ids, chunked=False, keep_own=True)
         protected = req.kv.cache_protected_len
         if protected % self.page_size != 0 or protected > pos:
             raise AssertionError(
@@ -704,6 +708,7 @@ class SessionTailPark:
         kv = park.kv
         if kv.kv_allocated_len > kv.cache_protected_len:
             cache.free_kv_row(kv, [(kv.cache_protected_len, kv.kv_allocated_len)])
+        cache.free_private_kv(kv)
         pool.free(_RowHolder(kv))
         pool.mamba_allocator.free(kv.mamba_pool_idx.unsqueeze(0))
         kv.mamba_pool_idx = None
@@ -778,6 +783,7 @@ class SessionTailPark:
             assert park.kv.req_pool_idx not in free_rows
             assert park.kv.holds_mamba and park.kv.mamba_ping_pong_track_buffer is None
             assert park.kv.kv_committed_len == park.kv.kv_allocated_len == park.pos
+            assert park.kv.private_kv_tokens % self.page_size == 0
             claimed = park.claimed_by is not None
             assert not claimed or self.claims[park.claimed_by] is park
             tokens[claimed] += self._park_tokens(park)
@@ -800,6 +806,8 @@ class SessionTailPark:
             kv = park.kv
             row = pool.req_to_token[kv.req_pool_idx]
             held_pages.append(row[kv.cache_protected_len : kv.kv_allocated_len] // page)
+            if kv.private_kv is not None:
+                held_pages.append(kv.private_kv // page)
             held_slots.append(kv.mamba_pool_idx.reshape(1))
         free_pages = self.cache.token_to_kv_pool_allocator.get_all_free_pages()
         held = torch.cat(held_pages).to(free_pages.device, torch.int64)
@@ -819,5 +827,7 @@ class SessionTailPark:
             "claimed": len(self.claims),
             "running_consumers": sum(len(v) for v in self.consumed.values()),
             "kv_tokens": {"unclaimed": self._tokens[False], "claimed": self._tokens[True]},
+            # of those, the parks' own pages where the tree has a duplicate's copy
+            "private_tokens": sum(p.kv.private_kv_tokens for p in self.lru.values()),
             "counters": dict(sorted(self.counters.items())),
         }

@@ -298,7 +298,10 @@ class SchedulerInvariantChecker:
                 allocated_len = ceil_align(allocated_len, self.page_size)
                 assert req.kv.cache_protected_len % self.page_size == 0
 
-            full_uncached += allocated_len - req.kv.cache_protected_len
+            # (+ its own pages below the protected prefix: session exact resume)
+            full_uncached += (
+                allocated_len - req.kv.cache_protected_len + req.kv.private_kv_tokens
+            )
             if self.is_hybrid_swa:
                 swa_uncached += allocated_len - max(
                     req.kv.cache_protected_len, req.kv.swa_evicted_seqlen

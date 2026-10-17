@@ -1142,6 +1142,9 @@ class UnifiedRadixCache(BasePrefixCache):
             comp.cleanup_after_caching_req(
                 req, is_finished=True, insert_result=result, insert_params=insert_params
             )
+        # Pages a session request kept below its protected prefix: the tree holds
+        # another copy of those ids (the insert above left them alone).
+        self.free_private_kv(req.kv)
 
         if self.enable_session_radix_cache and result is not None:
             from sglang.srt.managers.schedule_batch import FINISH_ABORT
@@ -1165,17 +1168,44 @@ class UnifiedRadixCache(BasePrefixCache):
             req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return
 
-        self._cache_unfinished_tokens(req, token_ids, chunked=chunked)
+        self._cache_unfinished_tokens(
+            req, token_ids, chunked=chunked, keep_own=self.keeps_own_pages(req)
+        )
 
-    def _cache_unfinished_tokens(self, req: Req, token_ids, *, chunked: bool) -> None:
+    def keeps_own_pages(self, req: Req) -> bool:
+        """--session-exact-resume: a session request never takes another request's
+        copy of its ids (a concurrent duplicate's) in place of the KV it computed --
+        its next turn resumes on that KV, and the routing its ledger append records
+        is the one that KV was computed with."""
+        return (
+            self.tail_park is not None
+            and req.session_id is not None
+            and req.session is None
+        )
+
+    def free_private_kv(self, kv) -> None:
+        if kv.private_kv is not None:
+            self.token_to_kv_pool_allocator.free(kv.private_kv)
+            kv.private_kv = None
+
+    def _cache_unfinished_tokens(
+        self, req: Req, token_ids, *, chunked: bool, keep_own: bool = False
+    ) -> None:
         """Insert the page-aligned prefix of ``token_ids`` the components can cache,
         re-point the request's row at the tree's copies and move its lock to the new
         last node; the request keeps its row and its KV past that prefix. Shared by
         cache_unfinished_req and the session park (session_park.py), which parks a
-        finished request this way at its exact end."""
+        finished request this way at its exact end.
+
+        ``keep_own`` (keeps_own_pages): no re-point. Where the tree already holds
+        another copy of these ids (a concurrent duplicate inserted first), the insert
+        keeps the tree's copy and frees nothing; the request keeps its own pages
+        there as req.kv.private_kv (whole pages below the new protected prefix)."""
         kv_indices_orig = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, : len(token_ids)
         ]
+        if keep_own and req.kv_rotation_base is not None:
+            raise AssertionError("keep_own does not support logical-page KV sharding")
 
         # components prepare insert data + return effective cache_len
         insert_params = InsertParams(
@@ -1229,6 +1259,12 @@ class UnifiedRadixCache(BasePrefixCache):
 
         insert_params.key = radix_key
         insert_params.value = values
+        if keep_own:
+            # No duplicate frees: where a node already holds these ids, the tree keeps
+            # its copy and the request keeps its own (the ranges the tree did not
+            # adopt from the request).
+            insert_params.prev_prefix_len = page_aligned_len
+            insert_params.track_adopted_ranges = True
         result = self.insert(insert_params)
 
         if result.rotation_tail_declined:
@@ -1260,10 +1296,16 @@ class UnifiedRadixCache(BasePrefixCache):
         assert new_prefix_len <= len(new_indices), (
             f"{new_prefix_len=}, {len(new_indices)=}"
         )
-        self.req_to_token_pool.write(
-            (req.kv.req_pool_idx, slice(req.kv.cache_protected_len, len(new_indices))),
-            new_indices[req.kv.cache_protected_len :],
-        )
+        if keep_own:
+            self._keep_own_pages(req, kv_indices_orig, new_indices, result)
+        else:
+            self.req_to_token_pool.write(
+                (
+                    req.kv.req_pool_idx,
+                    slice(req.kv.cache_protected_len, len(new_indices)),
+                ),
+                new_indices[req.kv.cache_protected_len :],
+            )
 
         self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
         # Opt-in: leave the matched-prefix mamba evictable during decode (it is
@@ -1282,7 +1324,9 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
         # Update req fields
-        if len(new_indices) < len(kv_indices_orig):
+        if keep_own:
+            req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
+        elif len(new_indices) < len(kv_indices_orig):
             req.prefix_indices = torch.cat(
                 [new_indices, kv_indices_orig[len(new_indices) :]]
             )
@@ -1303,6 +1347,48 @@ class UnifiedRadixCache(BasePrefixCache):
                 insert_result=result,
                 insert_params=insert_params,
             )
+
+    def _keep_own_pages(
+        self, req: Req, row: torch.Tensor, tree_indices: torch.Tensor, result
+    ) -> None:
+        """keep_own insert: [protected, end) of the request's row stays as it is.
+        Positions the tree adopted from the request are its pages in both; the rest
+        are nodes that already held another copy of the ids -- the request's own
+        pages there become req.kv.private_kv. Host-side ranges, no device read."""
+        lo, end, page = req.kv.cache_protected_len, len(tree_indices), self.page_size
+        if lo % page or end % page or end < lo:
+            raise AssertionError(f"keep_own: protected {lo}, insert end {end}, page {page}")
+        own, adopted, pos = [], [], lo
+        for a, b in result.adopted_ranges.get(BASE_COMPONENT_TYPE, []):
+            a, b = max(a, lo), min(b, end)
+            if a >= b:
+                continue
+            if a % page or (b % page and b != end):
+                raise AssertionError(f"keep_own: adopted range [{a}, {b}) off the page grid")
+            adopted.append((a, b))
+            if a > pos:
+                own.append((pos, a))
+            pos = max(pos, b)
+        if pos < end:
+            own.append((pos, end))
+        if envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.get():
+            tree = tree_indices.to(row.dtype)
+            for a, b in adopted:
+                if not torch.equal(row[a:b], tree[a:b]):
+                    raise AssertionError(
+                        f"keep_own: {req.rid} row [{a}, {b}) the tree adopted differs from it"
+                    )
+            for a, b in own:
+                if bool((row[a:b:page] == tree[a:b:page]).any()):
+                    raise AssertionError(
+                        f"keep_own: {req.rid} row [{a}, {b}) shares pages with the tree"
+                    )
+        if not own:
+            return
+        slots = torch.cat([row[a:b] for a, b in own]).to(dtype=torch.int64, copy=True)
+        kv = req.kv
+        kv.private_kv = slots if kv.private_kv is None else torch.cat([kv.private_kv, slots])
+        self.tail_park.counters["kept_own_tokens"] += sum(b - a for a, b in own)
 
     # ---- Internal Helpers ----
 

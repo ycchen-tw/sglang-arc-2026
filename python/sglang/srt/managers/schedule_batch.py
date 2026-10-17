@@ -928,6 +928,16 @@ class ReqKvInfo:
     # state at the request's ExactEnd; release_kv_cache frees it unless the session
     # park took it (set to None there).
     exact_end_slot: Optional[torch.Tensor] = None
+    # arc-forge session exact resume: whole KV pages (their slot indices) this record
+    # owns below cache_protected_len -- its own copy of ids whose tree node holds a
+    # concurrent duplicate's pages (an insert keeps the copy the tree has). A session
+    # request goes on with the KV it computed; the pages go with the record (into a
+    # park and back) and are freed with it.
+    private_kv: Optional[torch.Tensor] = None
+
+    @property
+    def private_kv_tokens(self) -> int:
+        return 0 if self.private_kv is None else self.private_kv.numel()
 
     def swa_dead_lo(self, page_size: int) -> int:
         # Lowest SWA position this request may free itself: above the tree-owned

@@ -29,10 +29,15 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache import memory_pool
 from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome, EvictParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestOutcome,
+    EvictParams,
+    MatchPrefixParams,
+)
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.registry import (
     TreeCacheBuildContext,
     default_radix_cache_factory,
@@ -228,16 +233,27 @@ class SessionTailParkHarness(CustomTestCase):
             row[pos:end] = new[: end - pos].to(row.dtype)
         req.kv.kv_committed_len = req.kv.kv_allocated_len = end
 
-    def _run(self, req, output, *, overshoot=False):
+    def _run(self, req, output, *, overshoot=False, prefill_insert=False):
         """Prefill the prompt and decode ``output``. extra_buffer tracks the mamba
         state at the last grid point of a prefill whose prefix is on the grid,
         and at every TRACK multiple a decode step reaches. Overlap scheduling
         leaves committed one past the last output id."""
+        self._prefill(req, insert=prefill_insert)
+        return self._decode(req, output, overshoot=overshoot)
+
+    def _prefill(self, req, *, insert):
+        """``insert``: BatchResultProcessor's cache_unfinished_req after the prefill
+        of a request that goes on decoding (the tree takes [0, track point))."""
         n_in = len(req.origin_input_ids)
         prefix = len(req.prefix_indices)
         self._extend(req, n_in)
         if prefix % PAGE == 0 and n_in - prefix >= PAGE:
             req.kv.mamba_last_track_seqlen = prefix + (n_in - prefix) // PAGE * PAGE
+        if insert:
+            self.cache.cache_unfinished_req(req)
+
+    def _decode(self, req, output, *, overshoot=False):
+        n_in = len(req.origin_input_ids)
         req.output_ids = array("q", output)
         committed = n_in + len(output) - 1 + int(overshoot)
         self._extend(req, committed)
@@ -272,7 +288,9 @@ class SessionTailParkHarness(CustomTestCase):
         c = self.cache
         held = [r for r in self.running if r.kv.holds_kv]
         uncached = sum(
-            ceil_align(r.kv.kv_allocated_len, PAGE) - r.kv.cache_protected_len
+            ceil_align(r.kv.kv_allocated_len, PAGE)
+            - r.kv.cache_protected_len
+            + r.kv.private_kv_tokens
             for r in held
         )
         self.assertEqual(
@@ -531,6 +549,71 @@ class TestSessionTailPark(SessionTailParkHarness):
         self.assertEqual(self._resume(other)["reason"], "ids_mismatch")
         for r in list(self.waiting):
             self._abort_waiting(r)
+        self._accounting()
+        self._drain()
+
+    def test_a_duplicate_never_takes_over_a_session_row(self):
+        """Two concurrent requests with the same ids: whichever inserts second keeps
+        its own pages (private_kv) instead of the tree's copy -- after its prefill and
+        when it parks -- so the next turn resumes on the KV the producer computed."""
+        self._first_turn()  # parks [0, 350), the tree holds [0, 256)
+        x = self._s1() + _seq(7000, 41)  # 392 ids
+        a = self._admit(self._match(self._req(x)))  # takes the park: prefix 350
+        b = self._admit(self._match(self._req(x)))  # its duplicate: 256 from the tree
+        b2 = self._admit(self._match(self._req(x)))  # a third copy
+        self.assertEqual(
+            [self._mrp(r)[:2] for r in (a, b, b2)],
+            [("exact", None), ("fallback", "claimed"), ("fallback", "claimed")],
+        )
+        # b and b2 track at 384 after their prefill; b inserts first, b2 then finds
+        # the tree holding b's pages for [256, 384) and keeps its own.
+        b2_own = self.pool.req_to_token[b2.kv.req_pool_idx, :392].clone()
+        self._prefill(b, insert=True)
+        self._prefill(b2, insert=True)
+        self.assertEqual((b.kv.cache_protected_len, b.kv.private_kv_tokens), (384, 0))
+        self.assertEqual((b2.kv.cache_protected_len, b2.kv.private_kv_tokens), (384, 128))
+        self.assertTrue(torch.equal(self.pool.req_to_token[b2.kv.req_pool_idx, :392], b2_own))
+        self.assertTrue(torch.equal(b2.prefix_indices[:384], b2_own[:384].to(torch.int64)))
+        self._accounting()
+        # a resumed off the page grid: no prefill track, nothing inserted yet.
+        a_own = self.pool.req_to_token[a.kv.req_pool_idx, :392].clone()
+        self._prefill(a, insert=True)
+        self.assertEqual((a.kv.cache_protected_len, a.kv.private_kv_tokens), (256, 0))
+        # a decodes past 512 and parks: the tree takes [0, 512), where [256, 384) is
+        # b's copy -- the park keeps a's.
+        out_a = _seq(20000, 140)
+        self._decode(a, out_a)
+        self._decode(b, _seq(30000, 20))
+        self._decode(b2, _seq(40000, 20))
+        a_row = self.pool.req_to_token[a.kv.req_pool_idx, :531].clone()
+        self.assertTrue(torch.equal(a_row[:392], a_own))
+        self._release(a, FINISH_MATCHED_TOKEN(matched=out_a[-1]))
+        park = next(p for p in self.park.lru.values() if p.producer_rid == a.rid)
+        self.assertEqual((park.pos, park.kv.cache_protected_len), (531, 512))
+        self.assertEqual(park.kv.private_kv_tokens, 128)
+        self.assertTrue(torch.equal(self.pool.req_to_token[park.row, :531], a_row))
+        self.assertTrue(torch.equal(park.kv.private_kv, a_own[256:384].to(torch.int64)))
+        # the tree's copy of [256, 384) is b's
+        key = RadixKey(array("q", x[:384]), None, cache_salt="ep-A")
+        tree = self.cache.match_prefix(MatchPrefixParams(key=key)).device_indices
+        self.assertEqual(len(tree), 384)
+        self.assertFalse(bool((tree[256:384] == a_own[256:384].to(tree.dtype)).any()))
+        # the park holds [512, 531) on one page and its own copy of [256, 384)
+        self.assertEqual(self.park.kv_tokens(claimed=False), PAGE + 128)
+        self._accounting()
+        # b2 ends on a stop string (no park): its own pages go back.
+        self._release(b2, FINISH_MATCHED_STR(matched="</tool>"))
+        self._accounting()
+        # The next turn of a's line resumes on a's pages, private ones included.
+        s_a = x + out_a
+        c = self._admit(self._match(self._req(s_a + [1, 2, 3])))
+        self.assertEqual(self._mrp(c), ("exact", None, 531))
+        self.assertEqual(c.kv.private_kv_tokens, 128)
+        self.assertTrue(torch.equal(self.pool.req_to_token[c.kv.req_pool_idx, :531], a_row))
+        self._accounting()
+        self._run(c, [5, 6])
+        self._release(c, FINISH_ABORT())  # no park: the private pages go back
+        self._release(b, FINISH_MATCHED_TOKEN(matched=0))
         self._accounting()
         self._drain()
 

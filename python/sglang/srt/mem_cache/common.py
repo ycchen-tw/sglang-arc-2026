@@ -294,6 +294,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
         kv_len_to_handle=effective_kv_committed_len,
     )
+    # session exact resume: the request's own pages below its protected prefix went
+    # with its KV record into a park, or back to the allocator
+    assert req.kv.private_kv is None, f"{req.rid} still holds private KV pages"
 
     # StreamingSession.cache_finished_req handles speculative tail trim
     # internally, then sets req_pool_idx = None.
