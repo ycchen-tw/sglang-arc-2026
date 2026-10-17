@@ -347,3 +347,16 @@ class Serving(msgspec.Struct):
         "Memory budget of the in-memory session records (int32 ids); the least "
         "recently used session is evicted beyond it.",
     ] = 8 << 30
+    # arc-forge session exact resume (arc-forge docs/plans/session_exact_resume.md)
+    session_exact_resume: A[
+        bool,
+        "When a request with a session_id finishes cleanly, park its request row, the "
+        "KV past the last radix track point and its mamba state at the exact end, so "
+        "the session's next request that extends the same ids resumes there and every "
+        "position is forwarded once (mem_cache/session_park.py). Off: unchanged.",
+    ] = False
+    session_exact_resume_max_parks: A[
+        Optional[int],
+        "With --session-exact-resume: request rows reserved for parked sessions "
+        "(default: max_running_requests); the oldest park is released beyond it.",
+    ] = None

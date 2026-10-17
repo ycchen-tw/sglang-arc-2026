@@ -35,6 +35,8 @@ class CacheInitParams:
     enable_metrics: bool = False
     enable_kv_cache_events: bool = False
     enable_session_radix_cache: bool = False
+    # --session-exact-resume: park finished session requests (session_park.py)
+    session_exact_resume: bool = False
 
     enable_mamba_extra_buffer: bool = False
     enable_mamba_extra_buffer_lazy: bool = False

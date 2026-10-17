@@ -1949,7 +1949,8 @@ class UnifiedRadixCacheSuite:
             len(req.prefix_indices), len(req.full_untruncated_fill_ids)
         )
         if self.cfg.has_mamba:
-            req.kv.mamba_last_track_seqlen = kv_len
+            # extra_buffer tracks on the page grid; the unaligned tail has no state
+            req.kv.mamba_last_track_seqlen = kv_len // ps * ps
 
         avail_before = allocator.available_size()
         cache.cache_finished_req(

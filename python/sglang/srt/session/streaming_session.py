@@ -367,6 +367,9 @@ class StreamingSession(BasePrefixCache):
     def finish(self, handle: CacheRequestHandle, outcome: CacheRequestOutcome) -> None:
         self.inner.finish(handle, outcome)
 
+    def on_prefill_admitted(self, req: Req) -> None:
+        self.inner.on_prefill_admitted(req)
+
     def release_aborted_request(self, handle: CacheRequestHandle) -> None:
         self.inner.release_aborted_request(handle)
 

@@ -1674,6 +1674,9 @@ class PrefillAdder:
             admission.prefix_len, admission.prefix_len + admission.extend_len
         )
         self._req_inc_lock_ref(req)
+        self.tree_cache.on_prefill_admitted(req)
+        req.admitted_prefix_len = admission.prefix_len
+        req.prefill_weight_version = None  # the first prefill result after this sets it
         self.can_run_list.append(req)
         if admission.is_chunked:
             self.new_chunked_req = req

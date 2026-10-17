@@ -816,7 +816,10 @@ class SessionLedger:
             self.counters[f"attempt_{ftype}"] += 1
             if self.writer is not None:
                 self.writer.put({"ev": "attempt", "sid": p.sid, "rid": rid, "t": time.time(), "kind": ftype,
-                                 "finish": finish_reason, "input_len": int(len(p.key)), "gen_len": int(len(gen))})
+                                 "finish": finish_reason, "input_len": int(len(p.key)), "gen_len": int(len(gen)),
+                                 "usage": _usage(meta_info),
+                                 # absent when the abort never reached the scheduler
+                                 "resume": meta_info.get("session_resume")})
             return
         sess = self.sessions.get(p.sid) if p.sid is not None else None
         kind, prefix_len, cause = p.kind, p.prefix_len, p.cause
@@ -891,9 +894,9 @@ class SessionLedger:
               "finish": finish_reason, "stop_substituted": bool(p.stop_substituted and kind == "extend"),
               "rewind": int(rewind),
               "sampling": p.sampling,
-              "usage": {"prompt_tokens": meta_info.get("prompt_tokens"),
-                        "completion_tokens": meta_info.get("completion_tokens"),
-                        "cached_tokens": meta_info.get("cached_tokens")},
+              "usage": _usage(meta_info),
+              # how the scheduler resumed this prefill (--session-exact-resume, session_park.py)
+              "resume": meta_info["session_resume"],
               "spec": {k2: meta_info[k2] for k2 in ("spec_verify_ct", "spec_accept_length", "spec_accept_rate")
                        if k2 in meta_info} or None,
               "replay": {"spans": p.replay.spans, "skip": p.replay.skip, "lcp0": p.replay.lcp0},
@@ -972,7 +975,8 @@ class SessionLedger:
             self.counters["pending_orphaned"] += 1
             if self.writer is not None:
                 self.writer.put({"ev": "attempt", "sid": p.sid, "rid": rid, "t": time.time(), "kind": "orphaned",
-                                 "finish": None, "input_len": int(len(p.key)), "gen_len": 0})
+                                 "finish": None, "input_len": int(len(p.key)), "gen_len": 0,
+                                 "usage": None, "resume": None})  # no meta_info: it left without one
 
     def status(self) -> dict:
         return {"instance": self.instance, "dir": self.root, "v": LEDGER_VERSION, "sessions": len(self.sessions),
@@ -998,6 +1002,12 @@ class SessionLedger:
         if self.writer is not None:
             self.writer.put({"ev": "end", "t": time.time(), "status": self.status()})
             self.writer.close()
+
+
+def _usage(meta_info: dict) -> dict:
+    return {"prompt_tokens": meta_info.get("prompt_tokens"),
+            "completion_tokens": meta_info.get("completion_tokens"),
+            "cached_tokens": meta_info.get("cached_tokens")}
 
 
 def _routing_bytes(meta_info: dict, routing_start: int, n_expected: int):

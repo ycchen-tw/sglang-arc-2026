@@ -50,6 +50,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
     get_schedule,
+    get_serving,
 )
 from sglang.srt.utils import is_hip
 
@@ -326,6 +327,7 @@ def build_kv_cache(
         enable_metrics=enable_metrics,
         enable_kv_cache_events=enable_kv_cache_events,
         enable_session_radix_cache=get_memory().enable_session_radix_cache,
+        session_exact_resume=get_serving().session_exact_resume,
         enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
         enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
         pp_rank=ps.pp_rank,

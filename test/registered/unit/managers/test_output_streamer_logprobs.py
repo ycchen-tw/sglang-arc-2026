@@ -44,6 +44,10 @@ class _FakeReq:
         self.customized_info = None
         self.is_retracted = is_retracted
         self.beam_group = None
+        # meta_info["session_resume"] (mem_cache/session_park.py)
+        self.session_resume = None
+        self.admitted_prefix_len = None
+        self.prefill_weight_version = None
 
         self.return_logprob = True
         self.input_logprob_sent = True

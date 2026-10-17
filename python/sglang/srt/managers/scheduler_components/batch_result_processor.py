@@ -376,6 +376,10 @@ class SchedulerBatchResultProcessor:
                     # aborted middle chunk in the chunked branch long enough to
                     # drain its accounting without streaming it.
                     continue
+                if req.prefill_weight_version is None:
+                    # meta_info["session_resume"]["prefill_version"]: the forward
+                    # that ran the first chunk since the request's admission.
+                    req.prefill_weight_version = result.forward_weight_version
 
                 if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()

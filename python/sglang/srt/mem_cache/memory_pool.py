@@ -293,6 +293,9 @@ class ReqToTokenPool:
         self.free_slots = list(range(1, self._alloc_size))
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
         self._aux_cache: Any = None
+        # Rows of `size` reserved for session parks (session_park.py); set by the
+        # configurator under --session-exact-resume, 0 otherwise.
+        self.session_park_rows = 0
 
     def write(self, indices, values):
         self.req_to_token[indices] = values

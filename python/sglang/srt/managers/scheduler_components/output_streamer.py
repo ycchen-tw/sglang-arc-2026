@@ -32,6 +32,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.session_park import session_resume_meta
 from sglang.srt.runtime_context import get_observability, get_serving
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -174,6 +175,7 @@ class SchedulerOutputStreamer:
             get_cached_tokens_details=self.get_cached_tokens_details,
             rust_server_mode=self.rust_server is not None,
             current_weight_version=get_serving().weight_version,
+            session_exact_resume=get_serving().session_exact_resume,
         )
         for req in reqs:
             if req is skip_req:
@@ -323,6 +325,7 @@ class _GenerationStreamAccumulator:
     default_force_stream_interval: int
     get_cached_tokens_details: Callable[[Req], Optional[CachedTokensDetails]]
     current_weight_version: Optional[str]
+    session_exact_resume: bool = False
     rids: list = field(default_factory=list)
     output_reqs: list[Req] = field(default_factory=list)
     http_worker_ipcs: list = field(default_factory=list)
@@ -356,6 +359,8 @@ class _GenerationStreamAccumulator:
     routed_experts: Optional[list] = None
     routed_experts_meta: Optional[list] = None
     indexer_topk: Optional[list] = None
+    # meta_info["session_resume"] per item (mem_cache/session_park.py)
+    session_resume: list = field(default_factory=list)
     customized_info: dict = field(default_factory=dict)
     beam_search_output: list = field(default_factory=list)
     time_stats: list = field(default_factory=list)
@@ -498,6 +503,9 @@ class _GenerationStreamAccumulator:
 
             # Collect detailed cache breakdown if available
             self.cached_tokens_details.append(self.get_cached_tokens_details(req))
+            self.session_resume.append(
+                session_resume_meta(req, exact_resume=self.session_exact_resume)
+            )
 
         # Multimodal prompt token counts. In disagg decode mode the prefill node
         # already computed these and transferred them via the metadata buffer
@@ -772,6 +780,7 @@ class _GenerationStreamAccumulator:
             output_hidden_states=self.output_hidden_states,
             routed_experts=self.routed_experts,
             routed_experts_meta=self.routed_experts_meta,
+            session_resume=self.session_resume,
             indexer_topk=self.indexer_topk,
             customized_info=(
                 wrap_as_pickle(self.customized_info) if self.customized_info else None

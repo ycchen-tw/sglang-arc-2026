@@ -1488,6 +1488,9 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # Per-request {"dtype", "shape", "start"} of routed_experts (None where
     # routed_experts is None); surfaced as meta_info["routed_experts_meta"].
     routed_experts_meta: Optional[List[Optional[Dict[str, Any]]]] = None
+    # Per-request {"mode", "reason", "pos", "prefill_version"}: how its prefill
+    # resumed (mem_cache/session_park.py), surfaced as meta_info["session_resume"].
+    session_resume: Optional[List[Optional[Dict[str, Any]]]] = None
 
     indexer_topk: Optional[List[Optional[torch.Tensor]]]
 
@@ -1587,6 +1590,8 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     routed_experts: Optional[List[Optional[str]]]
     # See BatchTokenIDOutput.routed_experts_meta.
     routed_experts_meta: Optional[List[Optional[Dict[str, Any]]]] = None
+    # See BatchTokenIDOutput.session_resume.
+    session_resume: Optional[List[Optional[Dict[str, Any]]]] = None
 
     indexer_topk: Optional[List[Optional[str]]]
 

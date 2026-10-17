@@ -75,6 +75,7 @@ from sglang.srt.mem_cache.memory_pool import (
     PageMajorMHATokenToKVPool,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.session_park import session_park_rows
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
@@ -1128,8 +1129,11 @@ class KVCacheConfigurator:
                 "--enable-linear-replayssm-spec with DSPARK/DFLASH requires a KDA "
                 "(kimi_linear) model; got a non-KDA model."
             )
+        # Session exact resume: one row per parked session on top of the running
+        # requests' rows (session_park.py), so a park never takes a running row.
+        park_rows = session_park_rows(max_num_reqs)
         req_to_token_pool = HybridReqToTokenPool(
-            size=max_num_reqs,
+            size=max_num_reqs + park_rows,
             mamba_size=get_schedule().max_mamba_cache_size,
             mamba_spec_state_size=max_num_reqs,
             max_context_len=self.model_config.context_len + extra_max_context_len,
@@ -1166,6 +1170,7 @@ class KVCacheConfigurator:
                 )
             ),
         )
+        req_to_token_pool.session_park_rows = park_rows
         return req_to_token_pool
 
     def _build_default_req_pool(
@@ -1926,6 +1931,8 @@ class KVCacheConfigurator:
                 qsa_token_topk=qsa_profile.budget,
                 num_request_slots=req_to_token_pool.req_to_token.shape[0],
                 qsa_max_verify_tokens=max_speculative_num_draft_tokens() or 0,
+                # TODO(exp/ser-qsa-misaligned merge): qsa_ring_slack=qsa_resume_ring_slack(
+                #   max_speculative_num_draft_tokens(), get_serving().session_exact_resume)
             )
         size_args = {"size": max_total_num_tokens}
         qsa_hisparse = get_memory().enable_hisparse

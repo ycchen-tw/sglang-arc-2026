@@ -366,6 +366,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def release_aborted_request(self, handle: CacheRequestHandle) -> None:
         """Release attempt state; caches without prefetch state have nothing to drop."""
 
+    def on_prefill_admitted(self, req: Req) -> None:
+        """PrefillAdder committed ``req``'s admission (its tree lock is taken)."""
+
     def finish(self, handle: CacheRequestHandle, outcome: CacheRequestOutcome) -> None:
         """Finish an attempt without cancelling successful asynchronous cache work."""
         if outcome != CacheRequestOutcome.SUCCESS:

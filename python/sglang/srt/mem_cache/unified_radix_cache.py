@@ -94,6 +94,7 @@ from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import HiCacheAck
+    from sglang.srt.mem_cache.session_park import SessionTailPark
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
@@ -245,6 +246,15 @@ class UnifiedRadixCache(BasePrefixCache):
         # internal fall-through to self.inner.xxx never fires -- no recursion.
         self.session = StreamingSession(inner=self)
 
+        # Session tail park (--session-exact-resume): a finished session request's
+        # row, its KV past the tree-owned prefix and its exact-end mamba state,
+        # resumed by the session's next request (session_park.py).
+        self.tail_park: Optional[SessionTailPark] = None
+        if params.session_exact_resume:
+            from sglang.srt.mem_cache.session_park import SessionTailPark
+
+            self.tail_park = SessionTailPark(self)
+
         self.tp_group = params.tp_cache_group
         self.attn_cp_group = params.attn_cp_cache_group
         self.attn_tp_group = params.attn_tp_cache_group
@@ -382,6 +392,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Reset Controller.
         self.session.slots.clear()
+        if self.tail_park is not None:
+            # The pools are cleared wholesale by the caller (flush_cache).
+            self.tail_park.reset()
         self.ongoing_write_through: dict[int, _OngoingWriteThrough] = {}
         self.ongoing_load_back: dict[int, _OngoingLoadBack] = {}
         self.enable_storage = False
@@ -556,6 +569,10 @@ class UnifiedRadixCache(BasePrefixCache):
         result = self.session.try_match_prefix(params)
         if result is not None:
             return result
+        if self.tail_park is not None:
+            result = self.tail_park.try_match_prefix(params)
+            if result is not None:
+                return result
         if self.disable:
             return self.tree_core.empty_match_result
         result = self.tree_core.match_prefix(params)
@@ -605,6 +622,41 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=True, same_results=True)
     def evict_for_alloc(self, params: EvictParams) -> EvictResult:
+        """Evict until the requested component allocations become feasible.
+
+        Session parks (--session-exact-resume) go last: when the tree alone cannot
+        cover the shortfall, release the oldest unclaimed park (its KV, mamba slot,
+        row and its lock on the tree path) and evict the tree again, until the
+        targets are met or no park is left to release.
+        """
+        if self.tail_park is None or self.disable:
+            return self._evict_for_alloc_tree(params)
+        targets = {
+            ct: self._component_available_size(ct) + request_cnt
+            for ct, request_cnt in self._evict_request_by_type(params).items()
+            if request_cnt > 0
+        }
+        result = self._evict_for_alloc_tree(params)
+
+        def shortfall(ct: ComponentType) -> int:
+            if ct not in targets:
+                return 0
+            return max(0, targets[ct] - self._component_available_size(ct))
+
+        while any(shortfall(ct) > 0 for ct in targets) and self.tail_park.evict_lru():
+            more = self._evict_for_alloc_tree(
+                EvictParams(
+                    num_tokens=shortfall(ComponentType.FULL),
+                    swa_num_tokens=shortfall(ComponentType.SWA),
+                    mamba_num=shortfall(ComponentType.MAMBA),
+                )
+            )
+            result.num_tokens_evicted += more.num_tokens_evicted
+            result.swa_num_tokens_evicted += more.swa_num_tokens_evicted
+            result.mamba_num_evicted += more.mamba_num_evicted
+        return result
+
+    def _evict_for_alloc_tree(self, params: EvictParams) -> EvictResult:
         """Evict until the requested component allocations become feasible.
 
         ``params`` contains allocator shortfalls, not absolute eviction quotas.
@@ -961,6 +1013,10 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> None:
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             return
+        if self.tail_park is not None and self.tail_park.try_park(
+            req, is_insert=is_insert, kv_len_to_handle=kv_len_to_handle
+        ):
+            return
 
         if self.disable:
             self.free_kv_row(req.kv, [(0, kv_len_to_handle)])
@@ -994,6 +1050,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     is_finished=True,
                 )
                 if cl is not None:
+                    self._assert_track_len_on_grid(comp, cl)
                     effective_cache_len = min(effective_cache_len, cl)
 
             # Truncate if needed; the tail free is deferred and batched with
@@ -1108,6 +1165,14 @@ class UnifiedRadixCache(BasePrefixCache):
             req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return
 
+        self._cache_unfinished_tokens(req, token_ids, chunked=chunked)
+
+    def _cache_unfinished_tokens(self, req: Req, token_ids, *, chunked: bool) -> None:
+        """Insert the page-aligned prefix of ``token_ids`` the components can cache,
+        re-point the request's row at the tree's copies and move its lock to the new
+        last node; the request keeps its row and its KV past that prefix. Shared by
+        cache_unfinished_req and the session park (session_park.py), which parks a
+        finished request this way at its exact end."""
         kv_indices_orig = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, : len(token_ids)
         ]
@@ -1129,6 +1194,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 is_finished=False,
             )
             if cl is not None:
+                self._assert_track_len_on_grid(comp, cl)
                 effective_cache_len = min(effective_cache_len, cl)
 
         radix_key = RadixKey(
@@ -2444,6 +2510,10 @@ class UnifiedRadixCache(BasePrefixCache):
     @rank_consensus(same_params=True)
     def release_aborted_request(self, request: CacheRequestHandle) -> None:
         rid = request.rid
+        if self.tail_park is not None:
+            # A request that claimed a park leaves before admission: the park is
+            # still whole (admission is what consumes it), hand it back.
+            self.tail_park.release_claim(rid)
         if self.linker is not None:
             self.linker.release_request(rid)
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
@@ -3412,6 +3482,24 @@ class UnifiedRadixCache(BasePrefixCache):
     def supports_mamba(self) -> bool:
         return self.is_mamba_enabled
 
+    def on_prefill_admitted(self, req: Req) -> None:
+        """PrefillAdder committed ``req`` (its own tree lock is taken): a park it
+        claimed at match time is consumed now (session_park.py)."""
+        if self.tail_park is not None:
+            self.tail_park.on_prefill_admitted(req)
+
+    def _assert_track_len_on_grid(self, comp: TreeComponent, cache_len: int) -> None:
+        """A MAMBA cache length is where a tracked state sits, and the insert files
+        the state under the page-aligned node of that length: off the page grid (a
+        prefill tracked from a prefix off it) the state would land under a shorter
+        node than it belongs to, silently."""
+        if comp.component_type != ComponentType.MAMBA or not self.enable_mamba_extra_buffer:
+            return
+        if cache_len % self.page_size != 0:
+            raise AssertionError(
+                f"mamba cache length {cache_len} is off the page grid {self.page_size}"
+            )
+
     # ---- Session radix cache API (delegates to composed UnifiedSessionRefTracker) ----
 
     def open_radix_session(self, session_id: str) -> Optional[int]:
@@ -3431,29 +3519,48 @@ class UnifiedRadixCache(BasePrefixCache):
     def release_session(self, session_id: str) -> None:
         self.session.release_session(session_id)
 
+    # Session tail parks (session_park.py): an unclaimed park is evictable (the
+    # alloc path releases it last, see evict_for_alloc); a park a waiting request
+    # has claimed is held. Its row is always held.
+
+    def _park_tokens(self, *, claimed: bool) -> int:
+        return 0 if self.tail_park is None else self.tail_park.kv_tokens(claimed=claimed)
+
+    def _park_mamba_slots(self, *, claimed: bool) -> int:
+        if self.tail_park is None:
+            return 0
+        return self.tail_park.mamba_slots(claimed=claimed)
+
     def session_held_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
-        return self.session.session_held_tokens(active_pool_idxs)
+        return self.session.session_held_tokens(active_pool_idxs) + self._park_tokens(
+            claimed=True
+        )
 
     def session_held_full_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
-        return self.session.session_held_full_tokens(active_pool_idxs)
+        return self.session.session_held_full_tokens(
+            active_pool_idxs
+        ) + self._park_tokens(claimed=True)
 
     def session_held_swa_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
         return self.session.session_held_swa_tokens(active_pool_idxs)
 
     def session_held_req_count(self, active_pool_idxs: Optional[set] = None) -> int:
-        return self.session.session_held_req_count(active_pool_idxs)
+        parked_rows = 0 if self.tail_park is None else self.tail_park.rows()
+        return self.session.session_held_req_count(active_pool_idxs) + parked_rows
 
     def session_held_mamba_slots(self, active_pool_idxs: Optional[set] = None) -> int:
-        return self.session.session_held_mamba_slots(active_pool_idxs)
+        return self.session.session_held_mamba_slots(
+            active_pool_idxs
+        ) + self._park_mamba_slots(claimed=True)
 
     def evictable_size(self) -> int:
-        return self.tree_core.evictable_size()
+        return self.tree_core.evictable_size() + self._park_tokens(claimed=False)
 
     def protected_size(self) -> int:
         return self.tree_core.protected_size()
 
     def full_evictable_size(self) -> int:
-        return self.tree_core.full_evictable_size()
+        return self.tree_core.full_evictable_size() + self._park_tokens(claimed=False)
 
     def full_protected_size(self) -> int:
         return self.tree_core.full_protected_size()
@@ -3462,7 +3569,9 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.tree_core.swa_evictable_size()
 
     def mamba_evictable_size(self) -> int:
-        return self.tree_core.mamba_evictable_size()
+        return self.tree_core.mamba_evictable_size() + self._park_mamba_slots(
+            claimed=False
+        )
 
     def swa_protected_size(self) -> int:
         return self.tree_core.swa_protected_size()
@@ -3521,6 +3630,11 @@ class UnifiedRadixCache(BasePrefixCache):
         # all nodes are unlocked during idle, which streaming sessions break
         # by design (they hold a first-turn lock across turns).
         if self.session.any_holding_kv():
+            return
+        # Session parks hold their tree path locked across requests in the same way.
+        # (Called while idle only: no claimant can be waiting.)
+        if self.tail_park is not None and self.tail_park.rows() > 0:
+            self.tail_park.sanity_check(idle=True)
             return
 
         # Pass ongoing ops as lightweight (id, node_id) pairs so the tree core

@@ -64,6 +64,10 @@ class _FakeReq:
         self.multimodal_inputs = None
         self.customized_info = customized_info
         self.weight_version_events = []
+        # meta_info["session_resume"] (mem_cache/session_park.py)
+        self.session_resume = None
+        self.admitted_prefix_len = None
+        self.prefill_weight_version = None
 
     def finished(self):
         return self._finished
@@ -94,7 +98,9 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
     def setUp(self):
         serving_patch = patch(
             "sglang.srt.managers.scheduler_components.output_streamer.get_serving",
-            return_value=SimpleNamespace(stream_interval=1, weight_version="default"),
+            return_value=SimpleNamespace(
+                stream_interval=1, weight_version="default", session_exact_resume=False
+            ),
         )
         observability_patch = patch(
             "sglang.srt.managers.scheduler_components.output_streamer.get_observability",

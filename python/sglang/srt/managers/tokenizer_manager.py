@@ -2510,6 +2510,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         "reasoning_tokens": recv_obj.reasoning_tokens[i],
                         "completion_tokens": recv_obj.completion_tokens[i],
                         "cached_tokens": recv_obj.cached_tokens[i],
+                        # How the prefill resumed (--session-exact-resume,
+                        # mem_cache/session_park.py); mode "none" with the flag off.
+                        "session_resume": recv_obj.session_resume[i],
                     }
                 )
                 if (

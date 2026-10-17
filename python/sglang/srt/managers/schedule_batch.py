@@ -874,6 +874,20 @@ class ReqLogprob:
     output_token_ids_logprobs_idx: Optional[list] = None
 
 
+@dataclasses.dataclass(frozen=True)
+class ExactEnd:
+    """arc-forge session exact resume: where a finished request's state is final.
+    Positions [0, pos) are forwarded and their KV and mamba state are final values;
+    the session's next request prefills from pos. mamba_slot holds the state after
+    [0, pos) (temporal + conv + PLE side states) and belongs to the request until
+    the session park takes it (mem_cache/session_park.py). mamba_slot is a 0-dim
+    int64 device tensor like ReqKvInfo.mamba_pool_idx (never read back on the host:
+    the overlap finish path must not sync)."""
+
+    pos: int
+    mamba_slot: torch.Tensor
+
+
 @dataclasses.dataclass(slots=True, kw_only=True)
 class ReqKvInfo:
     # Device KV a request holds outside the prefix cache. Always present on the Req;
@@ -910,6 +924,10 @@ class ReqKvInfo:
     # Deferred ReplaySSM spec cursor reset (arc-forge h20, ARC_GDN_FOLD_IN_VERIFY): a
     # fresh request row zeroes its cursors again on the forward stream before its extend
     replay_cursor_reset: bool = False
+    # arc-forge session exact resume, spec decode: the extra mamba slot holding the
+    # state at the request's ExactEnd; release_kv_cache frees it unless the session
+    # park took it (set to None there).
+    exact_end_slot: Optional[torch.Tensor] = None
 
     def swa_dead_lo(self, page_size: int) -> int:
         # Lowest SWA position this request may free itself: above the tree-owned
@@ -1020,6 +1038,18 @@ class Req(ReqDllmMixin):
         self.session_id = session_id
         # Used by the session radix cache to reject registration after a close/reopen.
         self.session_generation: Optional[int] = None
+        # arc-forge session exact resume (mem_cache/session_park.py): where this
+        # request's state is final when it ends (None + reason when it is not usable),
+        # how its last scheduling match resumed ((mode, reason), park end), and whether
+        # its QSA pending-ring row holds [floor4(prefix), prefix) for its next extend.
+        self.exact_end: Optional[ExactEnd] = None
+        self.exact_end_fallback: Optional[str] = None
+        self.session_resume: Optional[tuple] = None
+        self.qsa_ring_resume: bool = False
+        # meta_info["session_resume"]: the prefix of the last admission and the
+        # weight version of the first prefill forward after it.
+        self.admitted_prefix_len: Optional[int] = None
+        self.prefill_weight_version: Optional[str] = None
         self.input_embeds = input_embeds
         self.positional_embed_overrides = positional_embed_overrides
         self.multi_item_delimiter_indices = multi_item_delimiter_indices
@@ -2991,7 +3021,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # to force the math calculation to retrieve the correct mamba state from h.
             return i + 1
 
-        mask = req.extend_range.length >= checkpoint_grid
+        # The track point is prefix + k * checkpoint_grid and the tree files the
+        # state under the page-aligned node of that length: from a prefix off the
+        # page grid (a session resumed at its exact end, a chunk ending mid-page)
+        # it would land under a shorter node than the state belongs to.
+        mask = (
+            req.extend_range.length >= checkpoint_grid
+            and len(req.prefix_indices) % self.tree_cache.page_size == 0
+        )
         track_position = req.kv.mamba_next_track_idx
         if mamba_track_host.MAMBA_TRACK_HOST == "1":
             # Gathered on the device in prepare_for_extend; .item() here synchronizes the stream.
