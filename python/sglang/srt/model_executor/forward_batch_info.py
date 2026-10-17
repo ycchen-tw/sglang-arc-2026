@@ -448,6 +448,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # mamba_track_seqlens (ScheduleBatch.prepare_for_extend); None otherwise.
     mamba_extend_track_mask_cpu: Optional[List[bool]] = None  # shape: [b]
     mamba_extend_track_seqlens_cpu: Optional[List[int]] = None  # shape: [b]
+    # Extend only: per request, its QSA pending ring holds [floor4(prefix), prefix)
+    # (Req.qsa_ring_resume); None when no request is marked.
+    qsa_ring_resume_cpu: Optional[List[bool]] = None  # shape: [b]
     # Deferred mamba init ops: COW pairs and clear indices (performed on forward stream)
     mamba_cow_src_indices: Optional[torch.Tensor] = None
     mamba_cow_dst_indices: Optional[torch.Tensor] = None
@@ -866,6 +869,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mamba_track_seqlens=batch.mamba_track_seqlens,
             mamba_extend_track_mask_cpu=batch.mamba_extend_track_mask_cpu,
             mamba_extend_track_seqlens_cpu=batch.mamba_extend_track_seqlens_cpu,
+            qsa_ring_resume_cpu=batch.qsa_ring_resume_cpu,
             mamba_cow_src_indices=batch.mamba_cow_src_indices,
             mamba_cow_dst_indices=batch.mamba_cow_dst_indices,
             mamba_clear_indices=batch.mamba_clear_indices,
@@ -1702,6 +1706,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.mamba_extend_track_seqlens_cpu = self.mamba_extend_track_seqlens_cpu + [
                 0
             ] * (bs - len(self.mamba_extend_track_seqlens_cpu))
+        if self.qsa_ring_resume_cpu is not None:
+            # padding rows have no prefix
+            self.qsa_ring_resume_cpu = self.qsa_ring_resume_cpu + [False] * (
+                bs - len(self.qsa_ring_resume_cpu)
+            )
 
         if self.mrope_positions is not None:
             self.mrope_positions = torch.cat(

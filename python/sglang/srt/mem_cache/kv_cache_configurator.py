@@ -87,6 +87,7 @@ from sglang.srt.runtime_context import (
     get_mm,
     get_parallel,
     get_schedule,
+    get_serving,
     get_spec,
     max_speculative_num_draft_tokens,
     pre_capture_activation_reserve_mb,
@@ -1903,6 +1904,7 @@ class KVCacheConfigurator:
         )
         from sglang.srt.mem_cache.qsa_kv_pool import (
             QSATokenToKVPool,
+            qsa_resume_ring_slack,
         )
 
         from sglang.srt.mem_cache.qsa_kv_pool import native_mtp_kv_host_enabled, NativeMTPMappedHostFP8Pool
@@ -1931,8 +1933,12 @@ class KVCacheConfigurator:
                 qsa_token_topk=qsa_profile.budget,
                 num_request_slots=req_to_token_pool.req_to_token.shape[0],
                 qsa_max_verify_tokens=max_speculative_num_draft_tokens() or 0,
-                # TODO(exp/ser-qsa-misaligned merge): qsa_ring_slack=qsa_resume_ring_slack(
-                #   max_speculative_num_draft_tokens(), get_serving().session_exact_resume)
+                # A parked row's ring keeps its [floor4(P), P) head across the
+                # overshoot verify of a finished spec request (0 with the flag off).
+                qsa_ring_slack=qsa_resume_ring_slack(
+                    max_speculative_num_draft_tokens() or 0,
+                    get_serving().session_exact_resume,
+                ),
             )
         size_args = {"size": max_total_num_tokens}
         qsa_hisparse = get_memory().enable_hisparse

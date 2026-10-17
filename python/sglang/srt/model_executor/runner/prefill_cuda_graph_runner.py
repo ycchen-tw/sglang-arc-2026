@@ -1702,6 +1702,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             # bs-axis slots copied unpadded from the live batch, so its host mirrors hold.
             mamba_extend_track_mask_cpu=forward_batch.mamba_extend_track_mask_cpu,
             mamba_extend_track_seqlens_cpu=forward_batch.mamba_extend_track_seqlens_cpu,
+            qsa_ring_resume_cpu=forward_batch.qsa_ring_resume_cpu,
             encoder_lens=forward_batch.encoder_lens,
             return_logprob=(
                 forward_batch.return_logprob

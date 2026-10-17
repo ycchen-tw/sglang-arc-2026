@@ -371,6 +371,8 @@ class TestSessionTailPark(SessionTailParkHarness):
         self.assertEqual(self.park.rows(), 0)
         self.assertEqual(r2.kv.req_pool_idx, row)
         self.assertIs(r2.kv.mamba_pool_idx, slot)
+        # P = 350 is inside a QSA compress group: the extend reads [348, 350)
+        # from this row's pending ring (exp/ser-qsa-misaligned).
         self.assertTrue(r2.qsa_ring_resume)
         # The extend wrote [350, 391) behind the producer's KV, continuing its
         # last page; nothing before 350 moved.
@@ -545,22 +547,6 @@ class TestSessionTailPark(SessionTailParkHarness):
             self._abort_waiting(nxt)
         self.assertEqual(self.park.rows(), 0)
         self._accounting()
-        self._drain()
-
-    def test_qsa_misaligned_end_falls_back(self):
-        self.park.qsa_ratio = 4  # as on the QSA pool; 350 % 4 != 0
-        self._first_turn()
-        self.assertEqual(self.park.rows(), 0)
-        nxt = self._match(self._req(self._s1() + [1]))
-        self.assertEqual(self._resume(nxt)["reason"], "qsa_misaligned")
-        self._abort_waiting(nxt)
-        # committed 352 = 201 + 152 - 1 is a multiple of 4: it parks
-        r = self._turn(self.S1_IN, _seq(5000, 152), session="sess-4")
-        self.assertEqual(self.park.rows(), 1)
-        nxt = self._match(self._req(r.origin_input_ids.tolist() + r.output_ids.tolist() + [1], session="sess-4"))
-        self.assertEqual(self._mrp(nxt), ("exact", None, None))
-        self.assertEqual(self.park.claims[nxt.rid].pos, 352)
-        self._abort_waiting(nxt)
         self._drain()
 
     def test_eviction_releases_the_oldest_unclaimed_park_last(self):

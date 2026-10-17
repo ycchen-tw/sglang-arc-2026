@@ -48,6 +48,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
     get_schedule,
+    get_serving,
     get_spec,
     max_speculative_num_draft_tokens,
 )
@@ -1439,7 +1440,11 @@ class QSAHiSparsePoolConfigurator(DefaultPoolConfigurator):
             # outside the token pool); its weights were on the GPU before this budget was measured
             return 0, 0
         from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
-        from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool, native_mtp_kv_host_enabled
+        from sglang.srt.mem_cache.qsa_kv_pool import (
+            QSATokenToKVPool,
+            native_mtp_kv_host_enabled,
+            qsa_resume_ring_slack,
+        )
 
         host_kv = native_mtp_kv_host_enabled()
         draft_dtype = get_spec().speculative_draft_kv_cache_dtype
@@ -1467,7 +1472,12 @@ class QSAHiSparsePoolConfigurator(DefaultPoolConfigurator):
         slots = get_schedule().max_running_requests // kvc.ps.attn_dp_size + 1
         # h19: the pending ring holds ratio + K keys per request slot (experimental-qsa 0018),
         # as kv_cache_configurator builds it (qsa_max_verify_tokens)
-        ring_size = profile.compress_ratio + (max_speculative_num_draft_tokens() or 0)
+        draft_tokens = max_speculative_num_draft_tokens() or 0
+        ring_size = (
+            profile.compress_ratio
+            + draft_tokens
+            + qsa_resume_ring_slack(draft_tokens, get_serving().session_exact_resume)
+        )
         ring = slots * ring_size * (profile.kv_heads * profile.head_dim * 2 + 3 * 8)
         # rows beyond L: the pool's page_size padding plus the index capacity's round-up
         return cell, cell * 2 * page + ring

@@ -83,12 +83,6 @@ logger = logging.getLogger(__name__)
 MAX_PARKS_PER_SESSION = 2
 TOMBSTONE_LIMIT = 1 << 16
 
-# QSA extends accept a prefix that is not a multiple of the compress ratio only when
-# the request's own pending-ring row holds [floor4(P), P) and the forward batch says
-# so (Req.qsa_ring_resume, exp/ser-qsa-misaligned). Until that lands such ends do
-# not park (fallback "qsa_misaligned").
-QSA_MISALIGNED_RESUME = False
-
 # meta_info["session_resume"]["reason"] of a fallback: the contract's fixed names
 # (arc-forge docs/plans/session_exact_resume.md); exp/ser-spec-snapshot uses the
 # same set. Reasons a request sees at its match:
@@ -106,7 +100,7 @@ STOP_STRING = "stop_string"  # stop string / regex: output trimmed past the KV
 GRAMMAR = "grammar"
 THINK_BUDGET = "think_budget"
 SNAPSHOT_MISMATCH = "snapshot_mismatch"  # spec: the end snapshot does not reconcile
-QSA_MISALIGNED = "qsa_misaligned"  # P % compress ratio != 0 (until exp/ser-qsa-misaligned)
+QSA_MISALIGNED = "qsa_misaligned"  # (the transition before exp/ser-qsa-misaligned; unused)
 SPEC_UNSUPPORTED = "spec_unsupported"  # spec decode (until exp/ser-spec-snapshot)
 # (ABORT, UNSUPPORTED -- positional embed overrides, beam search -- as well.)
 RESUME_REASONS = frozenset(
@@ -206,7 +200,8 @@ class _Park:
     extra_key: Optional[str]
     producer_rid: str
     ids: np.ndarray  # int64 ids of positions [0, P)
-    kv: ReqKvInfo  # row; KV [cache_protected_len, P); mamba slot after [0, P)
+    row: int  # the producer's req_pool_idx: its QSA pending ring holds [floor4(P), P)
+    kv: ReqKvInfo  # that row; KV [cache_protected_len, P); mamba slot after [0, P)
     last_node: Any  # NodeId of the T node, locked by lock_receipt
     lock_receipt: DecLockRefParams
     claimed_by: Optional[str] = None  # rid of the waiting request that claimed it
@@ -228,12 +223,6 @@ class SessionTailPark:
                 f"(req_to_token_pool.session_park_rows={self.capacity})"
             )
         self.page_size = cache.page_size
-        from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
-
-        kvcache = cache.token_to_kv_pool_allocator.get_kvcache()
-        self.qsa_ratio = (
-            kvcache.qsa_compress_ratio if isinstance(kvcache, QSATokenToKVPool) else 1
-        )
         self.spec = get_spec().speculative_algorithm is not None
         self.counters: Counter = Counter()
         self.reset()
@@ -307,11 +296,8 @@ class SessionTailPark:
             req, is_insert=is_insert, kv_len_to_handle=kv_len_to_handle
         )
         reason = req.exact_end_fallback
-        if exact is not None:
-            if exact.pos % self.qsa_ratio != 0 and not QSA_MISALIGNED_RESUME:
-                reason = QSA_MISALIGNED
-            elif not self._make_room(sid):
-                reason = EVICTED  # every park row is claimed
+        if exact is not None and not self._make_room(sid):
+            reason = EVICTED  # every park row is claimed
         if reason is not None:
             self._tombstone(sid, reason)
             self.counters[f"no_park:{reason}"] += 1
@@ -460,6 +446,7 @@ class SessionTailPark:
             extra_key=req.extra_key,
             producer_rid=req.rid,
             ids=_ids_view(token_ids).copy(),
+            row=kv.req_pool_idx,
             kv=kv,
             last_node=req.last_node,
             lock_receipt=req.lock_receipt,
@@ -584,13 +571,18 @@ class SessionTailPark:
             raise AssertionError(f"session park: claimant {req.rid} already holds KV/mamba")
         if req.kv.cache_protected_len != park.kv.cache_protected_len:
             raise AssertionError("session park: claimant protected length differs")
+        # The QSA extend from P (any P % 4) reads [floor4(P), P) from this row's
+        # pending ring: it must be the producer's row, untouched since it parked.
+        if park.kv.req_pool_idx != park.row or park.row in self.cache.req_to_token_pool.free_slots:
+            raise AssertionError(
+                f"session park: {req.rid} resumes on row {park.kv.req_pool_idx}, "
+                f"the producer {park.producer_rid} parked row {park.row}"
+            )
         self._unlink(park)
         # The claimant took its own lock on the same node at commit.
         self.cache.dec_lock_ref(park.last_node, park.lock_receipt)
         req.kv = park.kv
-        # The row (hence its QSA pending ring) is the producer's: it holds
-        # [floor4(P), P) for this extend.
-        req.qsa_ring_resume = True
+        req.qsa_ring_resume = True  # consumed by its next prepare_for_extend
         self.counters["consume"] += 1
 
     # ---- release ------------------------------------------------------------
