@@ -3633,9 +3633,10 @@ class UnifiedRadixCache(BasePrefixCache):
             return
         # Session parks hold their tree path locked across requests in the same way.
         # (Called while idle only: no claimant can be waiting.)
-        if self.tail_park is not None and self.tail_park.rows() > 0:
+        if self.tail_park is not None:
             self.tail_park.sanity_check(idle=True)
-            return
+            if self.tail_park.rows() > 0:
+                return
 
         # Pass ongoing ops as lightweight (id, node_id) pairs so the tree core
         # can resolve + validate them without reaching into Controller state.

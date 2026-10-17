@@ -201,7 +201,8 @@ class _Park:
     producer_rid: str
     ids: np.ndarray  # int64 ids of positions [0, P)
     row: int  # the producer's req_pool_idx: its QSA pending ring holds [floor4(P), P)
-    kv: ReqKvInfo  # that row; KV [cache_protected_len, P); mamba slot after [0, P)
+    # that row; KV [cache_protected_len, P); mamba slot after [0, P) (None once consumed)
+    kv: Optional[ReqKvInfo]
     last_node: Any  # NodeId of the T node, locked by lock_receipt
     lock_receipt: DecLockRefParams
     claimed_by: Optional[str] = None  # rid of the waiting request that claimed it
@@ -255,6 +256,9 @@ class SessionTailPark:
         self.parks: Dict[str, List[_Park]] = {}
         self.lru: "OrderedDict[int, _Park]" = OrderedDict()
         self.claims: Dict[str, _Park] = {}
+        # Parks consumed by requests still running, per session: a request of the
+        # session that would have matched one sees "claimed", not "no_park".
+        self.consumed: Dict[str, Dict[str, _Park]] = {}
         self.tombstones: "OrderedDict[str, tuple[int, str]]" = OrderedDict()
         self.seq = 0
         self._tokens = {False: 0, True: 0}  # KV tokens by claimed
@@ -287,6 +291,9 @@ class SessionTailPark:
         sid = req.session_id
         if sid is None or req.session is not None:
             return False
+        mine = self.consumed.get(sid)
+        if mine is not None and mine.pop(req.rid, None) is not None and not mine:
+            del self.consumed[sid]
         if not req.finished():
             # release_req (retraction): the request starts over from the tree.
             req.session_resume = (_fallback(RETRACT), None)
@@ -489,8 +496,9 @@ class SessionTailPark:
 
         key = params.key
         candidates = self.parks.get(sid, [])
+        consumed = self.consumed.get(sid, {})
         reason = None
-        if candidates:
+        if candidates or consumed:
             if key.is_bigram:
                 raise AssertionError("session park: bigram (EAGLE) keys never park")
             tokens = _ids_view(key.token_ids)
@@ -505,6 +513,10 @@ class SessionTailPark:
                     return self._claimed_result(req, park, params)
                 if reason is None or _REASON_RANK[why] > _REASON_RANK[reason]:
                     reason = why
+            # one that a running request of the session already took
+            for park in consumed.values():
+                if self._why_not(park, key, tokens) == CLAIMED:
+                    reason = CLAIMED
         if reason is None:
             tomb = self.tombstones.get(sid)
             newest = candidates[-1].seq if candidates else -1
@@ -582,6 +594,9 @@ class SessionTailPark:
         # The claimant took its own lock on the same node at commit.
         self.cache.dec_lock_ref(park.last_node, park.lock_receipt)
         req.kv = park.kv
+        park.kv = None  # the record is the request's now; ids stay for "claimed"
+        park.claimant = None
+        self.consumed.setdefault(park.session_id, {})[req.rid] = park
         req.qsa_ring_resume = True  # consumed by its next prepare_for_extend
         self.counters["consume"] += 1
 
@@ -650,12 +665,15 @@ class SessionTailPark:
         assert sum(len(v) for v in self.parks.values()) == len(self.lru)
         assert all(p.seq in self.lru for p in self.claims.values())
         assert tokens == self._tokens and slots == self._slots, (tokens, self._tokens)
-        if not idle or not self.lru:
+        if not idle:
             return
-        if self.claims:
+        if self.claims or self.consumed:
             raise AssertionError(
-                f"session park: claims outstanding while idle: {sorted(self.claims)}"
+                f"session park: claims outstanding while idle: {sorted(self.claims)}, "
+                f"consumed by running requests: {sorted(self.consumed)}"
             )
+        if not self.lru:
+            return
         page = self.page_size
         held_pages, held_slots = [], []
         for park in self.lru.values():

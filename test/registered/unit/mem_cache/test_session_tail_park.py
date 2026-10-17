@@ -486,6 +486,10 @@ class TestSessionTailPark(SessionTailParkHarness):
     def test_abort_after_admission_releases_everything(self):
         self._first_turn()
         a = self._admit(self._match(self._req(self._s1() + _seq(7000, 40))))
+        # The client's resend arrives while a (it took the park) still runs.
+        early = self._match(self._req(self._s1() + _seq(7000, 40)))
+        self.assertEqual(self._mrp(early), ("fallback", "claimed", None))
+        self._abort_waiting(early)
         self._run(a, [1, 2, 3, 4])
         self._release(a, FINISH_ABORT())
         self.assertEqual(self.park.rows(), 0)

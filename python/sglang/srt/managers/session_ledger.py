@@ -817,7 +817,8 @@ class SessionLedger:
             if self.writer is not None:
                 self.writer.put({"ev": "attempt", "sid": p.sid, "rid": rid, "t": time.time(), "kind": ftype,
                                  "finish": finish_reason, "input_len": int(len(p.key)), "gen_len": int(len(gen)),
-                                 "usage": _usage(meta_info),
+                                 # intake's prefix_len against S (as an append's)
+                                 "prefix_len": int(p.prefix_len), "usage": _usage(meta_info),
                                  # absent when the abort never reached the scheduler
                                  "resume": meta_info.get("session_resume")})
             return
@@ -976,6 +977,7 @@ class SessionLedger:
             if self.writer is not None:
                 self.writer.put({"ev": "attempt", "sid": p.sid, "rid": rid, "t": time.time(), "kind": "orphaned",
                                  "finish": None, "input_len": int(len(p.key)), "gen_len": 0,
+                                 "prefix_len": int(p.prefix_len),
                                  "usage": None, "resume": None})  # no meta_info: it left without one
 
     def status(self) -> dict:
