@@ -160,7 +160,8 @@ def finish_of(gen):
 class SessionCases:
     """Mixin: own-turn and its sticky entries over a session's requests, on one route. A subclass gives
     ``session(own=True)``, an object with ``turn(rid, key, gen, finish) -> SimpleNamespace(ids, spans, skip,
-    own_skip)``, ``entries()`` (start -> OwnTurnEntry the route keeps with the record) and ``corrupt(pos)``
+    own_skip)``, ``abort_waiting(rid, key)`` (a request that gets its intake and is aborted before it commits
+    or parks anything), ``entries()`` (start -> OwnTurnEntry the route keeps with the record) and ``corrupt(pos)``
     (changes the record's id at pos, as only a bug could)."""
 
     def session(self, own=True):
@@ -240,6 +241,21 @@ class SessionCases:
         self.assertEqual([s for s in out.spans if s.get("kind") == "own_turn"], [])
         self.assertEqual(self.entries_of(sess), [])
         self.assertEqual(self.dropped(sess, "client"), 1)
+
+    def test_a_dropped_entry_stays_dropped_when_its_request_never_commits(self):
+        """The request that sent other ids for the message is aborted before it commits or parks: the record still
+        holds the model's ids, but the entry went at that intake, so the client's earlier ids again are
+        text_differs (the normal path) and not a sticky replay."""
+        sess, record, closure, ids, outs, chat = self.cut_then_replies("tool_call_cut", 1)
+        self.assertEqual(len(self.entries_of(sess)), 1)
+        kept = chat.text
+        chat.text = chat.text.replace("<function=f>\n</function>", "<function=g>\n</function>")
+        sess.abort_waiting("r9", chat.request())
+        self.assertEqual((self.entries_of(sess), self.dropped(sess, "client")), ([], 1))
+        chat.text = kept
+        out = sess.turn("r10", chat.request(), REPLY, "stop")
+        self.assertEqual((out.skip, out.own_skip), ("text_differs", "earlier_message"))
+        self.assertFalse(any(s.get("sticky") for s in out.spans))
 
     def test_record_changed_under_an_entry_raises(self):
         sess, record, closure, ids, outs, chat = self.cut_then_replies("tool_call_cut", 1)

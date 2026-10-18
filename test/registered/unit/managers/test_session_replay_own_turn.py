@@ -69,6 +69,9 @@ class TitoSession:
         self.led.on_finish(rid, SimpleNamespace(output_ids=gen), {}, reason)
         return SimpleNamespace(ids=list(tok.input_ids), spans=res.spans, skip=res.skip, own_skip=res.own_turn_skip)
 
+    def abort_waiting(self, rid, key):
+        self.turn(rid, key, [], "abort")  # an attempt: S is not touched
+
     def entries(self):
         sess = self.led.sessions.get("s")
         return {} if sess is None else sess.own

@@ -133,6 +133,12 @@ class HsSession:
             self.cache._park_entries(rec, finished_req(rid, finish))
         return outcome(self.cache.stats - before, logged, r)
 
+    def abort_waiting(self, rid, key):
+        """Aborted before admission: nothing parks; its intake lapses as in release_aborted_request."""
+        replay_logged(self.cache, recv(key, rid=rid), BIG)
+        if self.cache.own_last_turn and self.cache._own_intake["s"][0] == rid:
+            del self.cache._own_intake["s"]
+
     def entries(self):
         rec = self.cache.index.get("s")
         return {} if rec is None else rec.own
