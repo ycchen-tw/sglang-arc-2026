@@ -138,7 +138,8 @@ def moe_backend(device) -> str:
     return value
 
 
-def build_drafter(directory: Path, device, target_model, model_dir: Path, keep, group, backend: str, calib):
+def build_drafter(directory: Path, device, target_model, model_dir: Path, keep, group, backend: str, calib, *,
+                  refresh_entry: bool):
     """The exported drafter with routers pruned to `keep`, routed experts in NVFP4 (`backend`), embedding from the
     target and the target's lm_head (heads.build_head). On a group of N > 1 ranks: this rank's EP slice of the
     experts, and (ARC_DFLASH_ATTN_TP) its share of the attention heads."""
@@ -237,11 +238,11 @@ def build_drafter(directory: Path, device, target_model, model_dir: Path, keep, 
         fused_serving.shard_attention_for_tp(model, rank, size, group)
         model.config = replace(c, num_attention_heads=c.num_attention_heads // size,
                                num_key_value_heads=c.num_key_value_heads // size)
-    model.compile_mode = fast_drafter.install(model, replicas=size, device=device)
+    model.compile_mode = fast_drafter.install(model, replicas=size, device=device, refresh_entry=refresh_entry)
     return model.eval().requires_grad_(False)
 
 
-def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, group):
+def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, group, *, refresh_entry: bool):
     """A dense-routed drafter export: every tensor loaded as stored, embedding from the target and the target's
     lm_head. A `<module>.weight` stored as e4m3 must come with `<module>.weight_scale_inv` and becomes an
     Fp8BlockLinear; the set of FP8 modules must match the config's quantization record."""
@@ -399,7 +400,7 @@ def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, 
     model.w4a8_modules = tuple(w4a8_modules)
     model.w4a8_batch_invariant = tuple(w4a8_invariant)
     model.w4a8_spec = w4a8
-    model.compile_mode = fast_drafter.install(model, replicas=size, device=device)
+    model.compile_mode = fast_drafter.install(model, replicas=size, device=device, refresh_entry=refresh_entry)
     return model.eval().requires_grad_(False)
 
 
@@ -510,12 +511,15 @@ class DFlashDraftWorker:
         self.use_graphs = os.environ.get("ARC_DFLASH_GRAPH", "1") == "1"
         begin = time.monotonic()
         before = torch.cuda.memory_allocated(self.device)
+        # MTP3.refresh_entry: EXACT_PREFILL's refreshes (and SESSION_PARK's, which needs it) through the layers'
+        # refresh entry, compiled at start-up; off, the drafter refreshes and compiles as before
         if dense:
             self.model = build_dense_drafter(directory, self.device, target_worker.model_runner.model,
-                                             Path(server_args.model_path), self.group)
+                                             Path(server_args.model_path), self.group, refresh_entry=self.exact_prefill)
         else:
             self.model = build_drafter(directory, self.device, target_worker.model_runner.model,
-                                       Path(server_args.model_path), keep, self.group, self.backend, calib)
+                                       Path(server_args.model_path), keep, self.group, self.backend, calib,
+                                       refresh_entry=self.exact_prefill)
         torch.cuda.synchronize(self.device)
         self.weight_bytes = torch.cuda.memory_allocated(self.device) - before
         self._weight_load_time = time.monotonic() - begin

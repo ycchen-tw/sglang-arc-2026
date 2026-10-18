@@ -17,8 +17,9 @@ Asserts: traffic compiles nothing (dynamo's graph count does not move after the 
 more than MAX_ENTRIES compiled variants (dynamo's recompile limit is 8), no recompile-limit warning. Values (eager):
 the refresh's layer view (model.layer_view) leaves them alone, bitwise; a refresh shorter than model.REFRESH_MIN,
 padded after its own tokens, is within rounding of the unpadded one (same math per row, other GEMM row counts).
---legacy runs the same traffic as before the fix -- refresh and decode through one compiled layer entry, no layer
-view, no padding, no refresh warm-up: the traffic compiles, past the limit.
+--legacy runs the same traffic on the drafter as built without ARC_DFLASH_EXACT_PREFILL (MTP3.refresh_entry off: the
+base refresh -- refresh and decode through one compiled layer entry, no layer view, no padding, no refresh warm-up):
+the traffic compiles, past the limit.
 """
 
 import argparse
@@ -194,22 +195,18 @@ def check_values(model, ids, gr):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--drafter", required=True)
-    ap.add_argument("--legacy", action="store_true", help="the producers' layouts and no refresh warm-up (pre-fix)")
+    ap.add_argument("--legacy", action="store_true", help="MTP3.refresh_entry off (the base refresh, pre-fix)")
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
     logging.getLogger("torch._dynamo").addHandler(_LimitLog())
     from sglang.srt.speculative.arc_dflash import fast_drafter
-    from sglang.srt.speculative.arc_dflash import model as M
 
-    Wk, model, pool, w = T.build(a.drafter)
+    # --legacy: as a server without ARC_DFLASH_EXACT_PREFILL builds the drafter (the base refresh)
+    Wk, model, pool, w = T.build(a.drafter, refresh_entry=not a.legacy)
     T.W = Wk
     w._blank_state = types.MethodType(Wk.DFlashDraftWorker._blank_state, w)
     if model.compile_mode == "0":
         raise SystemExit("ARC_DFLASH_COMPILE=0: nothing is compiled, nothing to check")
-    if a.legacy:
-        M.layer_view, M.canonical, M.REFRESH_MIN = (lambda cache: cache), (lambda t: t), 1
-        for layer in model.layers:
-            layer.refresh_forward = layer.forward  # one compiled entry (one code object) for refresh and decode
     g = torch.Generator().manual_seed(a.seed)
     rng = random.Random(a.seed)
     c = model.config

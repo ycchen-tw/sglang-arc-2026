@@ -39,14 +39,16 @@ from dflash_propose_bench import VOCAB, _StubTarget  # noqa: E402
 K = 4  # DFLASH_K: verify width (anchor + 3 drafts), 3 proposals per step
 
 
-def build(drafter):
+def build(drafter, *, refresh_entry):
+    """`refresh_entry`: as a server with ARC_DFLASH_EXACT_PREFILL (on) or without (MTP3.refresh_entry)"""
     from sglang.srt.speculative.arc_dflash import heads
     from sglang.srt.speculative.arc_dflash import worker as Wk
     from sglang.srt.speculative.arc_dflash.state_pool import RingStatePool
 
     one = SimpleNamespace(rank_in_group=0, world_size=1, ranks=[0])
     target = _StubTarget()
-    model = Wk.build_dense_drafter(Path(drafter), torch.device("cuda"), target, Path(drafter), one)
+    model = Wk.build_dense_drafter(Path(drafter), torch.device("cuda"), target, Path(drafter), one,
+                                   refresh_entry=refresh_entry)
     model.lm_head = heads.PairHead([(target.lm_head.weight, 0)], VOCAB, one)
     pool = RingStatePool(model, slots=24, max_batch=8, device=torch.device("cuda"), steps=K - 1, sparse_q=True)
     w = SimpleNamespace(pool=pool, model=model, device=torch.device("cuda"), prefill_chunk=2048,
@@ -187,7 +189,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--drafter", required=True)
     a = ap.parse_args()
-    Wk, model, pool, w = build(a.drafter)
+    Wk, model, pool, w = build(a.drafter, refresh_entry=True)  # SESSION_PARK needs EXACT_PREFILL
     W = Wk
     g = torch.Generator().manual_seed(0)
     worst = 0.0
