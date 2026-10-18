@@ -24,7 +24,7 @@ def _make_checker(page_size=_PAGE_SIZE, row_width=4096, num_reqs=8, free_pages=N
         free_pages=free_pages,
         get_all_free_pages=lambda: free_pages,
     )
-    tc = SimpleNamespace(slots={})
+    tc = SimpleNamespace(slots={}, tail_park=None)  # BasePrefixCache.tail_park: no park
     _ps, _rtp, _alloc, _tc = page_size, rtp, alloc, tc
 
     class _FakeChecker:

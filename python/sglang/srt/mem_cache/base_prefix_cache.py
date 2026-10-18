@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
     from sglang.srt.mem_cache.radix_cache import RadixKey
+    from sglang.srt.mem_cache.session_park import SessionTailPark
     from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
     from sglang.srt.mem_cache.unified_cache.cache_action import (
         CacheAction,
@@ -338,6 +339,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     storage_prefetch_retries: Optional[StoragePrefetchRetries] = None
     # Set by caches that publish KV placement events; None means they don't.
     kv_events: Optional[KVCacheEventRecorder] = None
+    # The session tail park (mem_cache/session_park.py): set only by a
+    # UnifiedRadixCache built with --session-exact-resume; None everywhere else.
+    tail_park: Optional["SessionTailPark"] = None
 
     def init_metrics_collector(self):
         labels = {"cache_type": self.__class__.__name__}

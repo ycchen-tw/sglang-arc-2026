@@ -249,7 +249,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # Session tail park (--session-exact-resume): a finished session request's
         # row, its KV past the tree-owned prefix and its exact-end mamba state,
         # resumed by the session's next request (session_park.py).
-        self.tail_park: Optional[SessionTailPark] = None
+        # (class default None: BasePrefixCache.tail_park)
         if params.session_exact_resume:
             from sglang.srt.mem_cache.session_park import SessionTailPark
 
@@ -1144,7 +1144,8 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         # Pages a session request kept below its protected prefix: the tree holds
         # another copy of those ids (the insert above left them alone).
-        self.free_private_kv(req.kv)
+        if self.tail_park is not None:
+            self.free_private_kv(req.kv)
 
         if self.enable_session_radix_cache and result is not None:
             from sglang.srt.managers.schedule_batch import FINISH_ABORT
@@ -3724,12 +3725,12 @@ class UnifiedRadixCache(BasePrefixCache):
         # by design (they hold a first-turn lock across turns).
         if self.session.any_holding_kv():
             return
-        # Session parks hold their tree path locked across requests in the same way.
-        # (Called while idle only: no claimant can be waiting.)
+        # Session parks hold their tree path locked across requests: while idle (no
+        # claimant can be waiting) the tree's locks must be exactly theirs, and the
+        # tree invariants below hold with those locks counted.
         if self.tail_park is not None:
             self.tail_park.sanity_check(idle=True)
-            if self.tail_park.rows() > 0:
-                return
+            self.tail_park.check_tree_locks()
 
         # Pass ongoing ops as lightweight (id, node_id) pairs so the tree core
         # can resolve + validate them without reaching into Controller state.

@@ -66,6 +66,21 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
+def require_session_tail_park(tree_cache, detail: str) -> None:
+    """--session-exact-resume at start-up: the tree cache must be the hybrid-mamba
+    UnifiedRadixCache with its session tail park (mem_cache/session_park.py).
+    Otherwise nothing would park and the first output would fail in
+    session_resume_meta."""
+    if not get_serving().session_exact_resume:
+        return
+    if isinstance(tree_cache, UnifiedRadixCache) and tree_cache.tail_park is not None:
+        return
+    raise ValueError(
+        "--session-exact-resume needs the hybrid-mamba UnifiedRadixCache and its "
+        f"session tail park; this server built {type(tree_cache).__name__} ({detail})"
+    )
+
+
 def get_draft_kv_pool(
     *,
     draft_worker: BaseTpWorker,
@@ -356,6 +371,12 @@ def build_kv_cache(
             tp_rank=ps.tp_rank,
             tp_group=tp_group,
         )
+    )
+
+    require_session_tail_park(
+        tree_cache,
+        f"radix cache disabled: {disable_radix_cache}, hierarchical cache: "
+        f"{enable_hierarchical_cache}, hybrid SSM: {is_hybrid_ssm}",
     )
 
     if (

@@ -707,6 +707,52 @@ class TestSessionTailPark(SessionTailParkHarness):
         self._accounting()
         self._drain()
 
+    def test_a_resend_never_takes_an_older_shorter_park(self):
+        """review r1: a later end whose ids extend an older park's replaces it, and a
+        request whose newest extended end is taken reports "claimed" instead of
+        claiming an older, shorter park (exact at its end while the session's sequence
+        ends further)."""
+        self._turn(self.S1_IN, self.S1_OUT)
+        s1 = self._s1()
+        # turn 2 asks for prompt logprobs from 300 (< P1 = 350): key_limit, no claim
+        r2 = self._req(s1 + _seq(7000, 40))
+        r2.return_logprob, r2.logprob_start_len = True, 300
+        self._match(r2)
+        self.assertEqual(self._mrp(r2), ("fallback", "key_limit", None))
+        self._admit(r2)
+        self._run(r2, _seq(8000, 30))
+        self._release(r2, FINISH_MATCHED_TOKEN(matched=0))
+        # r2's end (420) replaced the first turn's park (350), a prefix of it
+        self.assertEqual([(p.producer_rid, p.pos) for p in self.park.parks["sess-A"]], [(r2.rid, 420)])
+        self.assertEqual(self.park.counters["release:replaced"], 1)
+        s2 = list(r2.origin_input_ids) + list(r2.output_ids)
+        c = self._match(self._req(s2 + [1, 2, 3]))
+        c2 = self._match(self._req(s2 + [1, 2, 3]))  # its concurrent resend
+        self.assertEqual(self._mrp(c), ("exact", None, None))
+        self.assertEqual(self.park.claims[c.rid].pos, len(s2) - 1)
+        self.assertEqual(self._mrp(c2), ("fallback", "claimed", None))
+        self._abort_waiting(c2)
+        self._admit(c)
+        self._run(c, [4, 5])
+        self._release(c, FINISH_MATCHED_TOKEN(matched=5))
+        self._accounting()
+        self._drain()
+
+    def test_start_up_needs_the_tail_park(self):
+        """kv_cache_builder: with the flag, a tree cache without the park is refused at
+        start-up (not at the first output)."""
+        from sglang.srt.mem_cache.chunk_cache import ChunkCache
+        from sglang.srt.mem_cache.kv_cache_builder import require_session_tail_park
+
+        require_session_tail_park(self.cache, "the harness cache")
+        chunk = ChunkCache.__new__(ChunkCache)  # radix cache disabled: no park
+        with self.assertRaisesRegex(ValueError, "needs the hybrid-mamba UnifiedRadixCache.*ChunkCache"):
+            require_session_tail_park(chunk, "radix cache disabled")
+        no_park = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        no_park.tail_park = None
+        with self.assertRaisesRegex(ValueError, "UnifiedRadixCache"):
+            require_session_tail_park(no_park, "built without the flag")
+
     def test_never_matched_requests(self):
         """Aborted while queued, before any scheduling match: a request without a
         session_id is "none" (not a session), one with a session_id "fallback:abort"."""
@@ -857,6 +903,10 @@ class TestSessionTailParkOff(SessionTailParkHarness):
         self.assertIsNone(nxt.session_resume)  # nothing annotates the match
         with self.assertRaises(AssertionError):
             session_resume_meta(nxt)  # and nothing may build the key
+        from sglang.srt.mem_cache.chunk_cache import ChunkCache
+        from sglang.srt.mem_cache.kv_cache_builder import require_session_tail_park
+
+        require_session_tail_park(ChunkCache.__new__(ChunkCache), "flag off: any cache")
         self._admit(nxt)
         self.assertIsNone(nxt.session_resume)
         self._run(nxt, [1])

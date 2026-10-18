@@ -339,14 +339,38 @@ class SessionTailPark:
             req, is_insert=is_insert, kv_len_to_handle=kv_len_to_handle
         )
         reason = req.exact_end_fallback
-        if exact is not None and not self._make_room(sid):
-            reason = EVICTED  # every park row is claimed
+        token_ids = None
+        if exact is not None:
+            token_ids = (req.origin_input_ids + req.output_ids)[: exact.pos]
+            self._replace_prefixes(sid, salt, req.extra_key, _ids_view(token_ids))
+            if not self._make_room(sid):
+                reason = EVICTED  # every park row is claimed
         if reason is not None:
             self._tombstone(sid, reason, salt, req.extra_key, input_ids)
             self.counters[f"no_park:{reason}"] += 1
             return False
-        self._park(req, exact)
+        self._park(req, exact, token_ids)
         return True
+
+    def _replace_prefixes(
+        self, sid: str, salt: Optional[str], extra_key: Optional[str], ids: np.ndarray
+    ) -> None:
+        """A new end of the session is about to park: release its older unclaimed
+        parks in the same namespace whose ids are a prefix of the new ones. Any
+        request that extends one of them past its end either extends the new park
+        too or rewinds into the new request's output; resuming at the old one's
+        shorter end would be reported exact while the session's sequence ends
+        further (the newest end, the ledger's S). It also frees their rows and
+        mamba slots. A claimed one stays with its claimant."""
+        for park in list(self.parks.get(sid, [])):
+            if (
+                park.claimed_by is None
+                and park.cache_salt == salt
+                and park.extra_key == extra_key
+                and park.pos <= len(ids)
+                and np.array_equal(ids[: park.pos], park.ids)
+            ):
+                self._release(park, "replaced")
 
     def _resolve_exact_end(
         self, req: Req, *, is_insert: bool, kv_len_to_handle: int
@@ -455,7 +479,7 @@ class SessionTailPark:
                 return False
         return True
 
-    def _park(self, req: Req, exact: ExactEnd) -> None:
+    def _park(self, req: Req, exact: ExactEnd, token_ids) -> None:
         cache = self.cache
         pool = cache.req_to_token_pool
         pos = exact.pos
@@ -483,7 +507,8 @@ class SessionTailPark:
             req.kv.mamba_last_track_seqlen = None
             self.counters["track_past_end"] += 1
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:pos]
+        if len(token_ids) != pos:
+            raise AssertionError(f"session park: {len(token_ids)} ids for the exact end {pos}")
         # The tree takes [0, T) the way a chunk boundary does; the row keeps the
         # producer's own pages where the tree has a duplicate's copy (private_kv).
         if not cache.keeps_own_pages(req):
@@ -595,8 +620,19 @@ class SessionTailPark:
             # (seq, reason) of the newest request of the session this one continues
             # or repeats; extending none of them is a rewind / branch.
             newest = (-1, IDS_MISMATCH)
-            claimed = False
+            # the newest end this request extends that a running request of the
+            # session already took (consumed)
+            taken = -1
+            for park in consumed.values():
+                why = self._why_not(park, key, tokens)
+                if why == CLAIMED:
+                    taken = max(taken, park.seq)
+                if park.seq > newest[0] and self._continues(park, key, tokens, park.ids):
+                    newest = (park.seq, why)
+            claimed = taken >= 0
             for park in reversed(candidates):  # newest first
+                if park.seq < taken:
+                    break  # older than an end it extends that is taken: see below
                 why = self._why_not(park, key, tokens)
                 if why is None:
                     self._account(park, -1)
@@ -605,13 +641,16 @@ class SessionTailPark:
                     self.claims[req.rid] = park
                     self.counters["claim"] += 1
                     return self._claimed_result(req, park, params)
-                claimed |= why == CLAIMED
-                if park.seq > newest[0] and self._continues(park, key, tokens, park.ids):
-                    newest = (park.seq, why)
-            # one that a running request of the session already took
-            for park in consumed.values():
-                why = self._why_not(park, key, tokens)
-                claimed |= why == CLAIMED
+                if why != IDS_MISMATCH:
+                    # The newest end this request extends decides: another request
+                    # took it (a concurrent resend: "claimed") or the key stops short
+                    # of it ("key_limit"). An older park it also extends ends earlier
+                    # than the session's sequence; claiming that one would re-forward
+                    # the gap and report it exact. Stop here.
+                    claimed = claimed or why == CLAIMED
+                    if park.seq > newest[0]:
+                        newest = (park.seq, why)
+                    break
                 if park.seq > newest[0] and self._continues(park, key, tokens, park.ids):
                     newest = (park.seq, why)
             if claimed:
@@ -901,6 +940,39 @@ class SessionTailPark:
         stale = held_slots[torch.isin(held_slots, mamba_free.to(torch.int64))]
         if stale.numel():
             raise AssertionError(f"session park: parked mamba slots are free: {stale.tolist()}")
+
+    def check_tree_locks(self) -> None:
+        """Idle (nothing waiting or running, no streaming session): the tree's device
+        locks are exactly the parks'. Each park holds its T node's Full lock (taken
+        on every node from T to the root) and, unless its receipt skipped it, the
+        Mamba lock on T itself; nothing else is locked."""
+        from sglang.srt.mem_cache.unified_cache.components import ComponentType
+
+        core = self.cache.tree_core
+        full, mamba = ComponentType.FULL, ComponentType.MAMBA
+        if set(core.component_types) != {full, mamba}:
+            raise AssertionError(f"session park: tree components {core.component_types}")
+        want = {full: Counter(), mamba: Counter()}
+        for park in self.lru.values():
+            node = core.node_by_id(park.last_node)
+            if mamba not in park.lock_receipt.skipped_lock_components:
+                want[mamba][node.id] += 1
+            while node is not core.root_node:
+                want[full][node.id] += 1
+                node = node.parent
+        bad = []
+        for node in core._collect_all_nodes():
+            if node is core.root_node:
+                continue
+            for ct, counts in want.items():
+                cd = node.component_data[ct]
+                if cd.lock_ref != counts[node.id] or cd.host_lock_ref != 0:
+                    bad.append((node.id, ct.name, cd.lock_ref, cd.host_lock_ref, counts[node.id]))
+        if bad:
+            raise AssertionError(
+                "session park: idle tree locks (node, component, lock_ref, host_lock_ref, "
+                f"parks' locks) differ: {bad[:8]}"
+            )
 
     def stats(self) -> dict:
         return {

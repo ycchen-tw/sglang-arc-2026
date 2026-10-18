@@ -386,6 +386,18 @@ class SchedulerInvariantChecker:
                         slot.kv.kv_committed_len,
                         slot.kv.kv_allocated_len,
                     )
+        park = self.tree_cache.tail_park
+        if park is not None:
+            # --session-exact-resume: a parked row owns [0, P) like the request that
+            # left it (the tree's pages below its protected prefix, its own above)
+            for p in park.lru.values():
+                _add_owner(
+                    p,
+                    f"park {p.producer_rid}",
+                    p.kv.req_pool_idx,
+                    p.kv.kv_committed_len,
+                    p.kv.kv_allocated_len,
+                )
 
         active = [
             (label, rpi, al) for label, rpi, al in owners if rpi is not None and al > 0

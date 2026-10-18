@@ -126,6 +126,11 @@ _OWNER_SITES = {
     (_SS, "StreamingSession.try_cache_finished_req", "kv_committed_len"): 1,
     # NPU page-boundary clamp on the shared req/slot clock.
     (_SS, "StreamingSession.try_match_prefix", "kv_committed_len"): 1,
+    # --session-exact-resume: a finished request parks at its exact end P (the
+    # request left every batch). Spec KV allocated past P goes back, so the record's
+    # kv_allocated_len and kv_committed_len are both P, where the next turn extends.
+    ("mem_cache/session_park.py", "SessionTailPark._park", "kv_allocated_len"): 1,
+    ("mem_cache/session_park.py", "SessionTailPark._park", "kv_committed_len"): 1,
 }
 
 
