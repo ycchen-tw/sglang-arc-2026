@@ -359,7 +359,8 @@ class _GenerationStreamAccumulator:
     routed_experts: Optional[list] = None
     routed_experts_meta: Optional[list] = None
     indexer_topk: Optional[list] = None
-    # meta_info["session_resume"] per item (mem_cache/session_park.py)
+    # meta_info["session_resume"] per item (mem_cache/session_park.py); only
+    # filled with --session-exact-resume
     session_resume: list = field(default_factory=list)
     customized_info: dict = field(default_factory=dict)
     beam_search_output: list = field(default_factory=list)
@@ -503,9 +504,8 @@ class _GenerationStreamAccumulator:
 
             # Collect detailed cache breakdown if available
             self.cached_tokens_details.append(self.get_cached_tokens_details(req))
-            self.session_resume.append(
-                session_resume_meta(req, exact_resume=self.session_exact_resume)
-            )
+            if self.session_exact_resume:
+                self.session_resume.append(session_resume_meta(req))
 
         # Multimodal prompt token counts. In disagg decode mode the prefill node
         # already computed these and transferred them via the metadata buffer
@@ -780,7 +780,8 @@ class _GenerationStreamAccumulator:
             output_hidden_states=self.output_hidden_states,
             routed_experts=self.routed_experts,
             routed_experts_meta=self.routed_experts_meta,
-            session_resume=self.session_resume,
+            # Only with --session-exact-resume: off, meta_info has no session_resume.
+            session_resume=self.session_resume if self.session_exact_resume else None,
             indexer_topk=self.indexer_topk,
             customized_info=(
                 wrap_as_pickle(self.customized_info) if self.customized_info else None

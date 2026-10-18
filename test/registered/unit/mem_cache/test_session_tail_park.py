@@ -337,7 +337,9 @@ class SessionTailParkHarness(CustomTestCase):
         self._accounting()
 
     def _resume(self, req):
-        meta = session_resume_meta(req, exact_resume=self.EXACT_RESUME)
+        if not self.EXACT_RESUME:
+            raise AssertionError("flag off: meta_info has no session_resume")
+        meta = session_resume_meta(req)
         self.assertEqual(set(meta), {"mode", "reason", "pos", "prefill_version"})
         return meta
 
@@ -705,6 +707,22 @@ class TestSessionTailPark(SessionTailParkHarness):
         self._accounting()
         self._drain()
 
+    def test_never_matched_requests(self):
+        """Aborted while queued, before any scheduling match: a request without a
+        session_id is "none" (not a session), one with a session_id "fallback:abort"."""
+        plain = self._req(self.S1_IN, session=None)
+        plain.finished_reason = FINISH_ABORT()
+        self.assertEqual(self._resume(plain), {"mode": "none", "reason": None, "pos": None,
+                                               "prefill_version": None})
+        sess = self._req(self.S1_IN)
+        sess.finished_reason = FINISH_ABORT()
+        self.assertEqual(self._mrp(sess), ("fallback", "abort", None))
+        # a request without a session_id that did reach a match is "none" as before
+        plain2 = self._match(self._req(self.S1_IN, session=None))
+        self.assertEqual(self._mrp(plain2), ("none", None, None))
+        self._abort_waiting(plain2)
+        self._accounting()
+
     def test_eviction_releases_the_oldest_unclaimed_park_last(self):
         for sid in ("sess-A", "sess-B", "sess-C"):
             self._turn(self.S1_IN, self.S1_OUT, session=sid, salt=sid)
@@ -821,20 +839,26 @@ class TestSessionTailPark(SessionTailParkHarness):
 
 
 class TestSessionTailParkOff(SessionTailParkHarness):
-    """Flag off: no park, meta mode "none", and the next turn re-prefills from
-    the tree's track point exactly as before."""
+    """Flag off: no park, no session_resume (the scheduler sends none, meta_info has
+    no such key), and the next turn re-prefills from the tree's track point exactly
+    as before."""
 
     EXACT_RESUME = False
 
     def test_off_is_the_tree_alone(self):
         s_in, s_out = _seq(1000, 3 * PAGE + 9), _seq(5000, 150)
-        self._turn(s_in, s_out)
+        first = self._req(s_in)
+        self._admit(self._match(first))
+        self._run(first, s_out)
+        self._release(first, FINISH_MATCHED_TOKEN(matched=s_out[-1]))
+        self.assertIsNone(first.session_resume)
         nxt = self._match(self._req(s_in + s_out + [1]))
         self.assertEqual(len(nxt.prefix_indices), 256)
-        self.assertEqual(self._mrp(nxt), ("none", None, None))
+        self.assertIsNone(nxt.session_resume)  # nothing annotates the match
+        with self.assertRaises(AssertionError):
+            session_resume_meta(nxt)  # and nothing may build the key
         self._admit(nxt)
-        self.assertEqual(self._mrp(nxt), ("none", None, None))
-        self.assertIsInstance(self._resume(nxt)["prefill_version"], str)
+        self.assertIsNone(nxt.session_resume)
         self._run(nxt, [1])
         self._release(nxt, FINISH_LENGTH(length=1))
         self._accounting()

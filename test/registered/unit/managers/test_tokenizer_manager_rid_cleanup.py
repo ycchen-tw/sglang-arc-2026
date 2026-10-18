@@ -136,6 +136,7 @@ def _make_tokenizer_manager(case) -> TokenizerManager:
     tm.incremental_streaming_output = False
     tm.allow_auto_truncate = False
     tm.skip_tokenizer_init = False
+    tm.session_exact_resume = False  # no meta_info["session_resume"]
     tm.dump_requests_folder = ""
     tm.crash_dump_folder = ""
     tm.send_to_scheduler = MagicMock()

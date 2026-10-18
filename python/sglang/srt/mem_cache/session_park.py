@@ -147,22 +147,25 @@ def _fallback(reason: str) -> tuple:
     return ("fallback", reason)
 
 
-def session_resume_meta(req: Req, *, exact_resume: bool) -> dict:
-    """meta_info["session_resume"] of every request:
+def session_resume_meta(req: Req) -> dict:
+    """meta_info["session_resume"] of every request, with --session-exact-resume
+    only (off, the scheduler sends none and meta_info has no such key):
     {"mode": "exact" | "fallback" | "none", "reason", "pos", "prefill_version"}.
     mode / reason come from the request's last scheduling match (req.session_resume);
     pos is the prefix of its last admission and prefill_version the weight version
     of the first prefill forward after it, both None before its first admission.
-    "none": the flag is off or the request has no session_id."""
+    "none": the request has no session_id."""
+    if not get_serving().session_exact_resume:
+        raise AssertionError("session_resume_meta with --session-exact-resume off")
     pos, version = req.admitted_prefix_len, req.prefill_weight_version
-    if not exact_resume:
-        mode, reason = NOT_A_SESSION
-        pos = None
-    elif req.session_resume is None:
+    if req.session_resume is None:
         # Never reached a scheduling match: aborted while queued.
         if pos is not None:
             raise AssertionError(f"session resume: {req.rid} admitted without a match")
-        mode, reason = _fallback(ABORT)
+        if req.session_id is None:
+            mode, reason = NOT_A_SESSION
+        else:
+            mode, reason = _fallback(ABORT)
     else:
         (mode, reason), park_pos = req.session_resume
         if mode == "none":

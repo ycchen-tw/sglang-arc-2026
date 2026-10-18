@@ -513,6 +513,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.allow_auto_truncate = get_serving().allow_auto_truncate
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
         self.preferred_sampling_params = get_serving().preferred_sampling_params
+        # meta_info["session_resume"] only with the flag (mem_cache/session_park.py)
+        self.session_exact_resume = get_serving().session_exact_resume
         self.crash_dump_folder = get_observability().crash_dump_folder
 
         # Init model config
@@ -596,6 +598,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             server_meta=server_meta(self.server_args),
             port=self.server_args.port,
             empty_think=serving.session_replay_empty_think,
+            exact_resume=serving.session_exact_resume,
         )
 
     def _session_ledger_intake(self, obj, tokenized_obj) -> None:
@@ -2510,11 +2513,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         "reasoning_tokens": recv_obj.reasoning_tokens[i],
                         "completion_tokens": recv_obj.completion_tokens[i],
                         "cached_tokens": recv_obj.cached_tokens[i],
-                        # How the prefill resumed (--session-exact-resume,
-                        # mem_cache/session_park.py); mode "none" with the flag off.
-                        "session_resume": recv_obj.session_resume[i],
                     }
                 )
+                # How the prefill resumed (mem_cache/session_park.py): with
+                # --session-exact-resume only; off, the key does not exist.
+                if self.session_exact_resume:
+                    if recv_obj.session_resume is None:
+                        raise RuntimeError(
+                            "--session-exact-resume: a scheduler output without session_resume"
+                        )
+                    meta_info["session_resume"] = recv_obj.session_resume[i]
+                elif recv_obj.session_resume is not None:
+                    raise RuntimeError(
+                        "session_resume in a scheduler output with --session-exact-resume off"
+                    )
                 if (
                     recv_obj.weight_versions is not None
                     and (spans := recv_obj.weight_versions[i]) is not None

@@ -617,6 +617,7 @@ class SessionLedger:
         server_meta: Dict[str, Any],
         port: int,
         empty_think: bool = False,
+        exact_resume: bool = False,
     ):
         if tokenizer is None:
             raise ValueError("--session-replay needs the tokenizer (do not use --skip-tokenizer-init)")
@@ -646,6 +647,9 @@ class SessionLedger:
             pads[name] = int(t) if isinstance(t, int) and tokenizer.convert_ids_to_tokens(t) == name else None
         self.image_pad, self.video_pad = pads[IMAGE_PAD_TOKEN], pads[VIDEO_PAD_TOKEN]
         self.record_all = record_all
+        # --session-exact-resume: appends and attempts carry "resume" (meta_info["session_resume"]);
+        # off, the key is absent (readers go by server.json's server_args.session_exact_resume)
+        self.exact_resume = exact_resume
         self.logprobs = logprobs
         self.routing = routing
         self.max_bytes = max_bytes
@@ -819,8 +823,8 @@ class SessionLedger:
                                  "finish": finish_reason, "input_len": int(len(p.key)), "gen_len": int(len(gen)),
                                  # intake's prefix_len against S (as an append's)
                                  "prefix_len": int(p.prefix_len), "usage": _usage(meta_info),
-                                 # absent when the abort never reached the scheduler
-                                 "resume": meta_info.get("session_resume")})
+                                 # a scheduler output: with the flag it always has session_resume
+                                 **({"resume": meta_info["session_resume"]} if self.exact_resume else {})})
             return
         sess = self.sessions.get(p.sid) if p.sid is not None else None
         kind, prefix_len, cause = p.kind, p.prefix_len, p.cause
@@ -896,8 +900,8 @@ class SessionLedger:
               "rewind": int(rewind),
               "sampling": p.sampling,
               "usage": _usage(meta_info),
-              # how the scheduler resumed this prefill (--session-exact-resume, session_park.py)
-              "resume": meta_info["session_resume"],
+              # how the scheduler resumed this prefill (--session-exact-resume only, session_park.py)
+              **({"resume": meta_info["session_resume"]} if self.exact_resume else {}),
               "spec": {k2: meta_info[k2] for k2 in ("spec_verify_ct", "spec_accept_length", "spec_accept_rate")
                        if k2 in meta_info} or None,
               "replay": {"spans": p.replay.spans, "skip": p.replay.skip, "lcp0": p.replay.lcp0},
@@ -978,7 +982,8 @@ class SessionLedger:
                 self.writer.put({"ev": "attempt", "sid": p.sid, "rid": rid, "t": time.time(), "kind": "orphaned",
                                  "finish": None, "input_len": int(len(p.key)), "gen_len": 0,
                                  "prefix_len": int(p.prefix_len),
-                                 "usage": None, "resume": None})  # no meta_info: it left without one
+                                 # no meta_info: it left without one (resume null with the flag, else absent)
+                                 "usage": None, **({"resume": None} if self.exact_resume else {})})
 
     def status(self) -> dict:
         return {"instance": self.instance, "dir": self.root, "v": LEDGER_VERSION, "sessions": len(self.sessions),
