@@ -9,7 +9,9 @@ quantization as CUTLASS -- it falls back to Triton for K < 256) or Triton. DeepG
 re-quantizes the scales to UE8M0 at load and so computes something G4 does not: it raises like anything else.
 """
 
+import contextlib
 import json
+import os
 
 import torch
 from torch import nn
@@ -18,18 +20,45 @@ from torch.nn import Parameter
 BLOCK = 128
 
 
+# arc-forge ARC_DFLASH_FP8_GEMM (opt-in; unset = the server's --fp8-gemm-backend): the drafter's own block-FP8 GEMM,
+# without touching the target's. deep_gemm on sm_100 is the only block-FP8 kernel there faster than the drafter's
+# BF16 cuBLAS (B200, M = 896: gate 22.6 vs 32.2 us; FlashInfer TRTLLM 157, tuned Triton 71); it re-quantizes the
+# block scales to UE8M0 (powers of two) at load, a different rounding from G4's fp32 scales -- lossy, judged by AL.
+FP8_GEMM = os.environ.get("ARC_DFLASH_FP8_GEMM")
+if FP8_GEMM not in (None, "flashinfer_trtllm", "triton", "deep_gemm"):
+    raise ValueError(f"ARC_DFLASH_FP8_GEMM must be unset, flashinfer_trtllm, triton or deep_gemm, got {FP8_GEMM!r}")
+
+
+@contextlib.contextmanager
+def _drafter_backend():
+    """sglang's FP8 GEMM backend is a process global read when a method is built and its weights processed: switch
+    it to ARC_DFLASH_FP8_GEMM for exactly that, then back to the server's (the target's)."""
+    from sglang.srt.layers.quantization import fp8_utils
+
+    server = fp8_utils.get_fp8_gemm_runner_backend()
+    if FP8_GEMM is not None:
+        fp8_utils.FP8_GEMM_RUNNER_BACKEND = fp8_utils.Fp8GemmRunnerBackend(FP8_GEMM)
+    try:
+        yield
+    finally:
+        fp8_utils.FP8_GEMM_RUNNER_BACKEND = server
+
+
 def _method(device):
     from sglang.srt.layers.quantization import fp8_utils
     from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 
-    method = Fp8LinearMethod(
-        Fp8Config(is_checkpoint_fp8_serialized=True, activation_scheme="dynamic", weight_block_size=[BLOCK, BLOCK])
-    )
+    with _drafter_backend():
+        method = Fp8LinearMethod(
+            Fp8Config(is_checkpoint_fp8_serialized=True, activation_scheme="dynamic", weight_block_size=[BLOCK, BLOCK])
+        )
     if not method.block_quant or method.use_marlin or method.use_mxfp8:
         raise RuntimeError(f"Fp8LinearMethod is not plain block FP8 here (block_quant={method.block_quant}, "
                            f"marlin={method.use_marlin}, mxfp8={method.use_mxfp8})")
     capability = torch.cuda.get_device_capability(device)
     sm100 = (fp8_utils.flashinfer_gemm_w8a8_block_fp8_linear_with_fallback, fp8_utils.triton_w8a8_block_fp8_linear)
+    if FP8_GEMM == "deep_gemm":  # asked for by name: its UE8M0 scales are the documented difference
+        sm100 += (fp8_utils.deepgemm_w8a8_block_fp8_linear_with_fallback,)
     want = {(12, 0): (fp8_utils.cutlass_w8a8_block_fp8_linear_with_fallback,),
             (8, 9): (fp8_utils.triton_w8a8_block_fp8_linear,),
             (10, 0): sm100, (10, 3): sm100}.get(capability, ())
@@ -38,6 +67,31 @@ def _method(device):
                            f"{method.w8a8_block_fp8_linear.__name__}; measured paths: CUTLASS on sm_120, Triton on sm_89, "
                            "FlashInfer TRTLLM (--fp8-gemm-backend flashinfer_trtllm) or Triton on sm_100")
     return method
+
+
+# arc-forge ARC_DFLASH_FP8_OP (opt-in, default 0): Fp8BlockLinear runs as the custom op arc_dflash::fp8_block_linear,
+# opaque to dynamo but no graph break, so inductor keeps fusing the elementwise work around the linear as it does
+# around a BF16 nn.Linear (fast_drafter.compile_layers). Off, the linear is compiler.disable'd and every one of the
+# 7 per layer splits the compiled layer (B200 batch 128: one extra 0.55 ms pointwise kernel among the resumes).
+# The GEMM is the same call either way; inductor's fusion moves the neighbours' rounding, not the linear's.
+FP8_OP = os.environ.get("ARC_DFLASH_FP8_OP", "0")
+if FP8_OP not in ("0", "1"):
+    raise ValueError(f"ARC_DFLASH_FP8_OP must be 0 or 1, got {FP8_OP!r}")
+# The op takes the module's (processed) weight tensor and finds the module by its address: an int id argument would
+# be value-guarded, and the 5 layers share one compiled code object -> a recompile per layer up to
+# torch._dynamo's recompile_limit (8), after which dynamo silently runs the layers eager.
+_LINEARS: dict = {}  # weight.data_ptr() -> Fp8BlockLinear
+
+
+@torch.library.custom_op("arc_dflash::fp8_block_linear", mutates_args=())
+def fp8_block_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    module = _LINEARS[weight.data_ptr()]
+    return module.method.apply(module, x, bias=None)
+
+
+@fp8_block_linear.register_fake
+def _(x, weight):
+    return x.new_empty(x.shape[0], weight.shape[0])
 
 
 class Fp8BlockLinear(nn.Module):
@@ -58,11 +112,20 @@ class Fp8BlockLinear(nn.Module):
         self.register_parameter("input_scale", None)
         self.orig_dtype = torch.bfloat16
         self.method = _method(weight.device)
-        self.method.process_weights_after_loading(self)
+        with _drafter_backend():
+            self.method.process_weights_after_loading(self)
+        if self.weight.shape[0] != self.out_features or self.weight.data_ptr() in _LINEARS:
+            raise RuntimeError(f"processed FP8 weight {tuple(self.weight.shape)} for {self.out_features} outputs, "
+                               "or its storage already registered")
+        _LINEARS[self.weight.data_ptr()] = self
 
     def forward(self, x):
         shape = x.shape
-        y = self.method.apply(self, x.reshape(-1, shape[-1]), bias=None)
+        rows = x.reshape(-1, shape[-1])
+        if FP8_OP == "1":
+            y = torch.ops.arc_dflash.fp8_block_linear(rows, self.weight)
+        else:
+            y = self.method.apply(self, rows, bias=None)
         return y.reshape(*shape[:-1], self.out_features)
 
 

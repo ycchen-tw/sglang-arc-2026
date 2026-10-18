@@ -108,3 +108,52 @@ def test_fp8_block_linear_sm100_refuses_deepgemm(monkeypatch):
         pytest.skip("auto already picks an accepted path here")
     with pytest.raises(RuntimeError, match="measured paths"):
         fp8.Fp8BlockLinear(w, s)
+
+
+@pytest.mark.skipif(not CUDA, reason="needs a GPU")
+def test_ring_attention_fp8_dot():
+    """ARC_DFLASH_RING_FP8_DOT: e4m3 x e4m3 over the pool; error vs the exact BF16 pool near the pool rounding's."""
+    from sglang.srt.speculative.arc_dflash import ring_attention as RA
+
+    q, k, v, qpos, pk, pv, idx, pos, window = _case(seed=2)
+    cols = window + 1
+    pk8, pv8 = state_pool.to_pool(pk, torch.float8_e4m3fn), state_pool.to_pool(pv, torch.float8_e4m3fn)
+    exact = attend(q, k, v, qpos, RingWindow(pk, idx, cols), RingWindow(pv, idx, cols), pos, window).float()
+    wide = attend(q, k, v, qpos, RingWindow(pk8, idx, cols), RingWindow(pv8, idx, cols), pos, window).float()
+    try:
+        RA.FP8_DOT = "1"
+        dot = attend(q, k, v, qpos, RingWindow(pk8, idx, cols), RingWindow(pv8, idx, cols), pos, window).float()
+        with pytest.raises(ValueError, match="e4m3 pool"):
+            attend(q, k, v, qpos, RingWindow(pk, idx, cols), RingWindow(pv, idx, cols), pos, window)
+    finally:
+        RA.FP8_DOT = "0"
+    err = lambda x: ((x - exact).norm() / exact.norm()).item()
+    assert err(dot) < 1.6 * err(wide) and err(dot) < 0.08, (err(dot), err(wide))
+
+
+@pytest.mark.skipif(not SM100, reason="needs sm_100")
+@pytest.mark.parametrize("gemm", [None, "deep_gemm"])
+def test_fp8_custom_op_and_drafter_gemm(monkeypatch, gemm):
+    """ARC_DFLASH_FP8_OP: the custom op computes exactly what the direct call does, under torch.compile with one
+    compiled body shared by several linears (no value guard on the module); ARC_DFLASH_FP8_GEMM=deep_gemm builds the
+    drafter's GEMM without touching the server's backend."""
+    from sglang.srt.layers.quantization import fp8_utils
+
+    monkeypatch.setattr(fp8_utils, "FP8_GEMM_RUNNER_BACKEND", fp8_utils.Fp8GemmRunnerBackend.FLASHINFER_TRTLLM)
+    monkeypatch.setattr(fp8, "FP8_GEMM", gemm)
+    lins = [fp8.Fp8BlockLinear(*_fp8_weight(2560, 2560, seed=s)) for s in range(10)]
+    assert fp8_utils.get_fp8_gemm_runner_backend() is fp8_utils.Fp8GemmRunnerBackend.FLASHINFER_TRTLLM
+    if gemm == "deep_gemm":
+        assert lins[0].method.w8a8_block_fp8_linear is fp8_utils.deepgemm_w8a8_block_fp8_linear_with_fallback
+    x = torch.randn(448, 2560, device="cuda", dtype=torch.bfloat16)
+    monkeypatch.setattr(fp8, "FP8_OP", "0")
+    direct = [lin(x) for lin in lins]
+    monkeypatch.setattr(fp8, "FP8_OP", "1")
+    torch._dynamo.reset()
+    f = torch.compile(lambda lin, t: lin(t) * 2, dynamic=True)
+    for lin, want in zip(lins, direct):
+        assert torch.equal(f(lin, x), want * 2)
+    ref_w = fp8.dequant_block_fp8(lins[0].weight if gemm is None else _fp8_weight(2560, 2560)[0],
+                                  _fp8_weight(2560, 2560)[1]).float()
+    ref = x.float() @ ref_w.T
+    assert ((direct[0].float() - ref).norm() / ref.norm()).item() < 0.06

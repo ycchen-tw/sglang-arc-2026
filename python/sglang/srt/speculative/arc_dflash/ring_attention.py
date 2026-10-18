@@ -46,7 +46,7 @@ def _ring_attn_kernel(
     s_qpb,
     s_ob, s_oh, s_ot,
     n, ncols, window, rows, group, scale,
-    D: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, NEW_N: tl.constexpr,
+    D: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, NEW_N: tl.constexpr, FP8_DOT: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     kvh = tl.program_id(1)
@@ -64,13 +64,21 @@ def _ring_attn_kernel(
     acc = tl.zeros([BLOCK_M, D], tl.float32)
     kbase = KP + slot * s_ps + kvh * s_ph
     vbase = VP + slot * s_ps + kvh * s_ph
+    if FP8_DOT:  # the query as e4m3 with one scale per row, for e4m3 x e4m3 products against the pool
+        q_scale = tl.maximum(tl.max(tl.abs(q.to(tl.float32)), 1), 1e-12) / 448.0
+        q8 = (q.to(tl.float32) / q_scale[:, None]).to(KP.dtype.element_ty)
+        s_scale = q_scale[:, None] * scale
     for start in range(0, ncols, BLOCK_N):
         c = start + tl.arange(0, BLOCK_N)
         c_ok = c < ncols
         kpos = tl.load(POS + b * s_posb + c, mask=c_ok, other=-1)
-        # widened to the query dtype: a no-op for a BF16 pool, exact for an FP8 one (ARC_DFLASH_KV_DTYPE)
-        k = tl.load(kbase + c[:, None] * s_pc + d[None, :], mask=c_ok[:, None], other=0.0).to(q.dtype)
-        s = tl.dot(q, tl.trans(k)).to(tl.float32) * scale
+        if FP8_DOT:
+            k8 = tl.load(kbase + c[:, None] * s_pc + d[None, :], mask=c_ok[:, None], other=0.0)
+            s = tl.dot(q8, tl.trans(k8)).to(tl.float32) * s_scale
+        else:
+            # widened to the query dtype: a no-op for a BF16 pool, exact for an FP8 one (ARC_DFLASH_KV_DTYPE)
+            k = tl.load(kbase + c[:, None] * s_pc + d[None, :], mask=c_ok[:, None], other=0.0).to(q.dtype)
+            s = tl.dot(q, tl.trans(k)).to(tl.float32) * scale
         dist = qpos[:, None] - kpos[None, :]
         ok = (kpos[None, :] >= 0) & (dist >= 0) & (dist < window) & row_ok[:, None]
         s = tl.where(ok, s, -1.0e30)
@@ -78,8 +86,12 @@ def _ring_attn_kernel(
         p = tl.where(ok, tl.exp(s - m_new[:, None]), 0.0)
         alpha = tl.exp(m_i - m_new)
         l_i = l_i * alpha + tl.sum(p, 1)
-        v = tl.load(vbase + c[:, None] * s_pc + d[None, :], mask=c_ok[:, None], other=0.0).to(q.dtype)
-        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+        if FP8_DOT:  # P in [0, 1] as e4m3 scaled by 256 (keeps p >= 2^-14 normal), V straight from the pool
+            v8 = tl.load(vbase + c[:, None] * s_pc + d[None, :], mask=c_ok[:, None], other=0.0)
+            acc = acc * alpha[:, None] + tl.dot((p * 256.0).to(v8.dtype), v8).to(tl.float32) * (1.0 / 256.0)
+        else:
+            v = tl.load(vbase + c[:, None] * s_pc + d[None, :], mask=c_ok[:, None], other=0.0).to(q.dtype)
+            acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
         m_i = m_new
     # the block's own keys (not in the pool yet)
     j = tl.arange(0, NEW_N)
@@ -147,7 +159,7 @@ _BIG_FITS: dict = {}  # (device index, D, NEW_N) -> whether AUTO_BIG's compiled 
 def _big_fits(args, consts, grid, device) -> bool:
     """Compile (no launch) AUTO_BIG for this shape once per device and compare its shared memory with the device's
     limit; the same answer on every rank of identical GPUs."""
-    key = (device.index, consts["D"], consts["NEW_N"])
+    key = (device.index, consts["D"], consts["NEW_N"], consts["FP8_DOT"])
     fits = _BIG_FITS.get(key)
     if fits is None:
         bm, bn, warps, stages = AUTO_BIG
@@ -181,6 +193,15 @@ OUT_T = os.environ.get("ARC_DFLASH_RING_OUT_T", "0")
 if OUT_T not in ("0", "1"):
     raise ValueError(f"ARC_DFLASH_RING_OUT_T must be 0 or 1, got {OUT_T!r}")
 
+
+# arc-forge ARC_DFLASH_RING_FP8_DOT (opt-in, default 0; needs ARC_DFLASH_KV_DTYPE=fp8_e4m3): over the pool's columns,
+# QK^T as e4m3 x e4m3 (the query quantized per row, one fp32 scale each) and PV as e4m3 x e4m3 (P scaled by 256),
+# fp32 accumulation; the block's own K/V (BF16, not in the pool) stay BF16. Widening the pool to BF16 for BF16 MMAs
+# made the e4m3 pool slower than a BF16 one (the kernel is not bandwidth-bound). Lossy beyond the pool's rounding
+# (query and P are rounded too): judged by accept length.
+FP8_DOT = os.environ.get("ARC_DFLASH_RING_FP8_DOT", "0")
+if FP8_DOT not in ("0", "1"):
+    raise ValueError(f"ARC_DFLASH_RING_FP8_DOT must be 0 or 1, got {FP8_DOT!r}")
 
 _ENV_TILE = _env_tile()
 if _ENV_TILE is not None and _ENV_TILE != "auto":
@@ -220,7 +241,10 @@ def attend(q, k, v, positions, key: RingWindow, value: RingWindow, key_positions
         out.stride(0), out.stride(1), out.stride(2),
         n, key.columns, window, rows, group, dim ** -0.5,
     )
-    consts = dict(D=dim, NEW_N=max(16, triton.next_power_of_2(n)))
+    fp8_dot = FP8_DOT == "1"
+    if fp8_dot and kp.dtype != torch.float8_e4m3fn:
+        raise ValueError(f"ARC_DFLASH_RING_FP8_DOT=1 needs an e4m3 pool (ARC_DFLASH_KV_DTYPE=fp8_e4m3), got {kp.dtype}")
+    consts = dict(D=dim, NEW_N=max(16, triton.next_power_of_2(n)), FP8_DOT=fp8_dot)
     bm, bn, warps, stages = TILES["large" if rows > 132 else "small"]
     if _ENV_TILE == "auto" and rows <= 132:
         tile = _auto_tile(rows, hkv * batch, q.device)
