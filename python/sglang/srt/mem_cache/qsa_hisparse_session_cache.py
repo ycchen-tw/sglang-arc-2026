@@ -43,6 +43,22 @@ the comparison runs raw against raw; a replayed message may not touch an image, 
 the processor's ids, padded ids, later image offsets and M-RoPE positions move with
 it.
 
+Own last turn (hisparse_config.qsa_session_replay_own_last_turn, needs qsa_session_replay;
+arc-forge docs/plans/replay_own_last_turn.md): where the replay would stop because the
+diverging message's text differs, and that message is the record's last generated one
+(the record's generation starts at prompt_len), the request gets the record's ids for it
+anyway, plus a closure when the generation was cut (managers/replay_own_turn.py). Codex
+re-renders a tool call the token budget cut, a malformed call, or a thinking block the
+template closed; the next request then resumes at P instead of releasing the record.
+Only a generation that finished (stop or length) is taken over (gen_finished; an abort or
+a retract parks a partial one: why "aborted"). Sticky: codex re-renders the message the
+same way in every later request, so each takeover leaves an entry with the record
+(rec.own): a later request whose ids for that message are exactly the client's ids the
+entry saw gets the record's ids again, and each request carries the entries its ids hold
+after replay to the record it parks (_carry at intake, _park_entries at exit). A record
+that is truncated or released drops its entries; a client that sends other ids for the
+message drops that one.
+
 Resume anchors (h23, hisparse_config.qsa_session_anchor; replaces the h10 prompt-tail
 track, design §3.8, §13): a record may hold a second GDN buffer, the anchor: the state
 after A tokens, where A is the P the request that parked it resumed from (0 < A < P).
@@ -66,11 +82,18 @@ import time
 from array import array
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 
+from sglang.srt.managers.replay_own_turn import (
+    OwnTurn,
+    OwnTurnEntry,
+    kept_entries,
+    own_turn_replacement,
+    sticky_replacement,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -114,6 +137,20 @@ def _lcp(a: np.ndarray, b: np.ndarray) -> int:
     return int(diff[0]) if diff.size else n
 
 
+def replay_flags(extra: Dict[str, Any]) -> Tuple[bool, bool]:
+    """hisparse_config's (qsa_session_replay, qsa_session_replay_own_last_turn), both bools; the second needs
+    the first (h14 replay with own-last-turn, managers/replay_own_turn.py)."""
+    replay = extra.get("qsa_session_replay", False)
+    if not isinstance(replay, bool):
+        raise ValueError(f"hisparse_config.qsa_session_replay must be a bool, got {replay!r}")
+    own_last_turn = extra.get("qsa_session_replay_own_last_turn", False)
+    if not isinstance(own_last_turn, bool):
+        raise ValueError(f"hisparse_config.qsa_session_replay_own_last_turn must be a bool, got {own_last_turn!r}")
+    if own_last_turn and not replay:
+        raise ValueError("hisparse_config.qsa_session_replay_own_last_turn needs qsa_session_replay")
+    return replay, own_last_turn
+
+
 @dataclass(eq=False)
 class SessionRecord:
     """design §2.1. logical / host_blocks / tokens are authoritative while PARKED only."""
@@ -134,6 +171,13 @@ class SessionRecord:
     close_on_unpin: bool = False
     released: bool = False
     prompt_len: int = 0  # h14: the producer's prompt length (its generation starts here)
+    # own last turn: prompt_len + the output through its stop (the generation's end; under speculative decoding
+    # tokens / raw go on with the draft ids a verify accepted past it, which the client never got)
+    gen_end: Optional[int] = None
+    # own last turn: the producer finished (stop or length); an abort or a retract parks a partial output
+    gen_finished: Optional[bool] = None
+    # own last turn: the messages own-turn took over, held by tokens / raw (start -> entry; sticky)
+    own: Dict[int, OwnTurnEntry] = field(default_factory=dict)
     raw: Optional[np.ndarray] = None  # h14: unpadded input + output ids when padding changed them
     raw_ok: bool = True  # h14: False when the unpadded ids cannot stand for the tokens (length differs)
     abuf: Optional[int] = None  # h23: second GDN buffer, the state after `anchor` tokens
@@ -207,14 +251,14 @@ class QSAHiSparseSessionCache(ChunkCache):
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout < 0:
             raise ValueError(f"hisparse_config.qsa_session_idle_timeout_s must be >= 0, got {timeout!r}")
 
-        replay = parse_hisparse_config().sparse_extra_config.get("qsa_session_replay", False)
-        if not isinstance(replay, bool):
-            raise ValueError(f"hisparse_config.qsa_session_replay must be a bool, got {replay!r}")
+        replay, own_last_turn = replay_flags(parse_hisparse_config().sparse_extra_config)
 
         self.coord = coordinator
         self.block_tokens = layout.block_tokens
         self.idle_timeout = float(timeout)  # 0: off
         self.replay = replay  # h14; set_replay_tokenizer must follow
+        self.own_last_turn = own_last_turn
+        self.replay_own_turn: Optional[OwnTurn] = None  # set_replay_tokenizer, with own_last_turn
         self.replay_end: Optional[int] = None
         self.replay_stop = np.empty(0, np.int64)  # <|im_end|> + the model's stop tokens
         self.replay_decode = None
@@ -227,12 +271,13 @@ class QSAHiSparseSessionCache(ChunkCache):
         coordinator.set_snapshot_owner(self)
         logger.info(
             "QSA HiSparse session cache: snapshot T=%d, idle timeout %.0f s, "
-            "resumed context cap %d tokens per prefill batch, output-id replay %s, resume anchors %s",
+            "resumed context cap %d tokens per prefill batch, output-id replay %s, resume anchors %s%s",
             coordinator.snapshots.interval,
             self.idle_timeout,
             self.resume_context_cap,
             "on" if self.replay else "off",
             "on" if self.anchor else "off",
+            ", own last turn on" if self.own_last_turn else "",
         )
 
     def reset_state(self) -> None:
@@ -244,6 +289,9 @@ class QSAHiSparseSessionCache(ChunkCache):
         self._reqs: Dict[str, _ReqSession] = {}  # rid -> live session request
         self.stats: Counter = Counter()
         self.ledger_version = 0  # bumped whenever a record parks or goes (idle re-check)
+        # own last turn: sid -> (rid, entries) of the session's latest intake: the entries its ids hold after
+        # replay (the record's it shares, and its own takeovers), which the record keeps when that request parks
+        self._own_intake: Dict[str, Tuple[str, Dict[int, OwnTurnEntry], int]] = {}
 
     # ------------------------------------------------------------ cache traits
 
@@ -285,6 +333,7 @@ class QSAHiSparseSessionCache(ChunkCache):
             return 0
         del self.gen[session_id]
         self.owner.pop(session_id, None)  # the in-flight request is stale from now on
+        self._own_intake.pop(session_id, None)
         rec = self.index.pop(session_id, None)
         if rec is None:
             self.stats["close_empty"] += 1
@@ -333,6 +382,12 @@ class QSAHiSparseSessionCache(ChunkCache):
         self.replay_decode = lambda ids: tokenizer.decode(
             ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
         )
+        if self.own_last_turn:
+            self.replay_own_turn = OwnTurn.from_tokenizer(
+                tokenizer, self.replay_decode, "hisparse_config.qsa_session_replay_own_last_turn"
+            )
+            if self.replay_own_turn.message_end != end:
+                raise ValueError(f"own-turn replay ends messages at {self.replay_own_turn.message_end}, h14 at {end}")
 
     def _first_end(self, tokens: np.ndarray, start: int) -> Optional[int]:
         hits = np.flatnonzero(tokens[start:] == self.replay_end)
@@ -424,7 +479,17 @@ class QSAHiSparseSessionCache(ChunkCache):
         that are not plain text (mm_shift), a record without a raw view (raw), and one whose
         prompt reaches max_input_len (the scheduler's max_req_input_len:
         validate_input_length would abort it, or cut its tail with --allow-auto-truncate,
-        where the client's own ids pass)."""
+        where the client's own ids pass).
+
+        With qsa_session_replay_own_last_turn, a message whose text differs is still replayed
+        when it is the record's last generated message (replay_own_turn.own_turn_replacement,
+        the generation starting at rec.prompt_len): its ids become the record's message plus a
+        closure; the span gets kind own_turn, closure, client_len and client_sha256 (counted
+        as replay_own_turn / replay_own_turn_closure). A message at one of the record's entries
+        (an earlier takeover) gets the record's ids again when the client sent the same ids
+        (span kind own_turn, sticky true, closure 0; replay_own_turn_sticky); other ids drop
+        the entry (replay_own_turn_sticky_drop_client). Otherwise it stops as
+        replay_text_differs, with replay_own_turn_skip_<why>."""
         if not self.replay:
             return
         if not isinstance(max_input_len, int) or max_input_len < 1:
@@ -433,45 +498,69 @@ class QSAHiSparseSessionCache(ChunkCache):
             raise RuntimeError(f"{BACKEND_NAME}: output-id replay is on but no tokenizer was set")
         sid = recv_req.session_id
         rec = self.index.get(sid) if sid is not None and sid in self.gen else None
+        # own last turn: the session's latest intake decides what its record keeps -- unless a request of the
+        # session runs (its record PINNED): that one's intake stays, and this one parks nothing (no_intake)
+        carry = self.own_last_turn and sid is not None and (rec is None or rec.state == "PARKED")
+        if carry:
+            self._own_intake.pop(sid, None)
         if rec is None or rec.tokens is None:
             return
+        taken = self._replay(recv_req, max_input_len, sid, rec)
+        if carry:
+            self._carry(recv_req, sid, rec, taken)
+
+    def _carry(self, recv_req, sid: str, rec: SessionRecord, taken: List[OwnTurnEntry]) -> None:
+        """Own last turn: the entries the request's ids hold after replay -- the record's that end before the
+        request leaves the record (cut at the first divergence), and its own takeovers -- for its park."""
+        toks = rec.raw if rec.raw is not None else rec.tokens
+        ids = _i64(recv_req.input_ids)
+        kept, dropped = kept_entries(rec.own, ids, _lcp(ids, toks), f"{recv_req.rid}'s ids after replay")
+        if dropped:
+            self.stats["replay_own_turn_sticky_unshared"] += dropped
+        for e in taken:
+            e.check_held_by(ids, f"{recv_req.rid}'s ids after replay")
+            kept[e.start] = e
+        self._own_intake[sid] = (recv_req.rid, kept, len(taken))
+
+    def _replay(self, recv_req, max_input_len: int, sid: str, rec: SessionRecord) -> List[OwnTurnEntry]:
+        """replay_request's work on the session's record; the own-turn takeovers it applied."""
         key = _i64(recv_req.input_ids)
         toks = rec.raw if rec.raw is not None else rec.tokens
         stop = self.replay_stop
         lcp = _lcp(key, toks)
         if lcp >= min(len(key), len(toks)):
-            return  # the key agrees through the record
+            return []  # the key agrees through the record
         if np.isin(toks[lcp], stop):
             if lcp < len(toks) - 1:  # a message boundary moved: different text, not a split
                 self.stats["replay_skip_stop"] += 1
-            return  # else only the previous generation's stop token differs (after P)
+            return []  # else only the previous generation's stop token differs (after P)
         if rec.state != "PARKED":
             self.stats["replay_skip_pinned"] += 1
-            return
+            return []
         if not rec.raw_ok:
             self.stats["replay_skip_raw"] += 1
-            return
+            return []
         first = np.flatnonzero(np.isin(toks[:lcp], stop))
         blocker = self._replay_blocker(recv_req, int(first[-1]) + 1 if first.size else 0)
         if blocker is not None:
             self.stats[f"replay_skip_{blocker}"] += 1
-            return
+            return []
         mm = recv_req.mm_inputs
         view = None
         if recv_req.need_wait_for_mm_inputs:  # encoder disaggregation: the images come later
             self.stats["replay_skip_mm_type"] += 1
-            return
+            return []
         if mm is not None:
             view = self._mm_view(mm, key)
             if view is None:
                 self.stats["replay_skip_mm_type"] += 1
-                return
+                return []
         ranges, special = view if view is not None else ([], None)
         shifts = {id(item): [list(map(int, ab)) for ab in item.offsets] for item, _, _ in ranges}
         padded = _i64(mm.padded_input_ids).copy() if view is not None and mm.padded_input_ids is not None else None
         pos = mm.mrope_positions if view is not None else None
         logprob = recv_req.logprob_start_len if recv_req.return_logprob else None
-        new, spans, lcp0 = key, [], lcp
+        new, spans, lcp0, taken = key, [], lcp, []
         while lcp < min(len(new), len(toks)) and not np.isin(toks[lcp], stop):
             ends = np.flatnonzero(np.isin(toks[:lcp], stop))
             start = int(ends[-1]) + 1 if ends.size else 0
@@ -490,17 +579,48 @@ class QSAHiSparseSessionCache(ChunkCache):
                     self.stats["replay_skip_mm_overlap"] += 1
                     break
             text = self.replay_decode(toks[start:rec_end].tolist())
+            extra, rep = None, toks[start:rec_end]
             if text != self.replay_decode(new[start:key_end].tolist()) or "\ufffd" in text:
-                self.stats["replay_text_differs"] += 1
-                break
-            delta = rec_end - key_end
+                entry = rec.own.get(start) if self.replay_own_turn is not None else None
+                sticky = None
+                if entry is not None:
+                    # a message own-turn took over in an earlier request (sticky)
+                    sticky = sticky_replacement(entry, toks, new, start, key_end, rec_end, rec.prompt_len)
+                    if sticky.drop:  # the client sent other ids for it
+                        del rec.own[start]
+                        self.stats["replay_own_turn_sticky_drop_client"] += 1
+                if sticky is not None and sticky.ids is not None:
+                    rep, extra = sticky.ids, sticky.fields
+                else:
+                    own = None
+                    if self.replay_own_turn is not None:
+                        # rec.tokens / rec.raw are the producer's input + output ids: its generation starts at
+                        # prompt_len and ends at gen_end (draft ids accepted past the stop follow it)
+                        if rec.gen_end is None or rec.gen_finished is None:
+                            raise RuntimeError(f"{recv_req.rid}: the record of {sid} has tokens but no gen_end / "
+                                               "gen_finished")
+                        own = own_turn_replacement(
+                            self.replay_own_turn, toks, new, lcp, start, key_end, rec.prompt_len, rec.gen_end, stop,
+                            finished=rec.gen_finished,
+                        )
+                    if own is None or own.ids is None:
+                        self.stats["replay_text_differs"] += 1
+                        if own is not None:
+                            self.stats[f"replay_own_turn_skip_{own.why}"] += 1
+                        break
+                    rep, extra, rec_end = own.ids, own.fields, own.rec_end
+                    if view is not None and np.isin(rep[rec_end - start :], special).any():
+                        self.stats["replay_skip_mm_overlap"] += 1  # the closure holds a multimodal token
+                        break
+                    taken.append(own.entry)
+            delta = len(rep) - (key_end - start)
             if pos is not None and delta:
                 seg = pos[:, start:key_end]
                 if not self._text_positions(seg):
                     self.stats["replay_skip_mm_shift"] += 1
                     spans = []
                     break
-                grown = seg[:, :1] + torch.arange(rec_end - start, dtype=pos.dtype, device=pos.device)
+                grown = seg[:, :1] + torch.arange(len(rep), dtype=pos.dtype, device=pos.device)
                 pos = torch.cat((pos[:, :start], grown, pos[:, key_end:] + delta), dim=1)
             if view is not None:
                 for offs in shifts.values():
@@ -511,22 +631,23 @@ class QSAHiSparseSessionCache(ChunkCache):
                 if padded is not None:
                     if not np.array_equal(padded[start:key_end], new[start:key_end]):
                         raise RuntimeError(f"{recv_req.rid}: padded ids differ from the ids in a text message")
-                    padded = np.concatenate((padded[:start], toks[start:rec_end], padded[key_end:]))
-            new = np.concatenate((new[:start], toks[start:rec_end], new[key_end:]))
+                    padded = np.concatenate((padded[:start], rep, padded[key_end:]))
+            new = np.concatenate((new[:start], rep, new[key_end:]))
             if logprob is not None and logprob >= key_end:
                 logprob += delta
-            spans.append({"s": start, "lcp": lcp, "rec_end": rec_end, "key_end": key_end, "delta": delta})
+            spans.append({"s": start, "lcp": lcp, "rec_end": rec_end, "key_end": key_end, "delta": delta,
+                          **(extra or {})})
             nxt = _lcp(new, toks)
-            if nxt < rec_end:
+            if nxt < rec_end:  # own-turn after a cut: rec_end is the generation's end
                 raise RuntimeError(f"{recv_req.rid}: replayed message [{start}, {rec_end}) still diverges at {nxt}")
             lcp = nxt
             if lcp < min(len(new), len(toks)) and lcp < len(toks) - 1 and np.isin(toks[lcp], stop):
                 self.stats["replay_skip_stop"] += 1
         if not spans:
-            return
+            return []
         if len(new) >= max_input_len:
             self.stats["replay_skip_input_len"] += 1
-            return
+            return []
         moved = int(len(new) - len(key))
         if view is not None:
             if pos is not None and mm.mrope_position_delta is not None:
@@ -551,6 +672,13 @@ class QSAHiSparseSessionCache(ChunkCache):
         self.stats["replay"] += 1
         self.stats["replay_messages"] += len(spans)
         self.stats["replay_earlier"] += sum(s["lcp"] < rec.prompt_len for s in spans)  # an earlier turn's reply
+        own = [s for s in spans if s.get("kind") == "own_turn" and not s.get("sticky")]
+        if own:
+            self.stats["replay_own_turn"] += len(own)
+            self.stats["replay_own_turn_closure"] += sum(s["closure"] for s in own)
+        sticky = sum(bool(s.get("sticky")) for s in spans)
+        if sticky:
+            self.stats["replay_own_turn_sticky"] += sticky
         w = max(0, lcp0 - 16)
         logger.info(
             "QSA_REPLAY %s",
@@ -573,6 +701,7 @@ class QSAHiSparseSessionCache(ChunkCache):
                 separators=(",", ":"),
             ),
         )
+        return taken
 
     # ------------------------------------------------------------ match / pin / adopt
 
@@ -712,6 +841,7 @@ class QSAHiSparseSessionCache(ChunkCache):
         a, bt = rec.anchor, self.block_tokens
         if rec.state != "PARKED" or rec.abuf is None or not 0 < a < rec.P or a % self.page_size:
             raise RuntimeError(f"truncate of the {rec.state} record of {rec.sid}: P={rec.P}, anchor {a}")
+        self._drop_entries(rec, "truncate")  # own last turn: the requests that keep them carry them again
         self.token_to_kv_pool_allocator.free(rec.logical[a:])
         self.coord.mem_pool_host.free(rec.host_blocks[a // bt :])
         self.coord.snapshots.free_buffer(rec.gdn)
@@ -930,6 +1060,7 @@ class QSAHiSparseSessionCache(ChunkCache):
             rec.host_blocks = coord.req_to_host_pool[r, : keep // self.block_tokens].clone()
             rec.tokens = np.concatenate((_i64(req.origin_input_ids), _i64(req.output_ids)))
             rec.prompt_len = len(req.origin_input_ids)
+            rec.gen_end = rec.prompt_len + len(req.output_ids_through_stop)
             unpadded = req.origin_input_ids_unpadded
             if unpadded is req.origin_input_ids:  # no multimodal padding: the tokens are the raw ids
                 rec.raw, rec.raw_ok = None, True
@@ -939,6 +1070,8 @@ class QSAHiSparseSessionCache(ChunkCache):
                 rec.raw, rec.raw_ok = None, False
             if rec.abuf is not None and not 0 < rec.anchor < rec.P:
                 raise RuntimeError(f"{req.rid}: parks the record of {rec.sid} with anchor {rec.anchor}, P={rec.P}")
+            if self.own_last_turn:
+                self._park_entries(rec, req)
         if st is not None:  # h23: a retracted request resumes (and keeps) again
             st.kept = None
         super().cache_finished_req(req, is_insert, kv_len_to_handle=kv_len_to_handle)
@@ -946,7 +1079,39 @@ class QSAHiSparseSessionCache(ChunkCache):
         if rec is not None:
             self._unpin(rec, st)
         if st is not None and req.finished():  # a retracted request stays the owner
+            intake = self._own_intake.get(st.sid)
+            if intake is not None and intake[0] == req.rid:
+                del self._own_intake[st.sid]  # own last turn: it parked no record
             self._exit(st)
+
+    def _park_entries(self, rec: SessionRecord, req: "Req") -> None:
+        """Own last turn, at every exit that writes the request's ids into its record: whether its generation
+        finished (stop or length: only such a generation is taken over later), and the entries its ids hold
+        (its intake's, checked against the record's ids; none when its intake is not the session's latest)."""
+        rec.gen_finished = req.finished() and req.finished_reason.to_json()["type"] in ("stop", "length")
+        intake = self._own_intake.get(rec.sid)
+        if intake is None or intake[0] != req.rid:
+            self._drop_entries(rec, "no_intake")
+            return
+        _, own, taken = intake
+        if not rec.raw_ok:  # the padded ids were cut (--allow-auto-truncate): no raw view to hold them
+            self._drop_entries(rec, "raw")
+            if req.finished():
+                del self._own_intake[rec.sid]
+            return
+        ids = rec.raw if rec.raw is not None else rec.tokens
+        for e in own.values():
+            e.check_held_by(ids, f"the record {req.rid} parks for {rec.sid}")
+        rec.own = dict(own)
+        if req.finished():  # a retracted request keeps its intake: it parks again when it exits for good
+            del self._own_intake[rec.sid]
+            if taken:
+                self.stats["replay_own_turn_entries"] += taken
+
+    def _drop_entries(self, rec: SessionRecord, why: str) -> None:
+        if rec.own:
+            self.stats[f"replay_own_turn_sticky_drop_{why}"] += len(rec.own)
+            rec.own = {}
 
     def _unpin(self, rec: SessionRecord, st: _ReqSession) -> None:
         if rec.pin_req is not st.req or rec.pin_count != 1:
@@ -977,6 +1142,9 @@ class QSAHiSparseSessionCache(ChunkCache):
         st = self._reqs.get(handle.rid)
         if st is None or st.req.kv.holds_kv:
             return  # no session, or it still exits through cache_finished_req
+        intake = self._own_intake.get(st.sid)
+        if intake is not None and intake[0] == handle.rid:
+            del self._own_intake[st.sid]  # own last turn: it never parks
         self.stats["abort_waiting" + ("_with_record" if st.claim is not None else "")] += 1
         st.claim = None
         self._exit(st)
@@ -1031,10 +1199,12 @@ class QSAHiSparseSessionCache(ChunkCache):
             raise RuntimeError(f"{BACKEND_NAME}.reset with live session requests")
         for rec in list(self.records):
             self._release_record(rec)
+        self._own_intake.clear()
 
     def _release_record(self, rec: SessionRecord) -> None:
         if rec.pin_count or rec.logical is None or rec.released:
             raise RuntimeError(f"release of the {rec.state} record of {rec.sid} (P={rec.P})")
+        self._drop_entries(rec, "release")
         self.token_to_kv_pool_allocator.free(rec.logical)
         self.coord.mem_pool_host.free(rec.host_blocks)
         self.coord.snapshots.free_buffer(rec.gdn)
@@ -1065,6 +1235,11 @@ class QSAHiSparseSessionCache(ChunkCache):
                 )
         if len(self.index) != len(self.records):
             problems.append(f"{len(self.index)} indexed of {len(self.records)} records")
+        for rec in self.records:  # own last turn: every entry is held by its record's ids
+            ids = rec.raw if rec.raw is not None else rec.tokens
+            bad = [e.start for e in rec.own.values() if ids is None or not e.held_by(ids)]
+            if bad or (self.own_last_turn and ids is not None and rec.gen_finished is None):
+                problems.append(f"record of {rec.sid}: own-turn entries {bad} not held, gen_finished {rec.gen_finished}")
         if problems:
             raise RuntimeError("QSA HiSparse session cache idle check: " + "; ".join(problems))
         parked = self.records

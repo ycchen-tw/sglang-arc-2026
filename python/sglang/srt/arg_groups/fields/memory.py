@@ -220,7 +220,14 @@ class Memory(msgspec.Struct):
     hisparse_config: A[
         Optional[str],
         Arg(
-            help='A dictionary in JSON string format for hierarchical sparse attention configuration. Example: \'{"top_k": 2048, "device_buffer_size": 4096, "host_to_device_ratio": 2}\'',
+            help='A dictionary in JSON string format for hierarchical sparse attention configuration. Example: \'{"top_k": 2048, "device_buffer_size": 4096, "host_to_device_ratio": 2}\'. '
+            "arc-forge QSA session cache keys include qsa_session_replay (h14: put the session's sampled "
+            "ids back where the client re-tokenized the same text) and qsa_session_replay_own_last_turn "
+            "(needs qsa_session_replay: the sampled ids are authoritative for the session's last generated "
+            "message even where the client re-rendered it with other text -- a cut or malformed tool call, a "
+            "thinking block the template closed -- with a closure after a cut that is not counted as "
+            "generated, and kept on later requests where the client sends the same ids for it (sticky); "
+            "only a stop / length generation is taken over; default off).",
             aliases=["--hierarchical-sparse-attention-extra-config"],
         ),
     ] = None

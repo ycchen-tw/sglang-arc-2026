@@ -52,6 +52,7 @@
 - **HiSparse L4 路徑**（h23–h39：attention DP2、sm_89、分散式 spec、native MTP host KV）：
   - 都用 `ARC_HISPARSE_*`、`ARC_GDN_STATE_FMT`、`ARC_NATIVE_MTP_KV_HOST` 這類旗標控制，或只在 sm_89／DP／TP>1 才會走到。
   - G4（TP1）在 L4 旗標全關時，和 v8 逐位相同：12 條真實 prompt 的 prefill logprob 加 512 步 decode 都一樣，見 arc-forge `work/sglang_fork/`。
+- **HiSparse session replay 的 own last turn**（`hisparse_config` 的 `qsa_session_replay_own_last_turn`，要 `qsa_session_replay`，預設關）：h14 `replay_request` 用同一個判斷（`managers/replay_own_turn.py`），生成範圍是 record 的 `[prompt_len, gen_end)`（`output_ids_through_stop`：spec 下 record 會多出 stop 之後被接受的 draft id，不算）；codex 改寫上一輪後下一個請求照樣在 P 接續、不放掉 record。只接管以 stop／length 結束的生成（abort／retract park 的部分輸出不接管，why `aborted`）。**sticky**：codex 之後每輪都照樣改寫那則訊息，所以每次接管在 record 留一筆 entry（`rec.own`），之後的請求對那則訊息送的 id 逐位相同就再換回 record 的 id（span `sticky: true`）；請求在 intake 帶著它的 id 保有的 entry，park 時交給 record，record truncate／release 時丟掉（arc-forge `docs/plans/replay_own_last_turn.md`）。計數 `replay_own_turn`／`replay_own_turn_closure`／`replay_own_turn_sticky`／`replay_own_turn_entries`／`replay_own_turn_sticky_drop_<why>`／`replay_own_turn_skip_<why>`（idle 時的 session cache stats），span 在 `QSA_REPLAY` log 行。
 - **DFlash**（`ARC_DFLASH_DRAFTER=<export dir>`）：
   - 只有一個 worker：drafter 跑在這張卡的 attention-TP 群組上。
   - routed experts 預設依 compute capability 選後端：sm_100／sm_120 用 CUTLASS W4A4；sm_89 用 Marlin W4A16，並在群組內做 EP。
