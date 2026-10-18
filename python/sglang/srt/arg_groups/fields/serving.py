@@ -322,6 +322,22 @@ class Serving(msgspec.Struct):
         "straight into the answer) also counts as the same message when the client "
         "renders it as <think>\\n\\n</think>\\n\\n; the model gets its sampled ids back.",
     ] = False
+    session_replay_own_last_turn: A[
+        bool,
+        "With --session-replay: the model's own sampled ids are authoritative for the "
+        "session's last generated assistant message. Where replay would stop because "
+        "the client re-rendered that one message with other text (a tool call cut by "
+        "the token budget or normalized by the parser, a thinking block the template "
+        "closed), the request gets the sampled ids back; a generation cut without a "
+        "stop token is followed by a closure that is not counted as generated: the "
+        "client's text after the cut (when the sampled text is a prefix of it), else "
+        "the chat template's think closure inside an open thinking block, else nothing. "
+        "The taken-over message stays so on every later request where the client sends "
+        "exactly the same ids for it (sticky; other ids drop it); only a stop / length "
+        "generation is taken over, and older messages the client changed are never touched. "
+        "The replay span has kind own_turn (sticky true on later requests) and the closure "
+        "size; counters replay_own_turn*. Off: unchanged.",
+    ] = False
     session_ledger_dir: A[
         Optional[str],
         "Write the session ledger (token ids, media bytes, optional logprobs and "

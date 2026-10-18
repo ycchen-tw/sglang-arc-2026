@@ -15,7 +15,12 @@ intake (after tokenization, before the scheduler)
     a previous assistant turn whose thinking the model left empty in a non-canonical
     way (``<think>\n</think>\n\n``, or ``<think>\n`` straight into the answer) also
     counts as the same message when the client renders it canonically
-    (``<think>\n\n</think>\n\n``): see ``EmptyThink``.
+    (``<think>\n\n</think>\n\n``): see ``EmptyThink``. With
+    ``--session-replay-own-last-turn`` the model's own ids are authoritative for the
+    session's last generated message even where the client's re-render has other text
+    (a cut or malformed tool call, a thinking block the template closed), and stay
+    so on every later request where the client sends the same ids for it (sticky
+    entries, kept per session with S): see ``replay_own_turn``.
 
 finish
     An extension appends ``tail`` (the ids after S) and ``gen`` (the sampled ids,
@@ -50,6 +55,14 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+
+from sglang.srt.managers.replay_own_turn import (
+    OwnTurn,
+    OwnTurnEntry,
+    kept_entries,
+    own_turn_replacement,
+    sticky_replacement,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +116,11 @@ class ReplayResult:
     spans: List[Dict[str, int]] = field(default_factory=list)
     skip: Optional[str] = None  # why it stopped before the record's end, None if it did not
     lcp0: int = 0  # first divergence before replay (len(record) or more: none)
+    own_turn_skip: Optional[str] = None  # own-turn on and text_differs kept: why it did not apply
+    # own-turn takeovers of this request (kept with S once it commits), and the starts of the session's
+    # entries the client sent other ids for (dropped at intake)
+    own_entries: List[OwnTurnEntry] = field(default_factory=list)
+    own_dropped: List[int] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -240,6 +258,9 @@ def replay_ids(
     decode: Callable[[List[int]], str],
     max_input_len: int,
     empty_think: Optional[EmptyThink] = None,
+    own_turn: Optional[OwnTurn] = None,
+    gen_start: Optional[int] = None,
+    entries: Optional[Dict[int, OwnTurnEntry]] = None,
 ) -> ReplayResult:
     """Put the record's sampled ids back into a tokenized request (h14 replay, ported).
 
@@ -256,7 +277,24 @@ def replay_ids(
     With ``empty_think``, a message whose text differs only because the record's leading
     empty thinking is non-canonical (``_empty_think_end``) is replayed the same way, as a
     span with ``"kind": "empty_think"``.
+
+    With ``own_turn``, a message whose text differs is still replayed when it is the record's
+    last generated message (``replay_own_turn.own_turn_replacement``; ``gen_start`` is where the
+    session's last generation starts in ``record``): its ids become the record's message plus a
+    closure, as a span with ``"kind": "own_turn"``, ``"closure"`` (closure tokens), ``"client_len"``
+    and ``"client_sha256"`` (the client's ids for the message); ``own_entries`` gets its entry.
+    A message starting at one of the session's ``entries`` (an earlier takeover; start ->
+    entry) gets the record's ids again when the client sent the same ids for it
+    (``replay_own_turn.sticky_replacement``: span kind own_turn, ``"sticky": true``, closure
+    0); other ids drop the entry (``own_dropped``) and the replay goes on as without it.
+    Otherwise the replay stops with text_differs as without the flag, and ``own_turn_skip``
+    says why.
     """
+    if own_turn is not None and (gen_start is None or entries is None):
+        raise ValueError("own-turn replay needs gen_start (the start of the session's last generation) and the "
+                         "session's own-turn entries")
+    if own_turn is None and entries is not None:
+        raise ValueError("own-turn entries without own-turn replay")
     if not isinstance(max_input_len, int) or max_input_len < 1:
         raise ValueError(f"max_input_len must be a positive int, got {max_input_len!r}")
     key = _i64(tok.input_ids)
@@ -289,7 +327,7 @@ def replay_ids(
     padded = _i64(mm.padded_input_ids).copy() if view is not None and mm.padded_input_ids is not None else None
     pos = mm.mrope_positions if view is not None else None
     logprob = tok.logprob_start_len if tok.return_logprob else None
-    new, spans = key, []
+    new, spans, taken = key, [], []
     while lcp < min(len(new), len(toks)) and not np.isin(toks[lcp], stop):
         ends = np.flatnonzero(np.isin(toks[:lcp], stop))
         start = int(ends[-1]) + 1 if ends.size else 0
@@ -309,21 +347,43 @@ def replay_ids(
                 res.skip = "mm_overlap"
                 break
         text = decode(toks[start:rec_end].tolist())
-        kind = None
+        kind, extra, rep = None, None, toks[start:rec_end]
         if text != decode(new[start:key_end].tolist()) or "�" in text:
-            if empty_think is None or _empty_think_end(toks, new, lcp, start, rec_end, key_end, empty_think,
-                                                       decode) is None:
-                res.skip = "text_differs"
-                break
-            kind = "empty_think"
-        delta = rec_end - key_end
+            if empty_think is not None and _empty_think_end(toks, new, lcp, start, rec_end, key_end, empty_think,
+                                                            decode) is not None:
+                kind = "empty_think"
+            else:
+                entry = None if entries is None else entries.get(start)
+                sticky = None if entry is None else sticky_replacement(entry, toks, new, start, key_end, rec_end,
+                                                                        gen_start)
+                if sticky is not None and sticky.drop:
+                    res.own_dropped.append(start)  # the client sent other ids for the message
+                if sticky is not None and sticky.ids is not None:
+                    rep, extra = sticky.ids, sticky.fields
+                else:
+                    # the ledger's record is input + output through the stop: the last generation ends with
+                    # it, and only a stop / length generation is ever committed
+                    own = None if own_turn is None else own_turn_replacement(
+                        own_turn, toks, new, lcp, start, key_end, gen_start, len(toks), stop, finished=True)
+                    if own is None or own.ids is None:
+                        res.own_turn_skip = None if own is None else own.why
+                        res.skip = "text_differs"
+                        break
+                    if own.rec_end != rec_end:
+                        raise RuntimeError(f"{tok.rid}: own-turn message end {own.rec_end}, replay's {rec_end}")
+                    rep, extra = own.ids, own.fields
+                    if view is not None and np.isin(rep[rec_end - start:], special).any():
+                        res.skip = "mm_overlap"  # the closure holds a multimodal token
+                        break
+                    taken.append(own.entry)
+        delta = len(rep) - (key_end - start)
         if pos is not None and delta:
             seg = pos[:, start:key_end]
             if not _text_positions(seg):
                 res.skip = "mm_shift"
                 spans = []
                 break
-            grown = seg[:, :1] + torch.arange(rec_end - start, dtype=pos.dtype, device=pos.device)
+            grown = seg[:, :1] + torch.arange(len(rep), dtype=pos.dtype, device=pos.device)
             pos = torch.cat((pos[:, :start], grown, pos[:, key_end:] + delta), dim=1)
         if view is not None:
             for offs in shifts.values():
@@ -334,14 +394,14 @@ def replay_ids(
             if padded is not None:
                 if not np.array_equal(padded[start:key_end], new[start:key_end]):
                     raise RuntimeError(f"{tok.rid}: padded ids differ from the ids in a text message")
-                padded = np.concatenate((padded[:start], toks[start:rec_end], padded[key_end:]))
-        new = np.concatenate((new[:start], toks[start:rec_end], new[key_end:]))
+                padded = np.concatenate((padded[:start], rep, padded[key_end:]))
+        new = np.concatenate((new[:start], rep, new[key_end:]))
         if logprob is not None and logprob >= key_end:
             logprob += delta
         spans.append({"s": start, "lcp": lcp, "rec_end": rec_end, "key_end": key_end, "delta": delta,
-                      **({"kind": kind} if kind is not None else {})})
+                      **({"kind": kind} if kind is not None else {}), **(extra or {})})
         nxt = _lcp(new, toks)
-        if nxt < rec_end:
+        if nxt < rec_end:  # own-turn after a cut: rec_end is the record's end
             raise RuntimeError(f"{tok.rid}: replayed message [{start}, {rec_end}) still diverges at {nxt}")
         lcp = nxt
         if lcp < min(len(new), len(toks)) and lcp < len(toks) - 1 and np.isin(toks[lcp], stop):
@@ -367,6 +427,9 @@ def replay_ids(
     if logprob is not None:
         tok.logprob_start_len = logprob
     res.spans = spans
+    for e in taken:
+        e.check_held_by(new, f"{tok.rid}'s ids after replay")
+    res.own_entries = taken
     return res
 
 
@@ -556,6 +619,8 @@ class _Session:
     last_used: float = 0.0
     media: List[dict] = field(default_factory=list)  # committed media entries, S coordinates
     gen_start: int = 0  # where the last committed generation starts in S
+    # --session-replay-own-last-turn: the messages own-turn took over, held by S (start -> entry)
+    own: Dict[int, OwnTurnEntry] = field(default_factory=dict)
 
 
 @dataclass
@@ -618,6 +683,7 @@ class SessionLedger:
         port: int,
         empty_think: bool = False,
         exact_resume: bool = False,
+        own_last_turn: bool = False,
     ):
         if tokenizer is None:
             raise ValueError("--session-replay needs the tokenizer (do not use --skip-tokenizer-init)")
@@ -641,6 +707,8 @@ class SessionLedger:
         self.stop = np.array(sorted({self.replay_end, *eos}), dtype=np.int64)
         self.decode = lambda ids: tokenizer.decode(ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
         self.empty_think = EmptyThink.from_tokenizer(tokenizer, self.decode) if empty_think else None
+        self.own_turn = (OwnTurn.from_tokenizer(tokenizer, self.decode, "--session-replay-own-last-turn")
+                         if own_last_turn else None)
         pads = {}
         for name in (IMAGE_PAD_TOKEN, VIDEO_PAD_TOKEN):
             t = tokenizer.convert_tokens_to_ids(name)
@@ -678,14 +746,14 @@ class SessionLedger:
                         pid=os.getpid(), port=port, replay_end=self.replay_end, eos=self.eos.tolist(),
                         image_pad=self.image_pad, video_pad=self.video_pad,
                         ledger={"all": record_all, "logprobs": logprobs, "routing": routing, "max_bytes": max_bytes,
-                                "empty_think": empty_think})
+                                "empty_think": empty_think, "own_last_turn": own_last_turn})
             with open(os.path.join(self.root, "server.json"), "w") as f:
                 json.dump(meta, f, indent=1, sort_keys=True, default=str)
             self.writer = _Writer(self.root)
             self.writer.put({"ev": "start", "v": LEDGER_VERSION, "instance": self.instance, "t": time.time()})
             atexit.register(self.shutdown)
-        logger.info("SESSION_LEDGER on: replay=1 empty_think=%d dir=%s all=%d logprobs=%d routing=%d",
-                    empty_think, self.root, record_all, logprobs, routing)
+        logger.info("SESSION_LEDGER on: replay=1 empty_think=%d own_last_turn=%d dir=%s all=%d logprobs=%d "
+                    "routing=%d", empty_think, own_last_turn, self.root, record_all, logprobs, routing)
 
     # ------------------------------------------------------------------ intake
 
@@ -703,15 +771,28 @@ class SessionLedger:
         if sess is not None:
             self.sessions.move_to_end(sid)
             res = replay_ids(tok, sess.S.astype(np.int64), self.stop, self.replay_end, self.decode, max_input_len,
-                             self.empty_think)
+                             self.empty_think, own_turn=self.own_turn, gen_start=sess.gen_start,
+                             entries=sess.own if self.own_turn is not None else None)
+            for start in res.own_dropped:  # the client sent other ids for a message own-turn had taken over
+                del sess.own[start]
+                self.counters["replay_own_turn_sticky_drop_client"] += 1
             if res.spans:
                 self.counters["replay"] += 1
                 self.counters["replay_messages"] += len(res.spans)
                 think = sum(s.get("kind") == "empty_think" for s in res.spans)
                 if think:
                     self.counters["replay_empty_think"] += think
+                own = [s for s in res.spans if s.get("kind") == "own_turn" and not s.get("sticky")]
+                if own:
+                    self.counters["replay_own_turn"] += len(own)
+                    self.counters["replay_own_turn_closure"] += sum(s["closure"] for s in own)
+                sticky = sum(bool(s.get("sticky")) for s in res.spans)
+                if sticky:
+                    self.counters["replay_own_turn_sticky"] += sticky
             if res.skip is not None:
                 self.counters[f"replay_skip_{res.skip}"] += 1
+            if res.own_turn_skip is not None:
+                self.counters[f"replay_own_turn_skip_{res.own_turn_skip}"] += 1
         key64 = _i64(tok.input_ids)
         kind, cause, prefix_len, substituted = "single", None, 0, False
         if sid is not None:
@@ -851,6 +932,17 @@ class SessionLedger:
             rewind = len(sess.S) - prefix_len
             if rewind:
                 self.counters["rewind"] += 1
+            if self.own_turn is not None:
+                # S keeps [0, prefix_len): an entry survives if it ends (its <|im_end|>) before that
+                kept, dropped = kept_entries(sess.own, new_S, prefix_len, f"{rid}'s committed S")
+                if dropped:
+                    self.counters["replay_own_turn_sticky_drop_rewind"] += dropped
+                for e in p.replay.own_entries:
+                    e.check_held_by(new_S, f"{rid}'s committed S")
+                    kept[e.start] = e
+                if p.replay.own_entries:
+                    self.counters["replay_own_turn_entries"] += len(p.replay.own_entries)
+                sess.own = kept
             self._set_S(sess, new_S)
             sess.gen_start = len(p.key)
             sess.media.extend(m for m in media if "sha256" in m)
@@ -863,9 +955,12 @@ class SessionLedger:
             # earlier in the session (same ids, same coordinates), as the intake saw them
             media = p.earlier_media + p.media
             if sess is not None:
+                self._drop_entries(sess, "split")
                 self._close(sess, f"split:{cause}")
                 del self.sessions[p.sid]
                 self.bytes -= sess.S.nbytes
+            if p.replay.own_entries:  # the new segment starts without entries
+                self.counters["replay_own_turn_sticky_drop_split"] += len(p.replay.own_entries)
             seg, k = self._open(p.sid, cause if p.sid is not None else "single"), 0
             prefix_len = 0
             if p.sid is not None:
@@ -951,6 +1046,11 @@ class SessionLedger:
                              "n_tokens": int(len(sess.S)),
                              "sha256": hashlib.sha256(sess.S.astype("<i4").tobytes()).hexdigest()})
 
+    def _drop_entries(self, sess: _Session, why: str) -> None:
+        if sess.own:
+            self.counters[f"replay_own_turn_sticky_drop_{why}"] += len(sess.own)
+            sess.own = {}
+
     def _set_S(self, sess: _Session, S: np.ndarray) -> None:
         self.bytes += S.nbytes - sess.S.nbytes
         sess.S = S
@@ -959,6 +1059,7 @@ class SessionLedger:
         while self.bytes > self.max_bytes and self.sessions:
             sid, sess = self.sessions.popitem(last=False)
             self.bytes -= sess.S.nbytes
+            self._drop_entries(sess, "evict")
             self._close(sess, "evicted")
 
     def close_session(self, session_id: str) -> None:
@@ -967,6 +1068,7 @@ class SessionLedger:
             self.counters["close_unknown"] += 1
             return
         self.bytes -= sess.S.nbytes
+        self._drop_entries(sess, "close")
         self._close(sess, "close_session")
 
     def sweep(self, live_rids) -> None:
