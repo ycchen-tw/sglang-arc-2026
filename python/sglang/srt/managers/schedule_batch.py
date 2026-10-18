@@ -3073,6 +3073,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # state under the page-aligned node of that length: from a prefix off the
         # page grid (a session resumed at its exact end, a chunk ending mid-page)
         # it would land under a shorter node than the state belongs to.
+        # Not gated by --session-exact-resume: with the flag off this is the only
+        # behavior difference from base -- a prefill whose prefix is off the page
+        # grid no longer tracks (base tracked it and filed the state under the
+        # wrong node, silently); from a prefix on the grid nothing changes
+        # (test/registered/unit/managers/test_mamba_prefill_track_grid.py).
         mask = (
             req.extend_range.length >= checkpoint_grid
             and len(req.prefix_indices) % self.tree_cache.page_size == 0

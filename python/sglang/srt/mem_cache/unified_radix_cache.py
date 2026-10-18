@@ -3586,7 +3586,10 @@ class UnifiedRadixCache(BasePrefixCache):
         """A MAMBA cache length is where a tracked state sits, and the insert files
         the state under the page-aligned node of that length: off the page grid (a
         prefill tracked from a prefix off it) the state would land under a shorter
-        node than it belongs to, silently."""
+        node than it belongs to, silently. Not gated by --session-exact-resume:
+        since the prefill track skips prefixes off the grid
+        (ScheduleBatch._mamba_radix_cache_v2_req_prepare_for_extend), an off-grid
+        length here is a bug, flag on or off."""
         if comp.component_type != ComponentType.MAMBA or not self.enable_mamba_extra_buffer:
             return
         if cache_len % self.page_size != 0:
