@@ -116,20 +116,36 @@ def length_limit(req: "Req") -> int:
 
 
 # ---- slot lifetime (CPU, schedule time) ------------------------------------------------------------------------------
+def _unarmed_reason(req: "Req") -> Optional[str]:
+    """Why a session's request gets no exact-end slot (its finish falls back whatever the device writes), or None."""
+    if req.retraction_count > 0:
+        return "retract"  # _fallback_reason reports a retracted request's finish as retract before anything else
+    if req.grammar is not None:
+        return "grammar"  # the grammar may cut the accepted run the device sees
+    if len(stop_ids(req)) > MAX_STOP_IDS:
+        return "too_many_stop_ids"
+    return None
+
+
+def needs_slot(req: "Req") -> bool:
+    """arm_on_alloc takes an exact-end slot for ``req`` at this alloc: alloc_req_slots evicts for one more mamba slot
+    per such request."""
+    kv = req.kv
+    return (req.session_id is not None and kv.exact_end_slot is None and kv.exact_end_unarmed is None
+            and _unarmed_reason(req) is None)
+
+
 def arm_on_alloc(pool, req: "Req") -> None:
     """HybridReqToTokenPool.alloc, after the request's live and ping-pong slots: give a session's request (one with a
-    session_id) an exact-end slot, once per lifetime (a retraction ends one). alloc_req_slots evicts for one more slot
-    per request."""
+    session_id) an exact-end slot, once per lifetime (a retraction ends one; the request is not armed again)."""
     kv = req.kv
     if req.session_id is None:
         return  # the contract: only a session's requests have a next request to resume
     if kv.exact_end_slot is not None or kv.exact_end_unarmed is not None:
         return
-    if req.grammar is not None:
-        kv.exact_end_unarmed = "grammar"  # the grammar may cut the accepted run the device sees
-        return
-    if len(stop_ids(req)) > MAX_STOP_IDS:
-        kv.exact_end_unarmed = "too_many_stop_ids"
+    reason = _unarmed_reason(req)
+    if reason is not None:
+        kv.exact_end_unarmed = reason
         return
     slot = pool.mamba_allocator.alloc(1)
     if slot is None:
@@ -246,6 +262,11 @@ class SpecState:
                 values[j, 2] = length_limit(req)
                 ids = stop_ids(req)
                 values[j, 3 : 3 + len(ids)] = ids
+                # a view of the mamba allocator's free list, allocated on the schedule stream; the stack below reads
+                # it on this (the forward) stream, after the host may have dropped the last reference (release: a
+                # request whose first verify is its overshoot -- it finished in its prefill, or was retracted right
+                # after the launch): keep the block from the schedule stream's reuse until this stream's read ran
+                kv.exact_end_slot.record_stream(torch.cuda.current_stream())
                 slots.append(kv.exact_end_slot.view(()).to(torch.int64))
             else:  # not armed: the row must not keep an earlier owner's slot
                 values[j, 1] = 0
@@ -311,8 +332,15 @@ def validate_and_init(model_runner, draft_worker, scheduler_pool) -> None:
     refused = []
     if type(draft_worker) is not EAGLEWorkerV2:
         # the plan runs in run_eagle_verify, called with the target model runner's pool by EAGLEWorkerV2.verify
-        refused.append(f"the EAGLE v2 worker (NEXTN / EAGLE, with or without ARC_DFLASH_DRAFTER), not "
+        refused.append(f"the EAGLE v2 worker with the DFlash drafter (ARC_DFLASH_DRAFTER), not "
                        f"{type(draft_worker).__name__}")
+    elif not draft_worker._dflash:
+        # validated with the DFlash drafter only (its window state: arc_dflash SESSION_PARK). A native draft model
+        # (NEXTN / EAGLE) keeps state of its own across the resume -- Qwen4-Exp's MTP layer its own QSA pool and
+        # indexer, which _draft_extend_for_prefill resumes from the target's qsa_ring_resume_cpu -- and that GPU path
+        # has not been checked against a full prefill
+        refused.append(f"the DFlash drafter (ARC_DFLASH_DRAFTER): the native {spec.speculative_algorithm} draft "
+                       "model's own state on a resume (Qwen4-Exp MTP: its QSA pool and indexer) is not validated")
     if spec.speculative_eagle_topk != 1:
         refused.append("a linear draft chain (--speculative-eagle-topk 1)")
     if type(pool) is not HybridReqToTokenPool:
@@ -323,8 +351,12 @@ def validate_and_init(model_runner, draft_worker, scheduler_pool) -> None:
             refused.append("the GDN ReplaySSM circular ring (--enable-linear-replayssm-spec on a GDN model)")
         else:
             spec_state = pool.get_speculative_mamba2_params_all_layers()
-            if spec_state.temporal.dtype == torch.uint8 and not _ARC_GDN_FOLD_IN_VERIFY:
-                refused.append("ARC_GDN_FOLD_IN_VERIFY with a packed GDN state (ARC_GDN_STATE_FMT)")
+            if spec_state.temporal.dtype not in (torch.bfloat16, torch.float16):
+                # the snapshot is checked bitwise for these (scripts/arc/test_exact_end_snapshot.py, with and without
+                # ARC_GDN_FOLD_IN_VERIFY); an fp32 checkpoint (folded only when the ring fills: the window spans
+                # commits) and a packed one (ARC_GDN_STATE_FMT, its own track kernel) are not
+                refused.append(f"a 16-bit GDN checkpoint (bfloat16 / float16 temporal state, got "
+                               f"{spec_state.temporal.dtype})")
             if len(spec_state.conv) != 1 or len(spec_state.intermediate_conv_window) != 1:
                 refused.append("one conv state tensor")
     if get_schedule().enable_mixed_chunk:

@@ -195,11 +195,11 @@ def canonical(tensor):
     return torch.empty_like(tensor, memory_format=torch.contiguous_format).copy_(tensor)
 
 
-# The fewest tokens a refresh forwards (MTP3.refresh pads a shorter one after its own tokens). torch.compile
-# specializes sizes 0 and 1, and the layers slice one row off the block (GroupedConv's previous rows), so a refresh of
-# one token and one of two were each a compiled variant of their own; from three on, one dynamic graph. Padding after
-# the refresh's own tokens leaves its rows' math alone: attention is causal by position, the convolutions read earlier
-# rows, everything else is per row.
+# The fewest tokens a refresh forwards under MTP3.refresh_entry (MTP3.refresh pads a shorter one after its own
+# tokens). torch.compile specializes sizes 0 and 1, and the layers slice one row off the block (GroupedConv's previous
+# rows), so a refresh of one token and one of two were each a compiled variant of their own; from three on, one
+# dynamic graph. Padding after the refresh's own tokens leaves its rows' math alone: attention is causal by position,
+# the convolutions read earlier rows, everything else is per row.
 REFRESH_MIN = 3
 
 
@@ -215,7 +215,8 @@ def layer_view(cache):
     code objects ran past dynamo's recompile limit (8) once ARC_DFLASH_EXACT_PREFILL / SESSION_PARK added theirs: the
     variants after it ran eager. Through this view (and REFRESH_MIN) a refresh is one of two variants of the
     layers' refresh entry (Decoder.refresh_forward), with or without a prefix, which fast_drafter.warm compiles at
-    start-up."""
+    start-up. Only under MTP3.refresh_entry (ARC_DFLASH_EXACT_PREFILL); off, a refresh hands the layers the
+    caller's prefix as before."""
     if cache is None:
         return None
     return CleanCache(
@@ -573,7 +574,7 @@ class Decoder(nn.Module):
         compiled variants per code object, and a refresh's (a prefix of clean K/V, attention inlined) passed the
         guards of decode's (a ring-window prefix, a graph break at the ring attention), so a refresh could run
         decode's graphs and compile attention variants of its own mid-traffic. fast_drafter.compile_layers compiles
-        both entries."""
+        it beside forward under MTP3.refresh_entry (ARC_DFLASH_EXACT_PREFILL); off, nothing calls it."""
         return Decoder.forward(self, h, positions, prefix, prefix_positions)
 
 
@@ -651,6 +652,11 @@ class MTP3(nn.Module):
         self.hyper_connection_mixer = GatedResidual(c, combine=False)
         self.target_reducer = GatedResidual(c, combine=False).requires_grad_(False)
         self.candidate_selector = CandidateSelector(c)
+        # refresh through the layers' refresh entry (Decoder.refresh_forward), on the one prefix layout (layer_view),
+        # at least REFRESH_MIN tokens; set by fast_drafter.install, on under ARC_DFLASH_EXACT_PREFILL (whose appends,
+        # adopted windows and folds hand the layers the prefixes and lengths that ran the shared entry past dynamo's
+        # recompile limit). Off: the refresh as before, the layers' own entry on the caller's prefix and length.
+        self.refresh_entry = False
 
     def forward(self, embeddings, predecessor_gr, positions, prefix=None, *, refresh=False):
         # predecessor_gr[i] pairs with embeddings[i]: the target GR one position back. `refresh`: MTP3.refresh's
@@ -704,10 +710,14 @@ class MTP3(nn.Module):
                 raise ValueError("refresh must append each committed position exactly once")
         # Deliberately the class function, not `self(...)`: a compiled instance `forward` would specialize on the
         # prefill chunk's length, which is as long as the prompt leaves it -- we measured 10 to 30 second stalls, one
-        # per distinct prompt length, paid as time to first token. What is compiled is the layers' refresh entry
-        # (fast_drafter.compile_layers, dynamic shapes, compiled at start-up by fast_drafter.warm): it sees one layout
-        # of positions and prefix whoever produced them (layer_view), and at least REFRESH_MIN tokens -- a shorter
-        # refresh runs with dummy tokens after its own and keeps its own rows. The trace keeps the caller's layout.
+        # per distinct prompt length, paid as time to first token. Prefill runs once per request over the prompt.
+        if not self.refresh_entry:
+            hidden, new = MTP3.forward(self, self.embed_tokens(tokens), predecessor_gr, positions, prefix)
+            return hidden, append_cache(prefix, new, positions, None if retain_trace else self.config.window)
+        # refresh_entry: what is compiled is the layers' refresh entry (fast_drafter.compile_layers, dynamic shapes,
+        # compiled at start-up by fast_drafter.warm): it sees one layout of positions and prefix whoever produced
+        # them (layer_view), and at least REFRESH_MIN tokens -- a shorter refresh runs with dummy tokens after its
+        # own and keeps its own rows. The trace keeps the caller's layout.
         n = tokens.shape[1]
         pad = max(0, REFRESH_MIN - n)
         if pad:

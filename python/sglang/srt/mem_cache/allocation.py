@@ -313,9 +313,12 @@ def alloc_req_slots(
             )
         else:
             factor = MAMBA_STATE_PER_REQ_NO_CACHE
-        if req_to_token_pool.exact_end_spec is not None:
-            factor += 1  # --session-exact-resume: the end snapshot slot (speculative/exact_end.py)
         mamba_state_needed = num_reqs * factor
+        if req_to_token_pool.exact_end_spec is not None:
+            from sglang.srt.speculative import exact_end
+
+            # --session-exact-resume: the end snapshot slot of each request the pool's alloc arms (a session's)
+            mamba_state_needed += sum(exact_end.needs_slot(req) for req in reqs)
         if mamba_available_size < mamba_state_needed:
             if tree_cache is not None and tree_cache.supports_mamba():
                 mamba_num = max(0, mamba_state_needed - mamba_available_size)

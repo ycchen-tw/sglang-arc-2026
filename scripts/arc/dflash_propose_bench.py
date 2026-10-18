@@ -159,7 +159,8 @@ def _build(drafter: Path, max_batch: int, steps: int):
 
     one = SimpleNamespace(rank_in_group=0, world_size=1, ranks=[0])
     target = _StubTarget()
-    model = Wk.build_dense_drafter(drafter, torch.device("cuda"), target, drafter, one)
+    # the step as a server without ARC_DFLASH_EXACT_PREFILL builds it (MTP3.refresh_entry only adds a refresh entry)
+    model = Wk.build_dense_drafter(drafter, torch.device("cuda"), target, drafter, one, refresh_entry=False)
     # one TP2 rank's share of the head: top-k over its 124,160 rows (the group's all-gathers are left out)
     model.lm_head = heads.PairHead([(target.lm_head.weight[:SHARD], 0)], VOCAB, one)
     sparse = os.environ.setdefault("ARC_DFLASH_SPARSE_Q", "1") == "1"

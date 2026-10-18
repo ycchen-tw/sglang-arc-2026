@@ -99,8 +99,11 @@ def compile_mode(replicas: int, device) -> str:
     return value
 
 
-def install(model, replicas: int = 1, device=None):
-    """`replicas`: ranks of the attention-TP group that run this drafter in lockstep."""
+def install(model, replicas: int = 1, device=None, *, refresh_entry: bool):
+    """`replicas`: ranks of the attention-TP group that run this drafter in lockstep. `refresh_entry`
+    (ARC_DFLASH_EXACT_PREFILL): MTP3.refresh through the layers' own refresh entry, compiled beside decode's and
+    warmed at start-up (model.MTP3.refresh_entry); off, the refresh and the compiled layers are as before."""
+    model.refresh_entry = refresh_entry
     for module in model.modules():
         if isinstance(module, Attention):
             module.forward = types.MethodType(attention_forward, module)
@@ -129,9 +132,10 @@ def compile_layers(model, deterministic: bool = False):
     fp8.HummingW4A8Linear.forward = torch.compiler.disable(fp8.HummingW4A8Linear.forward)
     for layer in model.layers:
         layer.forward = torch.compile(layer.forward, dynamic=True, options=options)
-        # MTP3.refresh's entry: the same layer under its own code object, so refresh and decode variants never share
-        # (or match) one cache (model.Decoder.refresh_forward)
-        layer.refresh_forward = torch.compile(layer.refresh_forward, dynamic=True, options=options)
+        if model.refresh_entry:
+            # MTP3.refresh's entry: the same layer under its own code object, so refresh and decode variants never
+            # share (or match) one cache (model.Decoder.refresh_forward)
+            layer.refresh_forward = torch.compile(layer.refresh_forward, dynamic=True, options=options)
     model.hyper_connection_mixer.forward = torch.compile(model.hyper_connection_mixer.forward, dynamic=True,
                                                          options=options)
 
@@ -176,9 +180,10 @@ def advance(worker, states, anchor, temperature):
 
 
 def warm(worker):
-    """Before the CUDA-graph capture (whose eager warm-up compiles decode's variants): compile the refresh variants
-    (warm_refresh); nothing to compile on the eager path."""
-    if worker.model.compile_mode != "0":
+    """Before the CUDA-graph capture (whose eager warm-up compiles decode's variants): under MTP3.refresh_entry,
+    compile the refresh entry's variants (warm_refresh); nothing to compile on the eager path. Off, a refresh
+    compiles the layers' variants it needs on first use, as before."""
+    if worker.model.compile_mode != "0" and worker.model.refresh_entry:
         warm_refresh(worker.model, worker.device, worker.prefill_chunk)
     if os.environ.get("ARC_DFLASH_CHECK_FAST") == "1":
         print("DFlash fast-path check:", check(worker.model), flush=True)
@@ -192,6 +197,8 @@ def warm_refresh(model, device, chunk):
     layout, so these two are all of them; compiled here, no request waits on a compile and none falls back to eager
     past dynamo's recompile limit. Sizes as served (a `chunk`-token forward, then one after a window-wide prefix):
     the first compile's sizes are the kernels' size hints."""
+    if not model.refresh_entry:
+        raise RuntimeError("warm_refresh compiles MTP3.refresh_entry's variants; this drafter refreshes without it")
     c = model.config
     n = max(REFRESH_MIN, chunk)
     tokens = torch.zeros((1, 2 * n), dtype=torch.long, device=device)
