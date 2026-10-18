@@ -23,8 +23,8 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "managers"))
 
 from replay_own_turn_fixtures import (  # noqa: E402
-    A, B, BIG, END, EOS, GEN_START, NEXT, PAD, PROMPT, REPLY, REPLY_TEXT, SHAPES, TOK, RouteCases, SessionCases, ToyChat,
-    enc, expected, recv, shape)
+    A, B, BIG, CLOSURE, END, EOS, GEN_START, NEXT, NL, PAD, PROMPT, REPLY, REPLY_TEXT, SHAPES, TOK, UNTHINK, RouteCases,
+    SessionCases, ToyChat, client, enc, expected, recv, shape)
 
 from sglang.srt.mem_cache import qsa_hisparse_session_cache as sc  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
@@ -311,7 +311,8 @@ class HiSparseRouteTest(RouteCases, unittest.TestCase):
 
     def test_own_turn_ends_at_the_generation_not_at_the_draft_ids(self):
         """The same record diverging inside the generation: own-turn replaces the message through the stop (or the
-        cut), the draft ids past it are not copied, and the replay goes on to the next message as usual."""
+        cut), the draft ids past it are not copied, and the replay ends there (past the generation the record holds
+        only draft ids)."""
         for name in ("malformed_call_stop", "tool_call_cut", "think_cut_prefix"):
             with self.subTest(name):
                 record, key, closure = shape(name)
@@ -321,6 +322,47 @@ class HiSparseRouteTest(RouteCases, unittest.TestCase):
                 (span,) = got.spans
                 self.assertEqual(span["rec_end"], len(record) - 1 if record[-1] in EOS else len(record))
                 self.assertEqual(got.stats["replay_own_turn"], 1)
+
+    def test_draft_ids_with_the_closure_text_after_a_cut_do_not_replay_over_the_takeover(self):
+        """A length cut inside thinking takes the template closure, and the last verify accepted draft ids past the
+        cut whose text is exactly the closure's, split another way (\n </think> \n \n for the closure's
+        \n </think> \n\n). The takeover is the last generation's last message and past gen_end the record holds only
+        draft ids the client never saw, so the replay ends with it. (Review, 10-18: the loop went on at the same
+        message, whose texts now agreed, replayed the record's ids with the draft ids over the takeover, and _carry
+        raised in the scheduler.) The request gets the record's message, the closure, the client's rest; its entry
+        is the takeover and is held by those ids."""
+        gen, rendered, closure = SHAPES["think_cut_not_prefix"]
+        record = PROMPT + gen
+        key = client(rendered)
+        for draft in ([NL, UNTHINK, NL, NL], list(CLOSURE), []):
+            with self.subTest(draft=draft):
+                self.assertEqual(TOK.decode(draft), TOK.decode(CLOSURE) if draft else "")
+                cache = hisparse_cache(record + draft, GEN_START, True, gen_end=len(record))
+                r = recv(key)
+                got = outcome(cache.stats, replay_logged(cache, r, BIG), r)
+                self.assertEqual(got.ids, expected(record, closure))
+                self.assertEqual([s.get("kind") for s in got.spans], ["own_turn"])
+                rid, entries, n_taken = cache._own_intake["s"]
+                (entry,) = entries.values()
+                self.assertEqual((rid, n_taken, entry.end), (r.rid, 1, len(record) + len(closure)))
+                self.assertTrue(entry.held_by(np.asarray(got.ids)))
+                self.assertNotIn("replay_text_differs", got.stats)
+
+    def test_a_takeover_with_draft_ids_after_it_counts_nothing_else(self):
+        """The same root in the counters: a takeover that ends on a stop or at a cut, with draft ids past the
+        generation, went on into the draft ids and counted replay_text_differs + replay_own_turn_skip_after_generation
+        (or replay_skip_stop, for a generation that ended on <|endoftext|>) on the takeover request. hs-on3's
+        text_differs 99 = after_generation 99 included such requests."""
+        for name in ("malformed_call_stop", "malformed_call_eot", "tool_call_cut", "think_cut_prefix",
+                     "think_cut_not_prefix"):
+            for draft in (enc("x"), TOK.encode("\n<|im_start|><|im_start|>")):
+                with self.subTest(name=name, draft=draft):
+                    record, key, closure = shape(name)
+                    got = self.go(record + draft, key, gen_end=len(record))
+                    self.assertEqual(got.ids, expected(record, closure))
+                    self.assertEqual(got.stats["replay_own_turn"], 1)
+                    for k in ("replay_text_differs", "replay_own_turn_skip_after_generation", "replay_skip_stop"):
+                        self.assertNotIn(k, got.stats)
 
     def test_a_record_without_gen_end_raises(self):
         record, key, _ = shape("think_cut_prefix")

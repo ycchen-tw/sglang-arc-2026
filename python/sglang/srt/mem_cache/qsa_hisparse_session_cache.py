@@ -485,7 +485,8 @@ class QSAHiSparseSessionCache(ChunkCache):
         when it is the record's last generated message (replay_own_turn.own_turn_replacement,
         the generation starting at rec.prompt_len): its ids become the record's message plus a
         closure; the span gets kind own_turn, closure, client_len and client_sha256 (counted
-        as replay_own_turn / replay_own_turn_closure). A message at one of the record's entries
+        as replay_own_turn / replay_own_turn_closure), and the replay ends there (past the
+        generation the record holds only draft ids). A message at one of the record's entries
         (an earlier takeover) gets the record's ids again when the client sent the same ids
         (span kind own_turn, sticky true, closure 0; replay_own_turn_sticky); other ids drop
         the entry (replay_own_turn_sticky_drop_client). Otherwise it stops as
@@ -579,7 +580,7 @@ class QSAHiSparseSessionCache(ChunkCache):
                     self.stats["replay_skip_mm_overlap"] += 1
                     break
             text = self.replay_decode(toks[start:rec_end].tolist())
-            extra, rep = None, toks[start:rec_end]
+            extra, rep, took_over = None, toks[start:rec_end], False
             if text != self.replay_decode(new[start:key_end].tolist()) or "\ufffd" in text:
                 entry = rec.own.get(start) if self.replay_own_turn is not None else None
                 sticky = None
@@ -613,6 +614,7 @@ class QSAHiSparseSessionCache(ChunkCache):
                         self.stats["replay_skip_mm_overlap"] += 1  # the closure holds a multimodal token
                         break
                     taken.append(own.entry)
+                    took_over = True
             delta = len(rep) - (key_end - start)
             if pos is not None and delta:
                 seg = pos[:, start:key_end]
@@ -640,6 +642,12 @@ class QSAHiSparseSessionCache(ChunkCache):
             nxt = _lcp(new, toks)
             if nxt < rec_end:  # own-turn after a cut: rec_end is the generation's end
                 raise RuntimeError(f"{recv_req.rid}: replayed message [{start}, {rec_end}) still diverges at {nxt}")
+            if took_over:
+                # the takeover is the last generation's last message: past gen_end the record holds only the
+                # draft ids the last verify accepted, which the client never got, so nothing more replays (going
+                # on would compare them with the client's ids, and replay them over the takeover where their text
+                # equals the closure's)
+                break
             lcp = nxt
             if lcp < min(len(new), len(toks)) and lcp < len(toks) - 1 and np.isin(toks[lcp], stop):
                 self.stats["replay_skip_stop"] += 1
