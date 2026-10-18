@@ -68,7 +68,8 @@ def _ring_attn_kernel(
         c = start + tl.arange(0, BLOCK_N)
         c_ok = c < ncols
         kpos = tl.load(POS + b * s_posb + c, mask=c_ok, other=-1)
-        k = tl.load(kbase + c[:, None] * s_pc + d[None, :], mask=c_ok[:, None], other=0.0)
+        # widened to the query dtype: a no-op for a BF16 pool, exact for an FP8 one (ARC_DFLASH_KV_DTYPE)
+        k = tl.load(kbase + c[:, None] * s_pc + d[None, :], mask=c_ok[:, None], other=0.0).to(q.dtype)
         s = tl.dot(q, tl.trans(k)).to(tl.float32) * scale
         dist = qpos[:, None] - kpos[None, :]
         ok = (kpos[None, :] >= 0) & (dist >= 0) & (dist < window) & row_ok[:, None]
@@ -77,7 +78,7 @@ def _ring_attn_kernel(
         p = tl.where(ok, tl.exp(s - m_new[:, None]), 0.0)
         alpha = tl.exp(m_i - m_new)
         l_i = l_i * alpha + tl.sum(p, 1)
-        v = tl.load(vbase + c[:, None] * s_pc + d[None, :], mask=c_ok[:, None], other=0.0)
+        v = tl.load(vbase + c[:, None] * s_pc + d[None, :], mask=c_ok[:, None], other=0.0).to(q.dtype)
         acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
         m_i = m_new
     # the block's own keys (not in the pool yet)
@@ -193,6 +194,9 @@ def attend(q, k, v, positions, key: RingWindow, value: RingWindow, key_positions
     hkv = k.shape[1]
     if key.pool.shape != value.pool.shape or key.idx is not value.idx or key.columns != value.columns:
         raise ValueError("key and value windows must be the same pool layout and batch")
+    if key.pool.dtype not in (q.dtype, torch.float8_e4m3fn) or k.dtype != q.dtype or v.dtype != q.dtype:
+        raise ValueError(f"pool {key.pool.dtype} / block {k.dtype}, {v.dtype} vs query {q.dtype}: the pool is the "
+                         "query dtype or e4m3, the block's own K/V the query dtype")
     if key.pool.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
         raise ValueError("head dim must be contiguous")
     if key_positions.shape != (batch, key.columns) or positions.shape != (batch, n) or key.idx.shape != (batch,):

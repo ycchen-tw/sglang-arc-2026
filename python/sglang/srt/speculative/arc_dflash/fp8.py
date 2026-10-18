@@ -2,8 +2,11 @@
 
 The layout and GEMM are the target's online block FP8 (arc_online_fp8, patch 0032): sglang's Fp8LinearMethod for
 block quant with dynamic per-token-group activation quant. No new kernel. The block GEMM sglang dispatches to is
-pinned per device generation, the two measured paths: CUTLASS on sm_120 (G4, as 0032), Triton on sm_89 (L4, as the
-target's ARC_HC_ONLINE_FP8 there). Anything else raises.
+pinned per device generation, the measured paths: CUTLASS on sm_120 (G4, as 0032), Triton on sm_89 (L4, as the
+target's ARC_HC_ONLINE_FP8 there), and on sm_100 (B200) the FlashInfer TRTLLM groupwise GEMM that
+--fp8-gemm-backend flashinfer_trtllm selects (the INT3 W3A8 deployment's dense block FP8; fp32 scales, the same
+quantization as CUTLASS -- it falls back to Triton for K < 256) or Triton. DeepGEMM, sglang's auto pick on sm_100,
+re-quantizes the scales to UE8M0 at load and so computes something G4 does not: it raises like anything else.
 """
 
 import json
@@ -26,11 +29,14 @@ def _method(device):
         raise RuntimeError(f"Fp8LinearMethod is not plain block FP8 here (block_quant={method.block_quant}, "
                            f"marlin={method.use_marlin}, mxfp8={method.use_mxfp8})")
     capability = torch.cuda.get_device_capability(device)
-    want = {(12, 0): fp8_utils.cutlass_w8a8_block_fp8_linear_with_fallback,
-            (8, 9): fp8_utils.triton_w8a8_block_fp8_linear}.get(capability)
-    if want is None or method.w8a8_block_fp8_linear is not want:
+    sm100 = (fp8_utils.flashinfer_gemm_w8a8_block_fp8_linear_with_fallback, fp8_utils.triton_w8a8_block_fp8_linear)
+    want = {(12, 0): (fp8_utils.cutlass_w8a8_block_fp8_linear_with_fallback,),
+            (8, 9): (fp8_utils.triton_w8a8_block_fp8_linear,),
+            (10, 0): sm100, (10, 3): sm100}.get(capability, ())
+    if method.w8a8_block_fp8_linear not in want:
         raise RuntimeError(f"block-FP8 dispatch on sm_{capability[0]}{capability[1]} is "
-                           f"{method.w8a8_block_fp8_linear.__name__}; measured paths: CUTLASS on sm_120, Triton on sm_89")
+                           f"{method.w8a8_block_fp8_linear.__name__}; measured paths: CUTLASS on sm_120, Triton on sm_89, "
+                           "FlashInfer TRTLLM (--fp8-gemm-backend flashinfer_trtllm) or Triton on sm_100")
     return method
 
 
