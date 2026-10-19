@@ -3,11 +3,17 @@ the torch implementations are the fallback and the reference."""
 
 import math
 import os
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
 from sglang.srt.environ import envs
+
+# Opt-in (ARC_QSA_LOG_SHAPES=1): one line per distinct decode / verify MQA dispatch shape
+# (rows, query heads, window, group, kernel heads, path), logged on first sight -- under
+# CUDA graphs that is the capture pass, so the log shows what every graph replays.
+_ARC_QSA_LOG_SHAPES = os.environ.get("ARC_QSA_LOG_SHAPES", "0") == "1"
+_ARC_QSA_SEEN_SHAPES: set = set()
 
 # Group 8 needs the same crossover treatment group 2 got: it beats group 4 by
 # 1.10-1.30x from about 128 rows up (B=16/30/64/110 at ctx 8.1k and 32.1k) and
@@ -88,6 +94,55 @@ def _grouped_qsa_effective_min_rows(
         return None
     scaled = math.ceil(configured_min_rows * scale)
     return math.ceil(scaled / queries_per_request) * queries_per_request
+
+
+
+def _env_flag(name: str, default: str) -> bool:
+    value = os.environ.get(name, default)
+    if value not in ("0", "1"):
+        raise ValueError(f"{name} must be 0 or 1, got {value!r}")
+    return value == "1"
+
+
+# arc-forge kverify, both speed-only (the logits are the per-row kernel's, bit for bit):
+# ARC_QSA_GROUPED_VERIFY_PAD: a verify window no supported group divides (5, 6 and 7 -- DFlash
+#   K5/K7 used to fall back to the per-row kernel, K6 to groups of two) runs as one CTA per
+#   request with the GEMM widened to the next supported width; the extra query columns are
+#   zeros that are never stored.
+# ARC_QSA_GROUPED_UNPAD_HEADS: the decode Q producer (qsa_index_q_norm_rope_store) zero-pads
+#   the index heads to 8 for the per-row kernel; the grouped kernel reads only the real heads
+#   (0026's intent, which the fused producer had undone: the grouped GEMM was half zeros).
+_ARC_QSA_GROUPED_VERIFY_PAD = _env_flag("ARC_QSA_GROUPED_VERIFY_PAD", "1")
+_ARC_QSA_GROUPED_UNPAD_HEADS = _env_flag("ARC_QSA_GROUPED_UNPAD_HEADS", "1")
+
+
+def _qsa_verify_grouped_plan(
+    window: Optional[int],
+    rows: int,
+    configured_min_rows: int = 0,
+    pad: bool = True,
+) -> Optional[Tuple[int, int]]:
+    """(stride, mma) for the grouped verify kernel, or None for the per-row kernel.
+
+    stride is the CTA's rows of the request-major layout and mma the GEMM's query width.
+    Exact: the widest supported group dividing the window that clears its floor
+    (stride = mma = group, see ``_qsa_verify_group_size``). Padded (``pad``): one CTA per
+    request (stride = window, mma = the smallest supported width above it), taken when the
+    exact choice would read each request's compressed K more than once -- K6 as groups of
+    two reads it three times, K5 / K7 per row five / seven times -- and the batch clears the
+    padded width's floor counted in requests (the floor is about how many CTAs there are,
+    and both layouts launch one per request).
+    """
+    exact = _qsa_verify_group_size(window, rows, configured_min_rows)
+    if not window or window < 2 or exact == window or not pad:
+        return (exact, exact) if exact else None
+    wider = [g for g in sorted(_GROUPED_QSA_MIN_ROWS_SCALE) if g > window]
+    if wider:
+        mma = wider[0]
+        floor_rows = _grouped_qsa_effective_min_rows(mma, configured_min_rows)
+        if rows // window >= floor_rows // mma:
+            return (window, mma)
+    return (exact, exact) if exact else None
 
 
 try:
@@ -464,6 +519,8 @@ if HAS_TILELANG:
         num_stages: int = 3,
         threads: int = 128,
         min_blocks_per_sm: int = 0,
+        mma_queries: int = 0,
+        in_heads: int = 0,
     ):
         """Speculative paged MQA that loads each request's K tile only once.
 
@@ -472,8 +529,23 @@ if HAS_TILELANG:
         increasing context lengths. Widening the GEMM across those queries
         removes duplicate K-cache traffic without changing the MMA reduction
         order per output.
+
+        arc-forge kverify: ``queries_per_request`` is the CTA's row stride (its
+        rows of the request-major layout) and ``mma_queries`` (0 = the same) the
+        GEMM's query width. A window that no supported width divides (5, 6, 7)
+        runs with mma_queries the next supported width: the extra query columns
+        are zeros and are never stored. ``in_heads`` (0 = ``heads``) is the head
+        count of Q as laid out in memory; only its first ``heads`` enter the GEMM
+        (the decode producer zero-pads the 4 index heads to 8 for the per-row
+        kernel, which the grouped kernel does not need). With both at their
+        defaults the generated kernel is the pre-kverify one.
         """
 
+        mma_queries = mma_queries or queries_per_request
+        in_heads = in_heads or heads
+        assert mma_queries >= queries_per_request, (mma_queries, queries_per_request)
+        assert in_heads >= heads, (in_heads, heads)
+        direct_q = mma_queries == queries_per_request and in_heads == heads
         GROUP = 64
         assert GROUP % page_size == 0, page_size
         sub_pages = GROUP // page_size
@@ -484,7 +556,7 @@ if HAS_TILELANG:
 
         @T.prim_func
         def kernel(
-            Q: T.Tensor([batch * heads, head_dim], T.bfloat16),  # type: ignore
+            Q: T.Tensor([batch * in_heads, head_dim], T.bfloat16),  # type: ignore
             KCache: T.Tensor([pages, page_size, 1, head_dim], T.bfloat16),  # type: ignore
             PageTable: T.Tensor([batch, max_pages], T.int32),  # type: ignore
             ContextLens: T.Tensor([batch], T.int32),  # type: ignore
@@ -500,19 +572,27 @@ if HAS_TILELANG:
                     T.annotate_min_blocks_per_sm(min_blocks_per_sm)
                 row_base = request * queries_per_request
                 q_shared = T.alloc_shared(
-                    [queries_per_request * heads, head_dim], T.bfloat16
+                    [mma_queries * heads, head_dim], T.bfloat16
                 )
                 k_shared = T.alloc_shared([GROUP, head_dim], T.bfloat16)
                 scores = T.alloc_fragment(
-                    [GROUP, queries_per_request * heads], T.float32
+                    [GROUP, mma_queries * heads], T.float32
                 )
                 scores_3d = T.reshape(
-                    scores, (GROUP, queries_per_request, heads)
+                    scores, (GROUP, mma_queries, heads)
                 )
                 reduced = T.alloc_fragment(
-                    [GROUP, queries_per_request], T.float32
+                    [GROUP, mma_queries], T.float32
                 )
-                T.copy(Q[row_base * heads, 0], q_shared)
+                if direct_q:
+                    T.copy(Q[row_base * heads, 0], q_shared)
+                else:
+                    for column, d in T.Parallel(mma_queries * heads, head_dim):
+                        q_shared[column, d] = T.if_then_else(
+                            column < queries_per_request * heads,
+                            Q[(row_base + column // heads) * in_heads + column % heads, d],
+                            T.cast(0, T.bfloat16),
+                        )
                 # Speculative paged row lengths are monotonic within a request.
                 context_max = ContextLens[
                     row_base + queries_per_request - 1
@@ -545,19 +625,26 @@ if HAS_TILELANG:
                             policy=T.GemmWarpPolicy.FullCol,
                         )
                         for token, query, head in T.Parallel(
-                            GROUP, queries_per_request, heads
+                            GROUP, mma_queries, heads
                         ):
                             scores_3d[token, query, head] = T.max(
                                 scores_3d[token, query, head], 0.0
                             )
                         T.reduce_sum(scores_3d, reduced, dim=2, clear=True)
                         for token, query in T.Parallel(
-                            GROUP, queries_per_request
+                            GROUP, mma_queries
                         ):
-                            row = row_base + query
-                            position = group * GROUP + token
-                            if position < ContextLens[row]:
-                                Logits[row, position] = reduced[token, query] / Scale
+                            if mma_queries == queries_per_request:
+                                row = row_base + query
+                                position = group * GROUP + token
+                                if position < ContextLens[row]:
+                                    Logits[row, position] = reduced[token, query] / Scale
+                            else:
+                                if query < queries_per_request:
+                                    row = row_base + query
+                                    position = group * GROUP + token
+                                    if position < ContextLens[row]:
+                                        Logits[row, position] = reduced[token, query] / Scale
 
         return kernel
 
@@ -670,7 +757,15 @@ if HAS_TILELANG:
         num_stages: int = 3,
         threads: int = 128,
         min_blocks_per_sm: int = 0,
+        mma_queries: int = 0,
+        in_heads: int = 0,
     ):
+        # arc-forge kverify: mma_queries / in_heads as in the BF16 grouped kernel
+        mma_queries = mma_queries or queries_per_request
+        in_heads = in_heads or heads
+        assert mma_queries >= queries_per_request, (mma_queries, queries_per_request)
+        assert in_heads >= heads, (in_heads, heads)
+        direct_q = mma_queries == queries_per_request and in_heads == heads
         GROUP = 64
         assert GROUP % page_size == 0, page_size
         sub_pages = GROUP // page_size
@@ -681,8 +776,8 @@ if HAS_TILELANG:
 
         @T.prim_func
         def kernel(
-            Q: T.Tensor([batch * heads, head_dim], T.float8_e4m3fn),  # type: ignore
-            QScale: T.Tensor([batch * heads], T.float32),  # type: ignore
+            Q: T.Tensor([batch * in_heads, head_dim], T.float8_e4m3fn),  # type: ignore
+            QScale: T.Tensor([batch * in_heads], T.float32),  # type: ignore
             KCache: T.Tensor([pages, page_size, 1, head_dim], T.float8_e4m3fn),  # type: ignore
             KScale: T.Tensor([pages, page_size], T.float32),  # type: ignore
             PageTable: T.Tensor([batch, max_pages], T.int32),  # type: ignore
@@ -699,21 +794,35 @@ if HAS_TILELANG:
                     T.annotate_min_blocks_per_sm(min_blocks_per_sm)
                 row_base = request * queries_per_request
                 q_shared = T.alloc_shared(
-                    [queries_per_request * heads, head_dim], T.float8_e4m3fn
+                    [mma_queries * heads, head_dim], T.float8_e4m3fn
                 )
                 k_shared = T.alloc_shared([GROUP, head_dim], T.float8_e4m3fn)
-                q_scale = T.alloc_fragment([queries_per_request * heads], T.float32)
+                q_scale = T.alloc_fragment([mma_queries * heads], T.float32)
                 scores = T.alloc_fragment(
-                    [GROUP, queries_per_request * heads], T.float32
+                    [GROUP, mma_queries * heads], T.float32
                 )
                 scores_3d = T.reshape(
-                    scores, (GROUP, queries_per_request, heads)
+                    scores, (GROUP, mma_queries, heads)
                 )
                 reduced = T.alloc_fragment(
-                    [GROUP, queries_per_request], T.float32
+                    [GROUP, mma_queries], T.float32
                 )
-                T.copy(Q[row_base * heads, 0], q_shared)
-                T.copy(QScale[row_base * heads], q_scale)
+                if direct_q:
+                    T.copy(Q[row_base * heads, 0], q_shared)
+                    T.copy(QScale[row_base * heads], q_scale)
+                else:
+                    for column, d in T.Parallel(mma_queries * heads, head_dim):
+                        q_shared[column, d] = T.if_then_else(
+                            column < queries_per_request * heads,
+                            Q[(row_base + column // heads) * in_heads + column % heads, d],
+                            T.cast(0, T.float8_e4m3fn),
+                        )
+                    for column in T.Parallel(mma_queries * heads):
+                        q_scale[column] = T.if_then_else(
+                            column < queries_per_request * heads,
+                            QScale[(row_base + column // heads) * in_heads + column % heads],
+                            T.float32(0),
+                        )
                 context_max = ContextLens[
                     row_base + queries_per_request - 1
                 ]
@@ -745,26 +854,40 @@ if HAS_TILELANG:
                             policy=T.GemmWarpPolicy.FullCol,
                         )
                         for token, column in T.Parallel(
-                            GROUP, queries_per_request * heads
+                            GROUP, mma_queries * heads
                         ):
                             scores[token, column] = (
                                 T.max(scores[token, column], 0.0) * q_scale[column]
                             )
                         T.reduce_sum(scores_3d, reduced, dim=2, clear=True)
                         for token, query in T.Parallel(
-                            GROUP, queries_per_request
+                            GROUP, mma_queries
                         ):
-                            row = row_base + query
-                            position = group * GROUP + token
-                            if position < ContextLens[row]:
-                                Logits[row, position] = (
-                                    reduced[token, query]
-                                    * KScale[
-                                        PageTable[row_base, position // page_size],
-                                        position % page_size,
-                                    ]
-                                    / Scale
-                                )
+                            if mma_queries == queries_per_request:
+                                row = row_base + query
+                                position = group * GROUP + token
+                                if position < ContextLens[row]:
+                                    Logits[row, position] = (
+                                        reduced[token, query]
+                                        * KScale[
+                                            PageTable[row_base, position // page_size],
+                                            position % page_size,
+                                        ]
+                                        / Scale
+                                    )
+                            else:
+                                if query < queries_per_request:
+                                    row = row_base + query
+                                    position = group * GROUP + token
+                                    if position < ContextLens[row]:
+                                        Logits[row, position] = (
+                                            reduced[token, query]
+                                            * KScale[
+                                                PageTable[row_base, position // page_size],
+                                                position % page_size,
+                                            ]
+                                            / Scale
+                                        )
 
         return kernel
 
@@ -892,9 +1015,12 @@ def tilelang_qsa_mqa_decode(
     verify_queries_per_request: Optional[int] = None,
     fill_invalid_tail: bool = True,
     k_scale: Optional[torch.Tensor] = None,
+    valid_heads: Optional[int] = None,
 ) -> torch.Tensor:
     """Validated TileLang paged decode kernel with weights removed; k_scale (arc-forge h21)
-    selects the FP8 kernels: k_cache float8_e4m3fn, k_scale [pages, page_size] fp32."""
+    selects the FP8 kernels: k_cache float8_e4m3fn, k_scale [pages, page_size] fp32.
+    valid_heads (arc-forge kverify): q's heads from valid_heads on are the producer's zero
+    padding; the grouped kernel skips them."""
 
     if not HAS_TILELANG:
         raise RuntimeError("TileLang is unavailable")
@@ -945,40 +1071,70 @@ def tilelang_qsa_mqa_decode(
         rows = q.shape[0]
         groups_per_cta = 1 if rows <= 8 else 2 if rows <= 24 else 4
     configured_min_rows = envs.SGLANG_QSA_GROUPED_VERIFY_MIN_ROWS.get()
-    grouped_size = _qsa_verify_group_size(
-        verify_queries_per_request, q.shape[0], configured_min_rows
-    )
-    grouped_min_rows = _grouped_qsa_effective_min_rows(grouped_size, configured_min_rows)
-    use_grouped_verify = (
+    if valid_heads is not None and not 0 < valid_heads <= query_heads:
+        raise ValueError(f"valid_heads {valid_heads} outside 1..{query_heads}")
+    plan = None
+    if (
         envs.SGLANG_QSA_GROUPED_VERIFY.get()
-        and grouped_min_rows is not None
-        and q.shape[0] >= grouped_min_rows
-        # The producer's row layout is still checked against the *window*
-        # width; the sub-group only subdivides a window that is already
-        # request-major.
+        and verify_queries_per_request
+        # The producer's row layout is checked against the *window* width; a
+        # sub-group only subdivides a window that is already request-major.
         and q.shape[0] % verify_queries_per_request == 0
-    )
+    ):
+        plan = _qsa_verify_grouped_plan(
+            verify_queries_per_request, q.shape[0], configured_min_rows,
+            pad=_ARC_QSA_GROUPED_VERIFY_PAD,
+        )
+    use_grouped_verify = plan is not None
     # The validated MMA layout requires N (the Q-head dimension) to be a
     # multiple of eight, and for the per-row kernel N *is* `heads`, so 4 index
     # heads have to be zero-padded to 8. The grouped kernel's N is
-    # `queries_per_request * heads`, which at the supported group sizes is
-    # already a multiple of eight -- there the pad only buys a torch.cat per
-    # call and a GEMM half of whose columns are zeros. Measured on B200 at
-    # ctx 96,000 / B=110: 356 -> 231 us, logits bitwise identical.
-    if use_grouped_verify and (grouped_size * query_heads) % 8 == 0:
-        kernel_heads = query_heads
+    # `mma * heads`, which at the supported widths is already a multiple of
+    # eight -- there the pad only buys a GEMM half of whose columns are zeros.
+    # Measured on B200 at ctx 96,000 / B=110: 356 -> 231 us, logits bitwise
+    # identical. memory_heads is q's head count once handed to a kernel,
+    # kernel_heads the heads the GEMM uses.
+    mma_heads = query_heads
+    if use_grouped_verify and valid_heads is not None and _ARC_QSA_GROUPED_UNPAD_HEADS:
+        mma_heads = valid_heads
+    if use_grouped_verify and (plan[1] * mma_heads) % 8 == 0:
+        memory_heads, kernel_heads = query_heads, mma_heads
     else:
-        kernel_heads = max(8, ((query_heads + 7) // 8) * 8)
+        memory_heads = kernel_heads = max(8, ((query_heads + 7) // 8) * 8)
+    if _ARC_QSA_LOG_SHAPES:
+        key = (int(q.shape[0]), int(query_heads), verify_queries_per_request, plan,
+               int(kernel_heads), int(memory_heads), k_scale is not None)
+        if key not in _ARC_QSA_SEEN_SHAPES:
+            _ARC_QSA_SEEN_SHAPES.add(key)
+            import logging
+            logging.getLogger(__name__).info(
+                "ARC_QSA_SHAPE rows=%d q_heads=%d window=%s plan=%s kernel_heads=%d "
+                "memory_heads=%d fp8=%s", *key)
     q_kernel = q.to(torch.bfloat16)
-    if kernel_heads != query_heads:
+    if memory_heads != query_heads:
         # Zero-padding preserves the weight-free head sum.
         q_kernel = torch.cat(
             [
                 q_kernel,
-                q_kernel.new_zeros(q.shape[0], kernel_heads - query_heads, head_dim),
+                q_kernel.new_zeros(q.shape[0], memory_heads - query_heads, head_dim),
             ],
             dim=1,
         )
+    if use_grouped_verify:
+        stride, mma = plan
+        grouped_kwargs = dict(
+            heads=kernel_heads,
+            head_dim=head_dim,
+            page_size=page_size,
+            queries_per_request=stride,
+            groups_per_cta=groups_per_cta,
+            min_blocks_per_sm=_ARC_QSA_INDEXER_MIN_BLOCKS_PER_SM,
+        )
+        # 0 = the pre-kverify kernel (same jit key, same code) whenever nothing is padded
+        if mma != stride:
+            grouped_kwargs["mma_queries"] = mma
+        if memory_heads != kernel_heads:
+            grouped_kwargs["in_heads"] = memory_heads
     tail_args = (
         page_table.to(device=q.device, dtype=torch.int32).contiguous(),
         context_lens.to(device=q.device, dtype=torch.int32).contiguous(),
@@ -989,15 +1145,9 @@ def tilelang_qsa_mqa_decode(
         # arc-forge h21: FP8 x FP8; padded heads are zero rows (scale 1, all-zero e4m3)
         q8, q_scale = quantize_qsa_index_q_fp8(q_kernel.contiguous())
         if use_grouped_verify:
-            _tilelang_qsa_mqa_grouped_verify_fp8_kernel(
-                heads=kernel_heads,
-                head_dim=head_dim,
-                page_size=page_size,
-                queries_per_request=grouped_size,
-                groups_per_cta=groups_per_cta,
-                min_blocks_per_sm=_ARC_QSA_INDEXER_MIN_BLOCKS_PER_SM,
-            )(q8.view(-1, head_dim), q_scale.view(-1), k_cache.contiguous(),
-              k_scale.contiguous(), *tail_args)
+            _tilelang_qsa_mqa_grouped_verify_fp8_kernel(**grouped_kwargs)(
+                q8.view(-1, head_dim), q_scale.view(-1), k_cache.contiguous(),
+                k_scale.contiguous(), *tail_args)
         else:
             _tilelang_qsa_mqa_decode_fp8_kernel(
                 heads=kernel_heads,
@@ -1008,14 +1158,8 @@ def tilelang_qsa_mqa_decode(
         return logits
     kernel_args = (k_cache.to(torch.bfloat16).contiguous(), *tail_args)
     if use_grouped_verify:
-        _tilelang_qsa_mqa_grouped_verify_kernel(
-            heads=kernel_heads,
-            head_dim=head_dim,
-            page_size=page_size,
-            queries_per_request=grouped_size,
-            groups_per_cta=groups_per_cta,
-            min_blocks_per_sm=_ARC_QSA_INDEXER_MIN_BLOCKS_PER_SM,
-        )(q_kernel.contiguous().view(-1, head_dim), *kernel_args)
+        _tilelang_qsa_mqa_grouped_verify_kernel(**grouped_kwargs)(
+            q_kernel.contiguous().view(-1, head_dim), *kernel_args)
     else:
         _tilelang_qsa_mqa_decode_kernel(
             heads=kernel_heads,
@@ -1091,6 +1235,7 @@ def qsa_mqa_decode(
     verify_queries_per_request: Optional[int] = None,
     fill_invalid_tail: bool = True,
     k_scale: Optional[torch.Tensor] = None,
+    valid_heads: Optional[int] = None,
 ) -> torch.Tensor:
     if q.is_cuda and HAS_TILELANG:
         return tilelang_qsa_mqa_decode(
@@ -1103,6 +1248,7 @@ def qsa_mqa_decode(
             verify_queries_per_request,
             fill_invalid_tail,
             k_scale,
+            valid_heads,
         )
     return torch_qsa_mqa_decode(
         q, k_cache, page_table, context_lens, max_model_len, score_scale, k_scale
