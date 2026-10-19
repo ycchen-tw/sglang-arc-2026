@@ -867,20 +867,35 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
         )
 
     output_shape = [*input.shape[:-1], weight.shape[0]]
+    m = input_2d.shape[0]
 
-    # TRTLLM uses the existing SGLang column-major scale layout.
-    # CUTLASS with scale_major_mode="MN" expects (k//block_k, m), so we normalize below.
-    q_input, x_scale = sglang_per_token_group_quant_fp8(
-        input_2d, block_size[1], column_major_scales=(backend == "trtllm")
-    )
+    if backend == "cutlass":
+        # CUTLASS groupwise with scale_major_mode="MN" expects A scales as (k//block_k, m), and above 32 rows
+        # can_implement rejects an m that is not a multiple of 4 (33-35, 37, 94, ...: a K=5/6 verify batch is 5/6
+        # rows a request). Quantize into row-padded buffers instead: the scale buffer is column-major, so its
+        # transpose is the MN-major layout without a copy; the pad rows are zero and the output is sliced back to m
+        # (rows are independent, so the m real rows are bit-exact with the unpadded GEMM).
+        q_input, x_scale = sglang_per_token_group_quant_fp8_row_padded(
+            input_2d, block_size[1], row_alignment=4
+        )
+        assert q_input.shape[0] % 4 == 0 and q_input.shape[0] >= m, (
+            f"FlashInfer CUTLASS groupwise FP8 needs rows padded to 4, got {tuple(q_input.shape)} for m={m}"
+        )
+        x_scale = x_scale.transpose(-1, -2)
+    else:
+        # TRTLLM uses the existing SGLang column-major scale layout.
+        q_input, x_scale = sglang_per_token_group_quant_fp8(
+            input_2d, block_size[1], column_major_scales=True
+        )
     if backend == "cutlass":
         block_n, block_k = block_size
-        m, k = input_2d.shape
+        m_pad, k = q_input.shape
         n = weight.shape[0]
-        expected_x_scale_shape = (k // block_k, m)
+        expected_x_scale_shape = (k // block_k, m_pad)
         expected_weight_scale_shape = (k // block_k, n // block_n)
-        if x_scale.shape == (m, k // block_k):
-            x_scale = x_scale.transpose(-1, -2).contiguous()
+        assert x_scale.is_contiguous(), (
+            f"padded A scales are not MN-major: shape {tuple(x_scale.shape)} strides {x_scale.stride()}"
+        )
         if weight_scale.shape == (n // block_n, k // block_k):
             weight_scale = weight_scale.transpose(-1, -2).contiguous()
         assert x_scale.shape == expected_x_scale_shape, (
@@ -913,6 +928,8 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
         weight_scale,
         out_dtype=input_2d.dtype,
     )
+    if output.shape[0] != m:
+        output = output[:m]
 
     if bias is not None:
         output += bias
