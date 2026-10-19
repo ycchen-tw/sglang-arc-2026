@@ -58,7 +58,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
-from sglang.srt.runtime_context import get_mm, get_parallel, get_serving
+from sglang.srt.runtime_context import get_disagg, get_mm, get_parallel, get_serving
 from sglang.srt.utils import cpu_has_amx_support, is_cpu
 from sglang.srt.utils.common import VideoData
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper, pin_decoded_frames
@@ -409,6 +409,12 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
                 # each tokenizer worker would keep its own cache; correct (the scheduler sends back what it
                 # needs) but the bookkeeping assumes one
                 raise ValueError(f"{arc_lazy_media.ENV}=1 supports one tokenizer worker")
+            if get_disagg().disaggregation_mode != "null":
+                # a parked request goes back to the waiting queue, past the PD bootstrap / prealloc queues
+                raise ValueError(
+                    f"{arc_lazy_media.ENV}=1 does not support PD disaggregation "
+                    f"({get_disagg().disaggregation_mode})"
+                )
             self._arc_lazy_cache = arc_lazy_media.MediaMetaCache(
                 arc_lazy_media.cache_entries(), arc_lazy_media.min_seen()
             )
@@ -1298,10 +1304,18 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         identity_time = time.perf_counter()
 
         materialize = getattr(request_obj, arc_lazy_media.MATERIALIZE_ATTR, None) or ()
+        # a fill (the scheduler parked this request and asked for these items) was counted when it arrived
+        count = not materialize
+        # a salted request counts occurrences (namespace, position among the prompt's media), see arc_lazy_media
+        scope = arc_lazy_media.seen_scope(request_obj)
         cache = self._arc_lazy_cache
         metas, misses = [], {}
-        for (modality, source), (key, item_hash) in zip(sources, identities):
-            meta = cache.lookup(key)
+        for position, ((modality, source), (key, item_hash)) in enumerate(
+            zip(sources, identities)
+        ):
+            meta = cache.lookup(
+                key, None if scope is None else (scope, position), count=count
+            )
             if item_hash in materialize:
                 meta = None
             metas.append(meta)
@@ -1359,7 +1373,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
                     grid_thw=tuple(int(x) for x in grid[0].tolist()),
                     hash=item.hash,
                 )
-                cache.put(key, new_meta)
+                cache.put(key, new_meta, salted=scope is not None)
                 materialized[key] = (item, new_meta)
             metas = [
                 materialized[key][1] if meta is None else meta
@@ -1442,7 +1456,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
                 len(cache),
                 cache.hits,
                 cache.misses,
-                f" (rematerialized {len(materialize)} for rid={getattr(request_obj, 'rid', None)})"
+                f" (fill of {len(materialize)} asked items for rid={request_obj.rid})"
                 if materialize
                 else "",
             )

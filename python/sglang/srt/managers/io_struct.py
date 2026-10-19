@@ -1078,8 +1078,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[str] = None
 
-    # arc: the media features of a retracted request parked in the scheduler (ArcMmRematerializeReq refill=True),
-    # not a new request
+    # arc: the media features of a request parked in the scheduler (ArcMmRematerializeReq: a waiting request's lazy
+    # items, or a retracted request's featureless ones), not a new request
     arc_mm_refill: bool = False
 
     def wrap_pickle_fields(self):
@@ -2089,15 +2089,20 @@ class AbortReq(BaseReq, kw_only=True):
 
 
 class ArcMmRematerializeReq(BaseReq, kw_only=True):
-    """Scheduler-to-tokenizer (arc lazy media, ARC_MM_LAZY_MEDIA=1): the request was taken out of the waiting queue
-    because these lazy items (hashes) overlap its extend; process it again with them materialized and resend it.
+    """Scheduler-to-tokenizer: the scheduler parked the request and needs these media items' (hashes) features.
+    Process the request's media again with them materialized and send it back with arc_mm_refill=True (a fill), from
+    which the scheduler takes only these items' features; everything else of the request stays the parked one's.
 
-    refill=True (a retracted request, lazy media or ARC_MM_RELEASE_AFTER_PREFILL): the scheduler keeps the request and
-    its output so far; process it again with these items materialized and send it back with arc_mm_refill=True, from
-    which the scheduler takes only these items' features."""
+    refill=False (arc lazy media, ARC_MM_LAZY_MEDIA=1): a waiting request whose lazy items overlap its extend, parked
+    with what its match holds (a session park claim). refill=True (a retracted request, lazy media or
+    ARC_MM_RELEASE_AFTER_PREFILL): every item without a feature, its output so far kept.
+
+    dp_rank: with data parallelism, the DP rank of the scheduler that parked the request; the fill goes back there
+    (routed_dp_rank), not wherever the DP controller would send a new request."""
 
     hashes: List[int]
     refill: bool = False
+    dp_rank: Optional[int] = None
 
 
 class EncoderDispatchErrorReq(BaseReq, kw_only=True):

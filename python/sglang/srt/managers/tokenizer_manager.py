@@ -3505,76 +3505,74 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         pass
 
     def _handle_arc_mm_rematerialize(self, recv_obj: ArcMmRematerializeReq):
-        """arc lazy media: the scheduler handed the request back; resend it with those items materialized."""
+        """arc lazy media / mm refill: the scheduler parked the request and asks for these media items' features.
+
+        The scheduler keeps the request whole -- its ids after the session ledger's replay, the logprob / routed
+        experts flags the ledger forced, its session park claim -- so nothing is tokenized for it or recorded by the
+        ledger again: the request's media are processed again with these items materialized and the result goes back
+        as a fill (arc_mm_refill), from which the scheduler takes only their features."""
         state = self.rid_to_state.get(recv_obj.rid)
         if state is None:
-            # finished or aborted by the client while the scheduler sent it back
+            # finished or aborted by the client meanwhile: its AbortReq drops the parked request in the scheduler
             logger.info(
-                "%s: rid=%s sent back but no longer tracked; dropped",
+                "%s: rid=%s parked for its media but no longer tracked; dropped",
                 arc_lazy_media.ENV,
                 recv_obj.rid,
             )
             return
         obj = state.obj
-        done = getattr(obj, arc_lazy_media.MATERIALIZE_ATTR, None) or frozenset()
-        if recv_obj.refill:
-            # a retracted request: its items may have been materialized before and released at prefill end
-            setattr(obj, arc_lazy_media.MATERIALIZE_ATTR, done | frozenset(recv_obj.hashes))
-            task = asyncio.create_task(self._arc_mm_refill(obj))
-            self._arc_mm_resend_tasks.add(task)
-            task.add_done_callback(self._arc_mm_resend_tasks.discard)
+        hashes = frozenset(recv_obj.hashes)
+        if not hashes:
+            self._arc_mm_abort_parked(obj.rid, "the scheduler parked the request for no media item")
             return
-        if set(recv_obj.hashes) <= done:
-            # the frontend already sent these with their pixels: a bug, not a cache event; fail this request
-            self._arc_mm_fail(
-                obj.rid,
-                f"the scheduler asked again for {len(recv_obj.hashes)} media items already materialized",
-            )
-            return
-        setattr(obj, arc_lazy_media.MATERIALIZE_ATTR, done | frozenset(recv_obj.hashes))
-        task = asyncio.create_task(self._arc_mm_resend(obj))
+        if not recv_obj.refill:
+            # a waiting request's lazy items: a fill gives each the feature, so one asked for twice is a bug
+            asked = getattr(obj, arc_lazy_media.ASKED_ATTR, None) or frozenset()
+            again = hashes & asked
+            if again:
+                self._arc_mm_abort_parked(
+                    obj.rid,
+                    f"{arc_lazy_media.ENV}: the scheduler asked again for {len(again)} lazy media items a fill "
+                    "already brought",
+                )
+                return
+            setattr(obj, arc_lazy_media.ASKED_ATTR, asked | hashes)
+        # a retracted request (refill): its items may have been filled before and released at prefill end
+        setattr(obj, arc_lazy_media.MATERIALIZE_ATTR, hashes)
+        task = asyncio.create_task(
+            self._arc_mm_fill(obj, refill=recv_obj.refill, dp_rank=recv_obj.dp_rank)
+        )
         self._arc_mm_resend_tasks.add(task)
         task.add_done_callback(self._arc_mm_resend_tasks.discard)
 
-    async def _arc_mm_resend(self, obj):
+    async def _arc_mm_fill(self, obj, *, refill: bool, dp_rank: Optional[int]):
+        what = "arc mm refill of a retracted request" if refill else f"{arc_lazy_media.ENV} fill of a waiting request"
         try:
-            tokenized_obj = await self._tokenize_one_request(obj)
-            await self._send_one_request(tokenized_obj)
-        except Exception as e:
-            logger.exception("%s: resending rid=%s failed", arc_lazy_media.ENV, obj.rid)
-            self._arc_mm_fail(obj.rid, f"resending failed: {e!r}")
-
-    async def _arc_mm_refill(self, obj):
-        try:
+            # the tokenized object only carries the media to the scheduler: it takes the features of the items it
+            # asked for and keeps everything else of the parked request
             tokenized_obj = await self._tokenize_one_request(obj)
             tokenized_obj.arc_mm_refill = True
+            if dp_rank is not None:
+                # data parallelism: back to the scheduler that parked it
+                tokenized_obj.routed_dp_rank = dp_rank
             await self._send_one_request(tokenized_obj)
         except Exception as e:
-            logger.exception("arc mm refill: rid=%s failed", obj.rid)
-            # the scheduler holds the request parked: abort it there, which finishes it here with this reason
-            state = self.rid_to_state.get(obj.rid)
-            if state is not None:
-                state.abort_sent = True
-            self._dispatch_to_scheduler(
-                AbortReq(
-                    rid=obj.rid,
-                    finished_reason={
-                        "type": "abort",
-                        "status_code": HTTPStatus.INTERNAL_SERVER_ERROR,
-                        "message": f"arc mm refill of a retracted request failed: {e!r}",
-                    },
-                )
-            )
+            logger.exception("%s: rid=%s failed", what, obj.rid)
+            self._arc_mm_abort_parked(obj.rid, f"{what} failed: {e!r}")
 
-    def _arc_mm_fail(self, rid: str, message: str):
-        logger.error("%s: rid=%s: %s", arc_lazy_media.ENV, rid, message)
-        self._handle_abort_req(
+    def _arc_mm_abort_parked(self, rid: str, message: str):
+        """The scheduler holds the request parked: abort it there, which finishes it here with this reason."""
+        logger.error("arc mm: rid=%s: %s", rid, message)
+        state = self.rid_to_state.get(rid)
+        if state is not None:
+            state.abort_sent = True
+        self._dispatch_to_scheduler(
             AbortReq(
                 rid=rid,
                 finished_reason={
                     "type": "abort",
                     "status_code": HTTPStatus.INTERNAL_SERVER_ERROR,
-                    "message": f"{arc_lazy_media.ENV}: {message}",
+                    "message": message,
                 },
             )
         )
