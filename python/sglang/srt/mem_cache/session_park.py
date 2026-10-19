@@ -22,7 +22,9 @@ Life of a park (one per finished request; a session keeps at most two):
            park's on [0, P) under the same (cache_salt, extra_key), whose matchable
            key reaches P: prefix = P, cache_protected_len = T, last node = T node.
            Exclusive: a second request (concurrent, a resend) falls back to the tree
-           (reason "claimed"). Nothing moves; a re-match returns the same result.
+           (reason "claimed"). Nothing moves; a re-match returns the same result. A
+           claimant the scheduler parks for its lazy media (ARC_MM_LAZY_MEDIA) keeps
+           the claim until its fill brings it back to the queue.
   consume  PrefillAdder commits the claimant (its own lock on the T node taken): the
            park's lock is released and the request takes the record (row, KV, mamba
            slot) and extends from P in place.
