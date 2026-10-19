@@ -108,6 +108,14 @@ _fold_commit_check_stats = [0, 0]  # check mode: steps compared, track slots com
 _FOLD_BK = 32
 _FOLD_UNROLL = True
 
+# arc-forge (kverify, opt-in): the verify kernel's per-token loops (T = (I + A)^-1 rows, D_spec = R T^T, D F) run
+# over the window's max_spec_len tokens instead of the token tile BS = max(4, next_pow2(max_spec_len)), so K = 5..7 no
+# longer run K = 8's loops (B200 bs 95, 36 layers: K5 6.11 -> 5.71 ms, K6 6.16 -> 5.86; K4 and K8 unchanged). The
+# skipped lanes are padding and every skipped term is a product with an exact zero, but the shorter unrolled loop
+# compiles to a different FMA contraction: test_replayssm_loop_k.py finds the outputs bitwise and a few fp32 D_spec
+# values (the compact rings' low parts) one ulp apart, so it is a rounding-level change and off by default.
+_ARC_GDN_SPEC_LOOP_K = _env_flag("ARC_GDN_SPEC_LOOP_K", "0")
+
 
 @triton.jit
 def _fold_key_block(
@@ -224,6 +232,7 @@ def gdn_replayssm_spec_circular_kernel(
     FOLD_PENDING: tl.constexpr = False,
     FOLD_BK: tl.constexpr = 16,
     FOLD_UNROLL: tl.constexpr = False,
+    SPEC_LOOP: tl.constexpr = 0,  # per-token loop length (max_spec_len or BS); the launcher always sets it
 ):
     i_v = tl.program_id(0)
     i_n = tl.program_id(1)
@@ -577,8 +586,9 @@ def gdn_replayssm_spec_circular_kernel(
     diff_ij = G_s[:, None] - G_s[None, :]
     A_mat = tl.where(lower, beta_s[:, None] * tl.exp(diff_ij) * kk_mat, 0.0)
 
+    tl.static_assert(SPEC_LOOP > 0 and SPEC_LOOP <= BS)
     b_Ai = -A_mat
-    for ii in range(2, BS):
+    for ii in range(2, SPEC_LOOP):
         row = tl.sum(tl.where((o_s == ii)[:, None], -A_mat, 0.0), axis=0)
         row = tl.where(o_s < ii, row, 0.0)
         row = row + tl.sum(row[:, None] * b_Ai, axis=0)
@@ -594,7 +604,7 @@ def gdn_replayssm_spec_circular_kernel(
     )
     R_mat = beta_s[None, :] * (v_tile - expG_s[None, :] * hw_k)
     D_spec = tl.zeros([BV, BS], dtype=tl.float32)
-    for j in tl.static_range(BS):
+    for j in tl.static_range(SPEC_LOOP):
         Rj = tl.sum(tl.where((o_s == j)[None, :], R_mat, 0.0), axis=1)
         Tj = tl.sum(tl.where((o_s == j)[None, :], T_mat, 0.0), axis=1)
         D_spec += Rj[:, None] * Tj[None, :]
@@ -606,7 +616,7 @@ def gdn_replayssm_spec_circular_kernel(
     diff_ji = G_s[None, :] - G_s[:, None]
     F_mat = tl.where(causalF, tl.exp(diff_ji) * kq_mat, 0.0)
     DF = tl.zeros([BV, BS], dtype=tl.float32)
-    for j in tl.static_range(BS):
+    for j in tl.static_range(SPEC_LOOP):
         Dj = tl.sum(tl.where((o_s == j)[None, :], D_spec, 0.0), axis=1)
         Fj = tl.sum(tl.where((o_s == j)[:, None], F_mat, 0.0), axis=0)
         DF += Dj[:, None] * Fj[None, :]
@@ -1638,6 +1648,7 @@ def _launch_gdn_spec(
         FOLD_PENDING=fold_pending,
         FOLD_BK=_FOLD_BK,
         FOLD_UNROLL=_FOLD_UNROLL,
+        SPEC_LOOP=max_spec_len if _ARC_GDN_SPEC_LOOP_K else BS,
         num_warps=num_warps,
         num_stages=num_stages,
     )
