@@ -842,6 +842,8 @@ class QSAIndexer(MultiPlatformOp):
             verify_queries_per_request=verify_queries_per_request,
             fill_invalid_tail=not use_fast_decode_topk,
             k_scale=compressed_scale,
+            # arc-forge kverify: heads past index_n_heads are project_qk's zero pad
+            valid_heads=self.index_n_heads,
         )
         if use_fast_decode_topk:
             # Decode rows start at zero, so compressed lengths double as row lengths;
