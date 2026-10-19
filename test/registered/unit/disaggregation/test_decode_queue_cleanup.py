@@ -421,6 +421,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.ps = ParallelState.trivial()
         scheduler.running_mbs = []
         scheduler.waiting_queue = []
+        scheduler.arc_mm_lazy_parked, scheduler.arc_mm_refill_parked = {}, {}
         scheduler.grammar_manager = SimpleNamespace(grammar_queue=[])
         scheduler.disaggregation_mode = DisaggregationMode.DECODE
         scheduler.disagg_decode_prealloc_queue = SimpleNamespace(

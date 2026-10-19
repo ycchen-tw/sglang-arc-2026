@@ -467,12 +467,15 @@ class Scheduler(
         # Prefill tokens processed so far; used as the aging axis for the HRRN scheduling policy. Reqs snapshot this at waiting_queue entry.
         self.processed_tokens_counter: int = 0
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
-        # arc lazy media: requests handed back to the tokenizer to materialize lazy items
+        # arc lazy media: waiting requests whose lazy items overlap their extend wait here (rid -> the request, the
+        # hashes it asked the tokenizer for), out of the queue but holding what a waiting request holds (a session
+        # park claim, a QSA session ownership), until the fill arrives (_arc_mm_refill) and they re-enter the queue
+        self.arc_mm_lazy_parked: Dict[str, Tuple[Req, frozenset]] = {}
         self.arc_lazy_sent_back_total: int = 0
         # arc: retracted requests whose media carry no feature (lazy items, ARC_MM_RELEASE_AFTER_PREFILL) wait here,
         # out of the queue and holding nothing, while the tokenizer processes those media again
         self.arc_mm_refill_parked: Dict[str, Req] = {}
-        # parked requests aborted before their refill arrived (the refill, if any, is then dropped)
+        # parked requests (either kind) aborted before their fill arrived (the fill, if any, is then dropped)
         self.arc_mm_refill_aborted: Set[str] = set()
         self.arc_mm_refill_total: int = 0
         self.init_soft_watchdog()
@@ -3346,33 +3349,72 @@ class Scheduler(
             return False
         return True
 
-    def _arc_lazy_send_back(self, sent_back) -> None:
-        """arc lazy media: hand waiting requests whose lazy items overlap their extend back to the tokenizer.
+    def _arc_mm_fill_dp_rank(self) -> Optional[int]:
+        """With data parallelism, this scheduler's DP rank: the fill of a request parked here must come back here."""
+        return self.ps.dp_rank if self.ps.dp_size > 1 else None
 
-        Nothing has been allocated for them past init_next_round_input (undone by the caller); they leave the queue
-        like a request aborted while waiting, and the tokenizer resends them with those items materialized."""
+    def _arc_lazy_needed(self, req: Req) -> List[int]:
+        """arc lazy media, right after the scheduling match of a waiting request: the hashes of its lazy items that
+        overlap its extend ([] if none). Then the request cannot run this round; what init_next_round_input staged
+        for it is undone here, as for a request add_one_req rejects."""
+        needed = arc_lazy_media.items_to_materialize(
+            req.multimodal_inputs, len(req.prefix_indices)
+        )
+        if not needed:
+            return needed
+        if req.output_ids or req.is_retracted:
+            # a retracted request re-entered the queue only after every featureless item was refilled
+            # (_arc_mm_park_for_refill): a lazy one here is a bug
+            raise RuntimeError(
+                f"{arc_lazy_media.ENV}: retracted request {req.rid} needs lazy media items re-embedded "
+                f"({len(needed)} items in its extend) (prefix {len(req.prefix_indices)})"
+            )
+        req.kv.mamba_cow_src_index = None
+        req.kv.mamba_needs_clear = False
+        if req.kv.holds_mamba and not getattr(req, "session", None):
+            self.tree_cache.req_to_token_pool.mamba_allocator.free(
+                req.kv.mamba_pool_idx.unsqueeze(-1)
+            )
+            req.kv.mamba_pool_idx = None
+        return needed
+
+    def _arc_lazy_send_back(self, sent_back) -> None:
+        """arc lazy media: park waiting requests whose lazy items overlap their extend until the tokenizer sends
+        those items' features (_arc_mm_refill).
+
+        Nothing has been allocated for them past init_next_round_input (undone by the caller). They leave the queue
+        but stay what they are: their ids (after the session ledger's or h14's replay), their logprob / routed-experts
+        flags, and what their match holds -- a session park claim (the re-match after the fill returns the same
+        claim, so the request still resumes exactly), a QSA session ownership -- the way a request waiting in the
+        queue keeps them. The tokenizer only re-processes their media; nothing upstream of the scheduler runs twice.
+        An abort while parked releases what they hold (abort_request -> _arc_mm_drop_parked)."""
         dropped = {id(req) for req, _ in sent_back}
         self.waiting_queue = [x for x in self.waiting_queue if id(x) not in dropped]
         for req, needed in sent_back:
-            self._release_aborted_request(req)
-            self.beam_coordinator.retire_group(req)
             if req.kv.holds_mamba:
                 # the caller freed a slot init_next_round_input took; a session-held one has its own lifecycle
                 raise RuntimeError(
-                    f"{arc_lazy_media.ENV}: rid={req.rid} still holds a mamba slot; cannot send it back"
+                    f"{arc_lazy_media.ENV}: rid={req.rid} still holds a mamba slot; cannot park it"
                 )
+            if req.rid in self.arc_mm_lazy_parked or req.rid in self.arc_mm_refill_parked:
+                raise RuntimeError(f"{arc_lazy_media.ENV}: rid={req.rid} is parked already")
+            self.arc_mm_lazy_parked[req.rid] = (req, frozenset(needed))
             self.ipc_channels.send_to_tokenizer.send_output(
-                ArcMmRematerializeReq(rid=req.rid, hashes=needed), req
+                ArcMmRematerializeReq(
+                    rid=req.rid, hashes=needed, dp_rank=self._arc_mm_fill_dp_rank()
+                ),
+                req,
             )
             self.arc_lazy_sent_back_total += 1
             logger.info(
-                "%s: sent rid=%s back to materialize %d of %d media items (prefix %d of %d tokens); %d sent back so far",
+                "%s: parked rid=%s for %d of %d media items (prefix %d of %d tokens); %d parked, %d sent back so far",
                 arc_lazy_media.ENV,
                 req.rid,
                 len(needed),
                 len(req.multimodal_inputs.mm_items),
                 len(req.prefix_indices),
                 len(req.origin_input_ids),
+                len(self.arc_mm_lazy_parked),
                 self.arc_lazy_sent_back_total,
             )
 
@@ -3383,11 +3425,17 @@ class Scheduler(
         hashes = arc_lazy_media.featureless_hashes(req.multimodal_inputs)
         if not hashes:
             return False
-        if req.rid in self.arc_mm_refill_parked:
+        if req.rid in self.arc_mm_refill_parked or req.rid in self.arc_mm_lazy_parked:
             raise RuntimeError(f"arc mm refill: rid={req.rid} retracted while parked")
         self.arc_mm_refill_parked[req.rid] = req
         self.ipc_channels.send_to_tokenizer.send_output(
-            ArcMmRematerializeReq(rid=req.rid, hashes=hashes, refill=True), req
+            ArcMmRematerializeReq(
+                rid=req.rid,
+                hashes=hashes,
+                refill=True,
+                dp_rank=self._arc_mm_fill_dp_rank(),
+            ),
+            req,
         )
         self.arc_mm_refill_total += 1
         logger.info(
@@ -3404,52 +3452,55 @@ class Scheduler(
     def _arc_mm_refill(
         self, recv_req: TokenizedGenerateReqInput, mm_input_error: Optional[str]
     ) -> None:
-        """arc: the tokenizer processed a parked request's media again; give its featureless items their features
-        and put it back in the queue as a retracted request."""
+        """arc: the tokenizer processed a parked request's media again (a fill). A retracted request
+        (arc_mm_refill_parked) gets every featureless item filled and re-enters the queue as retracted; a waiting
+        request parked for lazy items (arc_mm_lazy_parked) gets the items it asked for and goes back to the waiting
+        queue as it was (admission checks, queue entry time and storage prefetch were done when it arrived). Only the
+        fill's features are used: ids, flags and offsets stay the parked request's."""
         rid = recv_req.rid
-        req = self.arc_mm_refill_parked.pop(rid, None)
+        lazy = self.arc_mm_lazy_parked.pop(rid, None)
+        if lazy is not None:
+            if rid in self.arc_mm_refill_parked:
+                raise RuntimeError(f"arc mm fill: rid={rid} is parked twice")
+            req, wanted = lazy
+            what = "lazy media fill of a waiting request"
+        else:
+            req, wanted = self.arc_mm_refill_parked.pop(rid, None), None
+            what = "arc mm refill of a retracted request"
         if req is None:
             if rid in self.arc_mm_refill_aborted:
                 self.arc_mm_refill_aborted.discard(rid)
-                logger.info("arc mm refill: rid=%s was aborted while parked; refill dropped", rid)
+                logger.info("arc mm refill: rid=%s was aborted while parked; fill dropped", rid)
                 return
             raise RuntimeError(f"arc mm refill for rid={rid}, which is not parked")
         try:
             if mm_input_error is not None:
                 raise RuntimeError(mm_input_error)
-            fresh = {
-                item.hash: item
-                for item in self._get_multimodal_inputs(recv_req.mm_inputs).mm_items
-            }
-            items = req.multimodal_inputs.mm_items
-            for i, item in enumerate(items):
-                if item.feature is not None or item.precomputed_embeddings is not None:
-                    continue
-                new = fresh.get(item.hash)
-                if new is None or new.feature is None:
-                    raise RuntimeError(f"the refill has no feature for media item {item.hash}")
-                if (
-                    new.modality != item.modality
-                    or new.pad_value != item.pad_value
-                    or [e - s for s, e in new.offsets] != [e - s for s, e in item.offsets]
-                ):
-                    raise RuntimeError(
-                        f"media item {item.hash} came back as {new.modality} spans {new.offsets}, "
-                        f"was {item.modality} spans {item.offsets}"
-                    )
-                # positions are the parked request's (the session replay may have moved the text around them)
-                new.offsets = item.offsets
-                items[i] = new
+            filled = arc_lazy_media.fill_features(
+                req.multimodal_inputs.mm_items,
+                self._get_multimodal_inputs(recv_req.mm_inputs).mm_items,
+                wanted,
+            )
         except (_MultimodalInputProcessingError, RuntimeError) as e:
-            logger.error("arc mm refill: rid=%s failed: %s", rid, e)
+            logger.error("%s: rid=%s failed: %s", what, rid, e)
             self._arc_mm_drop_parked(
                 req,
                 {
                     "type": "abort",
                     "status_code": HTTPStatus.INTERNAL_SERVER_ERROR,
-                    "message": f"arc mm refill of a retracted request failed: {e}",
+                    "message": f"{what} failed: {e}",
                 },
             )
+            return
+        if wanted is not None:
+            logger.info(
+                "%s: rid=%s back in the queue (%d items filled); %d parked",
+                arc_lazy_media.ENV,
+                rid,
+                filled,
+                len(self.arc_mm_lazy_parked),
+            )
+            self.waiting_queue.append(req)
             return
         logger.info(
             "arc mm refill: rid=%s back in the queue; %d parked", rid, len(self.arc_mm_refill_parked)
@@ -4158,25 +4209,8 @@ class Scheduler(
 
             req.init_next_round_input(self.tree_cache)
             if arc_lazy_media.enabled() and req.multimodal_inputs is not None:
-                needed = arc_lazy_media.items_to_materialize(
-                    req.multimodal_inputs, len(req.prefix_indices)
-                )
+                needed = self._arc_lazy_needed(req)
                 if needed:
-                    if req.output_ids or req.is_retracted:
-                        # its output has been streamed; resending it from the tokenizer would start it over
-                        raise RuntimeError(
-                            f"{arc_lazy_media.ENV}: retracted request {req.rid} needs lazy media items re-embedded "
-                            f"({len(needed)} items in its extend) (prefix {len(req.prefix_indices)}); run with {arc_lazy_media.ENV}=0 "
-                            "if retraction is expected"
-                        )
-                    # as for a request add_one_req rejects: init_next_round_input may have staged mamba state
-                    req.kv.mamba_cow_src_index = None
-                    req.kv.mamba_needs_clear = False
-                    if req.kv.holds_mamba and not getattr(req, "session", None):
-                        self.tree_cache.req_to_token_pool.mamba_allocator.free(
-                            req.kv.mamba_pool_idx.unsqueeze(-1)
-                        )
-                        req.kv.mamba_pool_idx = None
                     arc_lazy_sent_back.append((req, needed))
                     continue
             if self.enable_hicache_storage and (
@@ -5135,6 +5169,10 @@ class Scheduler(
             # Grammar queue and prefill inflight queue may not produce batch
             # results instantly, but they still indicate the server is not idle.
             idle &= len(self.grammar_manager.grammar_queue) == 0
+            # arc: a request parked for its media comes back with its fill and still holds session state (a
+            # waiting one its session park claim / QSA session ownership; a retracted one stays the QSA session's
+            # owner): the idle invariants (QSA session cache: no live session request) do not hold yet
+            idle &= not self.arc_mm_lazy_parked and not self.arc_mm_refill_parked
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
@@ -5612,6 +5650,16 @@ class Scheduler(
             self.arc_mm_refill_aborted.add(rid)
             self._arc_mm_drop_parked(req, recv_req.finished_reason)
             logger.info("arc mm refill: parked rid=%s aborted", rid)
+        # arc lazy media: waiting requests parked for their media (what their match holds is released here)
+        for rid in [
+            rid
+            for rid in self.arc_mm_lazy_parked
+            if recv_req.abort_all or rid.startswith(recv_req.rid)
+        ]:
+            req, _ = self.arc_mm_lazy_parked.pop(rid)
+            self.arc_mm_refill_aborted.add(rid)
+            self._arc_mm_drop_parked(req, recv_req.finished_reason)
+            logger.info("%s: parked rid=%s aborted", arc_lazy_media.ENV, rid)
 
         if self.dllm_config is not None:
             for req in self.dllm_manager.pop_aborted_reqs(

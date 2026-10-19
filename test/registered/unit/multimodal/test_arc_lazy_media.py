@@ -88,6 +88,131 @@ def test_cache_rejects_a_different_expansion_and_evicts_lru():
     assert cache.lookup("b") is None and len(cache) == 2
 
 
+class _CacheBeforeSalts:
+    """MediaMetaCache as it was before salted requests counted occurrences (f31bd1bcf), for the equivalence test."""
+
+    def __init__(self, max_entries, min_seen):
+        from collections import OrderedDict
+
+        self.max_entries, self.min_seen = max_entries, min_seen
+        self._entries = OrderedDict()
+        self.hits = self.misses = 0
+
+    def lookup(self, key):
+        entry = self._entries.get(key)
+        if entry is None:
+            self.misses += 1
+            return None
+        self._entries.move_to_end(key)
+        seen = entry[1]
+        entry[1] = seen + 1
+        if seen < self.min_seen:
+            self.misses += 1
+            return None
+        self.hits += 1
+        return entry[0]
+
+    def put(self, key, meta):
+        entry = self._entries.get(key)
+        if entry is not None:
+            self._entries.move_to_end(key)
+            return
+        self._entries[key] = [meta, 1]
+        while len(self._entries) > self.max_entries:
+            self._entries.popitem(last=False)
+
+
+@pytest.mark.parametrize("min_seen", [1, 2, 3])
+def test_cache_without_salt_is_unchanged(min_seen):
+    """No cache_salt (the Kaggle line): every lookup / put answers as before, hit and miss counts included."""
+    import random
+
+    rng = random.Random(min_seen)
+    new, old = MediaMetaCache(max_entries=5, min_seen=min_seen), _CacheBeforeSalts(5, min_seen)
+    metas = {k: _meta(h) for h, k in enumerate("abcdefgh")}
+    for _ in range(3000):
+        key = rng.choice("abcdefgh")
+        if rng.random() < 0.6:
+            got, want = new.lookup(key), old.lookup(key)
+            assert (got is None) == (want is None)
+            if got is None:
+                new.put(key, metas[key])
+                old.put(key, metas[key])
+        else:  # a put without a lookup (another item of the same request processed it)
+            new.put(key, metas[key])
+            old.put(key, metas[key])
+        assert (new.hits, new.misses, len(new)) == (old.hits, old.misses, len(old._entries))
+        assert list(new._entries) == list(old._entries)
+        assert [e[1] for e in new._entries.values()] == [e[1] for e in old._entries.values()]
+    assert len(new._occurrences) == 0
+
+
+def test_cache_salted_counts_occurrences():
+    """A salted request: an item goes lazy only where an earlier request of the same namespace carried it at the
+    same position among the prompt's media."""
+    cache = MediaMetaCache(max_entries=64, min_seen=1)
+    a, b = ("ep-A", None), ("ep-B", None)
+    # episode A, turn 1: frame k at position 0, processed with pixels
+    assert cache.lookup("k", (a, 0)) is None
+    cache.put("k", _meta(), salted=True)
+    # turn 2 of A: position 0 is in A's prefix (lazy); the same frame again at position 1 is new there
+    assert cache.lookup("k", (a, 0)) is not None
+    assert cache.lookup("k", (a, 1)) is None
+    # episode B (another sample of the same level) never carried it: pixels, although the meta is known
+    assert cache.lookup("k", (b, 0)) is None
+    cache.put("k", _meta(), salted=True)  # B processes it; the meta must agree
+    assert cache.lookup("k", (b, 0)) is not None
+    # A's turn 3 carries both of its occurrences: both are in A's prefix now
+    assert cache.lookup("k", (a, 0)) is not None and cache.lookup("k", (a, 1)) is not None
+    # another extra_key is another radix namespace
+    assert cache.lookup("k", (("ep-A", "x"), 0)) is None
+    # salted requests never count for unsalted ones: a key first processed by a salted request starts at 0
+    assert cache.lookup("k") is None
+    assert cache.lookup("k") is not None
+
+
+def test_cache_salted_min_seen_and_lru():
+    cache = MediaMetaCache(max_entries=2, min_seen=2)
+    ns = ("ep", None)
+    assert cache.lookup("k", (ns, 0)) is None
+    cache.put("k", _meta(), salted=True)
+    assert cache.lookup("k", (ns, 0)) is None  # carried by one earlier request: still with pixels
+    assert cache.lookup("k", (ns, 0)) is not None
+    # occurrences are an LRU of max_entries too
+    cache.lookup("k", (ns, 1))
+    cache.lookup("k", (ns, 2))
+    assert len(cache._occurrences) == 2 and ((ns, 0), "k") not in cache._occurrences
+    # the meta itself went: a counted occurrence still misses
+    cache.put("j", _meta(2), salted=True)
+    cache.put("i", _meta(3), salted=True)
+    assert cache.lookup("k", (ns, 2)) is None
+
+
+def test_cache_fill_counts_nothing():
+    """A fill (the scheduler parked the request and asked for its lazy items) re-processes a request that was
+    counted when it arrived: it looks without counting, salted or not."""
+    cache = MediaMetaCache(max_entries=8, min_seen=2)
+    cache.put("k", _meta())
+    assert cache.lookup("k", count=False) is None
+    assert cache._entries["k"][1] == 1
+    assert cache.lookup("k") is None and cache._entries["k"][1] == 2
+    assert cache.lookup("k", count=False) is not None and cache._entries["k"][1] == 2
+    ns = ("ep", None)
+    assert cache.lookup("k", (ns, 0), count=False) is None
+    assert ((ns, 0), "k") not in cache._occurrences
+
+
+def test_seen_scope():
+    from types import SimpleNamespace
+
+    assert arc_lazy_media.seen_scope(SimpleNamespace(cache_salt=None, extra_key="x")) is None
+    assert arc_lazy_media.seen_scope(SimpleNamespace(cache_salt="p/ep-3", extra_key=None)) == ("p/ep-3", None)
+    assert arc_lazy_media.seen_scope(SimpleNamespace(cache_salt="p/ep-3", extra_key="x")) == ("p/ep-3", "x")
+    assert arc_lazy_media.seen_scope(SimpleNamespace()) is None  # EmbeddingReqInput: no cache_salt
+    with pytest.raises(ValueError, match="cache_salt"):
+        arc_lazy_media.seen_scope(SimpleNamespace(cache_salt=["a"], extra_key=None))
+
+
 def _item(h, offsets, lazy, modality=Modality.VIDEO, rows=None):
     item = MultimodalDataItem(modality=modality, offsets=offsets)
     if lazy:
@@ -111,10 +236,69 @@ def test_items_to_materialize():
     inputs = _Inputs([old, last, new])
     # the prefix covers the old video and the last image: nothing to send back
     assert items_to_materialize(inputs, 24) == []
-    # the prefix stops inside the last image: that one and every other item in the extend, new or not
-    assert items_to_materialize(inputs, 22) == [last.hash, new.hash]
-    assert items_to_materialize(inputs, 0) == [old.hash, last.hash, new.hash]
+    # the prefix stops inside the last image: only the lazy items in the extend (the parked request keeps the new
+    # video's feature; a fill gives features to these alone)
+    assert items_to_materialize(inputs, 22) == [last.hash]
+    assert items_to_materialize(inputs, 0) == [old.hash, last.hash]
     assert items_to_materialize(_Inputs([new]), 0) == []
+    # the same picture twice (a repeated frame): asked for once
+    again = _item(12, [(26, 29)], lazy=True, modality=Modality.IMAGE)
+    assert items_to_materialize(_Inputs([last, again, new]), 0) == [last.hash]
+    bad = _item(14, [(40, 41)], lazy=True, modality=Modality.IMAGE)
+    bad.feature = torch.zeros(2, 2)
+    with pytest.raises(RuntimeError, match="lazy item carries a feature"):
+        items_to_materialize(_Inputs([bad]), 0)
+
+
+def _fresh(h, offsets, modality=Modality.IMAGE):
+    """An item of the fill: the tokenizer's processing of the same request, the item materialized."""
+    item = _item(h, offsets, lazy=False, modality=modality)
+    item.feature = torch.full((sum(b - a + 1 for a, b in offsets), 2), float(h))
+    return item
+
+
+def test_fill_features_gives_the_asked_items_their_features():
+    # parked: a lazy image in the prefix, the same lazy frame twice in the extend, a new image with its feature
+    in_prefix = _item(11, [(2, 5)], lazy=True, modality=Modality.IMAGE)
+    frame_a = _item(12, [(10, 13)], lazy=True, modality=Modality.IMAGE)
+    frame_b = _item(12, [(20, 23)], lazy=True, modality=Modality.IMAGE)
+    new = _item(13, [(30, 33)], lazy=False, modality=Modality.IMAGE)
+    kept = new.feature
+    items = [in_prefix, frame_a, frame_b, new]
+    # the fill's offsets are the client's (no session replay there): 3 tokens earlier
+    fill = [_item(11, [(2, 5)], lazy=True, modality=Modality.IMAGE), _fresh(12, [(7, 10)]), _fresh(12, [(17, 20)]),
+            _fresh(13, [(27, 30)])]
+    assert arc_lazy_media.fill_features(items, fill, {12}) == 2
+    assert items[0] is in_prefix and LAZY_KEY in items[0].model_specific_data  # not asked for: stays lazy
+    assert items[3] is new and items[3].feature is kept  # had its feature: untouched
+    a, b = items[1], items[2]
+    assert a is not b  # each occurrence keeps its own offsets
+    assert a.offsets == [(10, 13)] and b.offsets == [(20, 23)]  # the parked request's positions
+    assert a.feature is not None and LAZY_KEY not in a.model_specific_data
+    assert items_to_materialize(_Inputs(items), 6) == []
+
+
+def test_fill_features_refill_takes_every_featureless_item():
+    lazy = _item(11, [(2, 5)], lazy=True, modality=Modality.IMAGE)
+    released = _item(12, [(8, 11)], lazy=False, modality=Modality.IMAGE)
+    released.feature = None
+    items = [lazy, released]
+    assert arc_lazy_media.fill_features(items, [_fresh(11, [(2, 5)]), _fresh(12, [(8, 11)])], None) == 2
+    assert all(item.feature is not None for item in items)
+
+
+def test_fill_features_fails_loudly():
+    def parked():
+        return [_item(12, [(10, 13)], lazy=True, modality=Modality.IMAGE)]
+
+    with pytest.raises(RuntimeError, match="no feature for media item"):
+        arc_lazy_media.fill_features(parked(), [_item(12, [(10, 13)], lazy=True, modality=Modality.IMAGE)], {12})
+    with pytest.raises(RuntimeError, match="came back as"):
+        arc_lazy_media.fill_features(parked(), [_fresh(12, [(10, 14)])], {12})
+    with pytest.raises(RuntimeError, match="came back as"):
+        arc_lazy_media.fill_features(parked(), [_fresh(12, [(10, 13)], modality=Modality.VIDEO)], {12})
+    with pytest.raises(RuntimeError, match="does not hold without a feature"):
+        arc_lazy_media.fill_features(parked(), [_fresh(12, [(10, 13)]), _fresh(15, [(1, 2)])], {12, 15})
 
 
 def test_featureless_hashes():
