@@ -78,7 +78,8 @@ def main(a):
         # the pair's head would be the target's vocab-sharded one; both are replaced by the full head below, so the
         # pair is built with a placeholder (the stub target's lm_head is not sharded)
         Wk.build_head = (lambda *args, **kw: torch.nn.Module()) if group is pair else build_head
-        m = Wk.build_dense_drafter(drafter, device, target, drafter, group, refresh_entry=False)
+        path = drafter if group is pair else Path(a.whole_drafter or a.drafter)
+        m = Wk.build_dense_drafter(path, device, target, path, group, refresh_entry=False)
         Wk.build_head = build_head
         if m.config.residual != "plain" or m.config.context != "inject":
             raise SystemExit(f"{drafter}: not the plain / injected-context drafter")
@@ -179,6 +180,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--drafter", required=True)
     ap.add_argument("--cycles", type=int, default=12)
+    ap.add_argument("--whole-drafter", help="build the one-GPU drafter from this export instead (e.g. the BF16 deploy "
+                    "against an FP8 pair: the quantization's own distance, the yardstick for the pair's)")
     ap.add_argument("--max-rel", type=float, default=0.05, help="pair vs whole proposal hidden, relative L2")
     ap.add_argument("--min-cos", type=float, default=0.99, help="pair vs whole proposal hidden, worst row")
     raise SystemExit(main(ap.parse_args()))
