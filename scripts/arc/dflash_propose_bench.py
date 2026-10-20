@@ -159,9 +159,18 @@ def _build(drafter: Path, max_batch: int, steps: int):
 
     one = SimpleNamespace(rank_in_group=0, world_size=1, ranks=[0])
     target = _StubTarget()
+    if torch.cuda.get_device_capability() == (12, 0):
+        # the server's fp8_utils.initialize_fp8_gemm_config (--fp8-gemm-backend auto): CUTLASS on sm_120, the block
+        # FP8 path fp8.Fp8BlockLinear pins there (a bare process would dispatch to DeepGEMM)
+        from sglang.srt.layers.quantization import fp8_utils
+
+        fp8_utils.FP8_GEMM_RUNNER_BACKEND = fp8_utils.Fp8GemmRunnerBackend.CUTLASS
     model = Wk.build_dense_drafter(drafter, torch.device("cuda"), target, drafter, one)
-    # one TP2 rank's share of the head: top-k over its 124,160 rows (the group's all-gathers are left out)
-    model.lm_head = heads.PairHead([(target.lm_head.weight[:SHARD], 0)], VOCAB, one)
+    ids = heads.draft_vocab(VOCAB, torch.device("cuda"))
+    if ids is not None:  # ARC_DFLASH_DRAFT_VOCAB: the subset head the TP1 G4 deployment serves
+        model.lm_head = heads.SubsetHead(target.lm_head.weight, ids)
+    else:  # one TP2 rank's share of the head: top-k over its 124,160 rows (the group's all-gathers are left out)
+        model.lm_head = heads.PairHead([(target.lm_head.weight[:SHARD], 0)], VOCAB, one)
     sparse = os.environ.setdefault("ARC_DFLASH_SPARSE_Q", "1") == "1"
     pool = RingStatePool(model, slots=max_batch + 8, max_batch=max_batch, device=torch.device("cuda"), steps=steps,
                          sparse_q=sparse)
@@ -181,7 +190,8 @@ def _fill(pool, seed: int):
     pool.positions[:n].scatter_(1, p % w, p)
     pool.key.normal_(generator=g)
     pool.value.normal_(generator=g)
-    pool.boundary.normal_(generator=g)
+    if not pool.inject:  # an injected-context pool keeps no conv boundaries
+        pool.boundary.normal_(generator=g)
     pending = torch.randint(1, 5, (n,), device="cuda", generator=g)
     pool.pending_length[:n] = pending
     pool.last_position[:n] = lengths - 1 + pending
