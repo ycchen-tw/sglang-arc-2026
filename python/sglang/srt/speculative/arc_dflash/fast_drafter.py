@@ -128,7 +128,8 @@ def compile_layers(model, deterministic: bool = False):
     options = dict(DETERMINISTIC_OPTIONS) if deterministic else None
     ring_attention.attend = torch.compiler.disable(ring_attention.attend)
     nvfp4.Nvfp4Experts.forward = torch.compiler.disable(nvfp4.Nvfp4Experts.forward)
-    fp8.Fp8BlockLinear.forward = torch.compiler.disable(fp8.Fp8BlockLinear.forward)
+    if fp8.FP8_OP != "1":  # ARC_DFLASH_FP8_OP=1: a custom op inside the graph instead (fp8.py)
+        fp8.Fp8BlockLinear.forward = torch.compiler.disable(fp8.Fp8BlockLinear.forward)
     fp8.HummingW4A8Linear.forward = torch.compiler.disable(fp8.HummingW4A8Linear.forward)
     # Context "inject" (plain residual): a refresh never runs the layers (model.MTP3.refresh), so there is no refresh
     # entry to compile; the decode step's injected K/V (fusion, context_layernorm, k/v projections) run eager inside
