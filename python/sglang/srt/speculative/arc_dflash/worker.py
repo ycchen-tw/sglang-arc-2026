@@ -39,7 +39,8 @@ layers.*.mlp.{gate,up,down}_proj and the attention projections) loads through th
 selects it (model.PlainDecoder, MTP3.context, state_pool.RingStatePool._step_injected). Committed tokens only write
 their injected K/V into the window (no trunk, no conv boundaries); the trunk runs the proposal block. On an
 attention-TP group the attention heads are split as for the hyper-connection drafter (the injected K/V come from the
-same sliced k/v projections, PlainDecoder.context_kv); ARC_DFLASH_W4A8 and ARC_DFLASH_POOL=shift raise for it.
+same sliced k/v projections, PlainDecoder.context_kv); ARC_DFLASH_W4A8 applies as there (scope mlp = the dense
+.mlp.{gate,up,down}_proj); ARC_DFLASH_POOL=shift raises for it.
 
 Draft state per request is a fixed SWA window (`window` = 1024 tokens x layers, plus the newest conv boundary) in a
 slot pool sized per DP group (max_running_requests / attention DP + 16 slots). The request's state is dropped when it
@@ -283,15 +284,13 @@ def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, 
         # The plain / injected-context drafter (or a dense FFN without the shared expert): the attention-TP group's
         # head split applies as is -- each attention module gets the local head counts and the pool the local KV
         # heads, and PlainDecoder.context_kv projects through the same sliced k/v (first validated on one GPU; an
-        # attention-TP group of more ranks is first run on L4 TP2). The W4A8 linears (whose "mlp" scope names
-        # .mlp.routed.) were validated on the hyper-connection dense_shared drafter alone.
+        # attention-TP group of more ranks is first run on L4 TP2). ARC_DFLASH_W4A8 replaces the FP8 linears as for
+        # the hyper-connection drafter; its "mlp" scope is .mlp.routed. there and the plain drafter's .mlp.{gate,up,
+        # down}_proj here (ffn_type dense).
         if size != 1 and c.num_key_value_heads % size and size % c.num_key_value_heads == 0:
             raise NotImplementedError(f"{directory}: residual {c.residual!r} on {size} ranks would tile "
                                       f"{c.num_key_value_heads} KV heads (kv_rep > 1), not validated for the "
                                       "injected context")
-        if w4a8_spec() is not None:
-            raise NotImplementedError(f"{directory}: ARC_DFLASH_W4A8 is not ported to residual {c.residual!r} / "
-                                      f"ffn_type {c.ffn_type!r}")
     shard = size > 1 and os.environ.get("ARC_DFLASH_ATTN_TP", "1") == "1"
     kv_rep = 1  # ranks sharing one KV head
     if shard:
@@ -363,7 +362,8 @@ def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, 
                     if cut is not None:
                         value, scale = narrow_fp8(value, scale, cut)
                     parent, _, child = name.rpartition(".")
-                    if w4a8 is not None and (w4a8[3] == "all" or ".mlp.routed." in name):
+                    mlp = ".mlp.routed." in name or (c.ffn_type == "dense" and ".mlp." in name)
+                    if w4a8 is not None and (w4a8[3] == "all" or mlp):
                         # every rank computes a whole (unsliced) linear on the same input: bitwise equal or the
                         # group's proposals diverge; a rank's attention slice feeds only its o_proj all-reduce part
                         module = HummingW4A8Linear(dequant_block_fp8(value, scale), w4a8,
