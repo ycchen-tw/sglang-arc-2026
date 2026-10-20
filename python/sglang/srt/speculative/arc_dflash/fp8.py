@@ -7,6 +7,7 @@ target's ARC_HC_ONLINE_FP8 there). Anything else raises.
 """
 
 import json
+import os
 
 import torch
 from torch import nn
@@ -34,6 +35,31 @@ def _method(device):
     return method
 
 
+# arc-forge ARC_DFLASH_FP8_OP (opt-in, default 0): Fp8BlockLinear runs as the custom op arc_dflash::fp8_block_linear,
+# opaque to dynamo but no graph break, so inductor keeps fusing the elementwise work around the linear as it does
+# around a BF16 nn.Linear (fast_drafter.compile_layers). Off, the linear is compiler.disable'd and every one of the
+# per-layer linears splits the compiled layer. The GEMM is the same call either way; inductor's fusion moves the
+# neighbours' rounding, not the linear's. (Ported from exp/dflash-fp8-b200.)
+FP8_OP = os.environ.get("ARC_DFLASH_FP8_OP", "0")
+if FP8_OP not in ("0", "1"):
+    raise ValueError(f"ARC_DFLASH_FP8_OP must be 0 or 1, got {FP8_OP!r}")
+# The op takes the module's (processed) weight tensor and finds the module by its address: an int id argument would
+# be value-guarded, and the layers share one compiled code object -> a recompile per layer up to
+# torch._dynamo's recompile_limit (8), after which dynamo silently runs the layers eager.
+_LINEARS: dict = {}  # weight.data_ptr() -> Fp8BlockLinear
+
+
+@torch.library.custom_op("arc_dflash::fp8_block_linear", mutates_args=())
+def fp8_block_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    module = _LINEARS[weight.data_ptr()]
+    return module.method.apply(module, x, bias=None)
+
+
+@fp8_block_linear.register_fake
+def _(x, weight):
+    return x.new_empty(x.shape[0], weight.shape[0])
+
+
 class Fp8BlockLinear(nn.Module):
     def __init__(self, weight: torch.Tensor, scale_inv: torch.Tensor):
         super().__init__()
@@ -53,10 +79,18 @@ class Fp8BlockLinear(nn.Module):
         self.orig_dtype = torch.bfloat16
         self.method = _method(weight.device)
         self.method.process_weights_after_loading(self)
+        if self.weight.shape[0] != self.out_features or self.weight.data_ptr() in _LINEARS:
+            raise RuntimeError(f"processed FP8 weight {tuple(self.weight.shape)} for {self.out_features} outputs, "
+                               "or its storage already registered")
+        _LINEARS[self.weight.data_ptr()] = self
 
     def forward(self, x):
         shape = x.shape
-        y = self.method.apply(self, x.reshape(-1, shape[-1]), bias=None)
+        rows = x.reshape(-1, shape[-1])
+        if FP8_OP == "1":
+            y = torch.ops.arc_dflash.fp8_block_linear(rows, self.weight)
+        else:
+            y = self.method.apply(self, rows, bias=None)
         return y.reshape(*shape[:-1], self.out_features)
 
 
