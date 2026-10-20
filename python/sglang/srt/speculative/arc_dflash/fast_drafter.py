@@ -130,14 +130,21 @@ def compile_layers(model, deterministic: bool = False):
     nvfp4.Nvfp4Experts.forward = torch.compiler.disable(nvfp4.Nvfp4Experts.forward)
     fp8.Fp8BlockLinear.forward = torch.compiler.disable(fp8.Fp8BlockLinear.forward)
     fp8.HummingW4A8Linear.forward = torch.compiler.disable(fp8.HummingW4A8Linear.forward)
+    # Context "inject" (plain residual): a refresh never runs the layers (model.MTP3.refresh), so there is no refresh
+    # entry to compile; the decode step's injected K/V (fusion, context_layernorm, k/v projections) run eager inside
+    # the step's CUDA graph.
+    inject = model.config.context == "inject"
     for layer in model.layers:
         layer.forward = torch.compile(layer.forward, dynamic=True, options=options)
-        if model.refresh_entry:
+        if model.refresh_entry and not inject:
             # MTP3.refresh's entry: the same layer under its own code object, so refresh and decode variants never
             # share (or match) one cache (model.Decoder.refresh_forward)
             layer.refresh_forward = torch.compile(layer.refresh_forward, dynamic=True, options=options)
-    model.hyper_connection_mixer.forward = torch.compile(model.hyper_connection_mixer.forward, dynamic=True,
-                                                         options=options)
+    if model.config.residual == "hc":
+        model.hyper_connection_mixer.forward = torch.compile(model.hyper_connection_mixer.forward, dynamic=True,
+                                                             options=options)
+    else:  # the plain residual's output norm in place of the mixer
+        model.norm.forward = torch.compile(model.norm.forward, dynamic=True, options=options)
 
 
 @torch.no_grad()
@@ -183,7 +190,8 @@ def warm(worker):
     """Before the CUDA-graph capture (whose eager warm-up compiles decode's variants): under MTP3.refresh_entry,
     compile the refresh entry's variants (warm_refresh); nothing to compile on the eager path. Off, a refresh
     compiles the layers' variants it needs on first use, as before."""
-    if worker.model.compile_mode != "0" and worker.model.refresh_entry:
+    # context "inject": a refresh runs no compiled code (model.MTP3.refresh), nothing to warm
+    if worker.model.compile_mode != "0" and worker.model.refresh_entry and worker.model.config.context != "inject":
         warm_refresh(worker.model, worker.device, worker.prefill_chunk)
     if os.environ.get("ARC_DFLASH_CHECK_FAST") == "1":
         print("DFlash fast-path check:", check(worker.model), flush=True)
@@ -199,6 +207,8 @@ def warm_refresh(model, device, chunk):
     the first compile's sizes are the kernels' size hints."""
     if not model.refresh_entry:
         raise RuntimeError("warm_refresh compiles MTP3.refresh_entry's variants; this drafter refreshes without it")
+    if model.config.context == "inject":
+        raise RuntimeError("warm_refresh: an injected context refresh runs no compiled layers")
     c = model.config
     n = max(REFRESH_MIN, chunk)
     tokens = torch.zeros((1, 2 * n), dtype=torch.long, device=device)
