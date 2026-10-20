@@ -240,6 +240,21 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
             raise ValueError("the FP8 QSA index cache needs indexer_kv_heads=1")
         return scale.reshape(-1, pool.qsa_compressed_page_size)
 
+    def get_decode_compressed_lengths(self) -> torch.Tensor:
+        """The compressed lengths get_decode_mqa_inputs returns, without touching a layer's cache
+        (ARC_QSA_INDEX_SHARD: a layer the pair owns has none on this rank)."""
+        if self.is_cuda_graph:
+            if self.graph_compressed_lengths is None:
+                raise RuntimeError("QSA CUDA graph decode metadata is incomplete")
+            return self.graph_compressed_lengths
+        if self.decode_page_table is not None and self.decode_lengths is not None:
+            return self.decode_lengths
+        return torch.div(
+            self.sequence_lengths.to(torch.int32),
+            self.compress_ratio,
+            rounding_mode="floor",
+        )
+
     def get_decode_mqa_inputs(
         self, layer_id: int
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:

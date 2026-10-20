@@ -8,6 +8,7 @@ Qwen3Next-DSA) adds only the flat per-token index-K cache.
 
 from __future__ import annotations
 
+import logging
 import os
 from contextlib import nullcontext
 from typing import List, Optional
@@ -16,6 +17,8 @@ import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.mem_cache.memory_pool import GB, HybridLinearKVPool, MambaPool, MHATokenToKVPool
+
+logger = logging.getLogger(__name__)
 
 # State layer IDs are serialized as uint32 by the disaggregation protocols.
 # Reserve the value below PLE's request-wide sentinel for QSA's request-wide
@@ -134,6 +137,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         quant_method=None,
         post_capture_active: bool = False,
         index_size: Optional[int] = None,
+        qsa_index_shard=None,
     ):
         if page_size <= 1 or page_size % qsa_compress_ratio != 0:
             raise ValueError(
@@ -151,6 +155,17 @@ class QSATokenToKVPool(HybridLinearKVPool):
         self.qsa_compressed_scale_pool = []
         self.qsa_rope_position_buffer = torch.empty(0)
         self.qsa_index_fp8 = qsa_index_fp8_enabled()
+        # ARC_QSA_INDEX_SHARD=layer (index_shard.py): the index state (pending ring, compressed keys, scales) exists
+        # only for the QSA layers this attention-TP rank owns (layer-check: all of them); None keeps every layer's.
+        self.qsa_index_shard = qsa_index_shard
+        index_layer_ids = list(full_attention_layer_ids)
+        if qsa_index_shard is not None:
+            if list(qsa_index_shard.layer_ids) != index_layer_ids:
+                raise RuntimeError(
+                    f"QSA index shard covers layers {list(qsa_index_shard.layer_ids)}, the pool {index_layer_ids}"
+                )
+            index_layer_ids = list(qsa_index_shard.held_layer_ids)
+        self._qsa_index_offset = {layer_id: i for i, layer_id in enumerate(index_layer_ids)}
         super().__init__(
             size=size,
             dtype=dtype,
@@ -235,7 +250,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
                     dtype=self.index_state_dtype,
                     device=device,
                 )
-                for _ in full_attention_layer_ids
+                for _ in index_layer_ids
             ]
             # RoPE coordinates are layer-independent. Keep the exact Qwen4-Exp
             # MRoPE position of every incomplete key so compression can rotate
@@ -247,7 +262,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
             # compressed pages are addressable from a single base pointer.
             self.qsa_compressed_flat = torch.zeros(
                 (
-                    len(full_attention_layer_ids),
+                    len(index_layer_ids),
                     self.qsa_compressed_capacity
                     * self.qsa_index_kv_heads
                     * self.qsa_index_head_dim,
@@ -262,7 +277,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
                 # never-written slots (zeros in k8) at a zero key, as in the BF16 cache
                 self.qsa_compressed_scale_flat = torch.ones(
                     (
-                        len(full_attention_layer_ids),
+                        len(index_layer_ids),
                         self.qsa_compressed_capacity * self.qsa_index_kv_heads,
                     ),
                     dtype=torch.float32,
@@ -274,22 +289,50 @@ class QSATokenToKVPool(HybridLinearKVPool):
                 self.qsa_index_kv_heads,
                 self.qsa_index_head_dim,
             )
-            for layer_offset in range(len(full_attention_layer_ids))
+            for layer_offset in range(len(index_layer_ids))
         ]
         if self.qsa_index_fp8:
             self.qsa_compressed_scale_pool = [
                 self.qsa_compressed_scale_flat[layer_offset].view(
                     self.qsa_compressed_capacity, self.qsa_index_kv_heads
                 )
-                for layer_offset in range(len(full_attention_layer_ids))
+                for layer_offset in range(len(index_layer_ids))
             ]
         k_size, v_size = self.get_kv_size_bytes()
         self.mem_usage = (k_size + v_size) / GB
+        if qsa_index_shard is not None:
+            index_bytes = self.qsa_compressed_flat.nbytes + sum(
+                t.nbytes for t in self.qsa_key_state_buffer_pool
+            ) + (self.qsa_compressed_scale_flat.nbytes if self.qsa_index_fp8 else 0)
+            logger.info(
+                "ARC_QSA_INDEX_SHARD: QSA index state on this rank %.3f GiB for %d of %d layers %s "
+                "(compressed slots %d x %d B per layer); unsharded it would be %.3f GiB",
+                index_bytes / (1 << 30),
+                len(index_layer_ids),
+                len(full_attention_layer_ids),
+                index_layer_ids,
+                self.qsa_compressed_capacity,
+                self.qsa_compressed_flat[0].nbytes // self.qsa_compressed_capacity
+                + (4 * self.qsa_index_kv_heads if self.qsa_index_fp8 else 0),
+                index_bytes / len(index_layer_ids) * len(full_attention_layer_ids) / (1 << 30),
+            )
+
+    def _qsa_index_layer(self, layer_id: int) -> int:
+        """Offset of layer_id's index state: the full-attention offset, or under ARC_QSA_INDEX_SHARD the offset
+        among the layers this rank owns (a layer owned by the pair raises: its index is not here)."""
+        if self.qsa_index_shard is None:
+            return self._transfer_full_attention_id(layer_id)
+        offset = self._qsa_index_offset.get(layer_id)
+        if offset is None:
+            raise RuntimeError(
+                f"QSA index of layer {layer_id} is held by attention-TP rank "
+                f"{self.qsa_index_shard.owner(layer_id)} (ARC_QSA_INDEX_SHARD), not by rank "
+                f"{self.qsa_index_shard.rank}"
+            )
+        return offset
 
     def get_qsa_key_state_buffer(self, layer_id: int) -> torch.Tensor:
-        return self.qsa_key_state_buffer_pool[
-            self._transfer_full_attention_id(layer_id)
-        ]
+        return self.qsa_key_state_buffer_pool[self._qsa_index_layer(layer_id)]
 
     def set_qsa_key_state_buffer(
         self, layer_id: int, loc: torch.Tensor, token_k: torch.Tensor
@@ -313,17 +356,13 @@ class QSATokenToKVPool(HybridLinearKVPool):
         return self.qsa_rope_position_buffer[loc.long()]
 
     def get_qsa_compressed_k_buffer(self, layer_id: int) -> torch.Tensor:
-        return self.qsa_compressed_k_buffer_pool[
-            self._transfer_full_attention_id(layer_id)
-        ]
+        return self.qsa_compressed_k_buffer_pool[self._qsa_index_layer(layer_id)]
 
     def get_qsa_compressed_k_scale(self, layer_id: int) -> Optional[torch.Tensor]:
         """[compressed_slots, kv_heads] fp32 scales of the FP8 cache (h21), None for BF16."""
         if not self.qsa_index_fp8:
             return None
-        return self.qsa_compressed_scale_pool[
-            self._transfer_full_attention_id(layer_id)
-        ]
+        return self.qsa_compressed_scale_pool[self._qsa_index_layer(layer_id)]
 
     def set_qsa_compressed_k_buffer(
         self, layer_id: int, loc: torch.Tensor, compressed_k: torch.Tensor
@@ -352,6 +391,8 @@ class QSATokenToKVPool(HybridLinearKVPool):
         # its zero-initialized or stale contents.
         if not self.full_attention_layer_id_mapping:
             return [], [], []
+        if self.qsa_index_shard is not None:
+            raise NotImplementedError("ARC_QSA_INDEX_SHARD does not cover PD transfer of the QSA pending rings")
         if self.qsa_pending_ring_size != self.qsa_compress_ratio:
             # PD prefill and decode may use different speculative widths. The
             # existing protocol transfers request rows without remapping ring
@@ -385,6 +426,8 @@ class QSATokenToKVPool(HybridLinearKVPool):
         One full KV page maps to one compressed page because the full page size
         is an integer multiple of the compression ratio.
         """
+        if self.qsa_index_shard is not None:
+            raise NotImplementedError("ARC_QSA_INDEX_SHARD does not cover PD transfer of the compressed keys")
         if self.qsa_index_fp8:
             raise NotImplementedError(
                 "ARC_QSA_INDEX_FP8 (h21) does not transfer the compressed-key scales; PD is unsupported"
