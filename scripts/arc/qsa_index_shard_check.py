@@ -235,8 +235,9 @@ class Workload:
         self.forward_id = 0
 
     def _fb(self, **kw):
+        # qsa_ring_resume_cpu: ForwardBatch's default (None, no session exact resume row), read by the write plan
         base = dict(_original_forward_mode=None, spec_info=None, mrope_positions=None, extend_seq_lens=None,
-                    extend_seq_lens_cpu=None, num_padding=0)
+                    extend_seq_lens_cpu=None, num_padding=0, qsa_ring_resume_cpu=None)
         base.update(kw)
         return SimpleNamespace(**base)
 
