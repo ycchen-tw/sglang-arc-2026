@@ -44,6 +44,37 @@ if BATCHED_COMMIT not in ("0", "1"):
     raise ValueError(f"ARC_DFLASH_BATCHED_COMMIT must be 0 or 1, got {BATCHED_COMMIT!r}")
 
 
+# arc-forge ARC_DFLASH_KV_DTYPE (opt-in, default bf16; exp/dflash-fp8-b200 fb27ed9be): the dtype of the ring pool's
+# window K/V. fp8_e4m3 stores them as e4m3 with no scale (clamped to +-448, as sglang's fp8_e4m3 KV without checkpoint
+# scales), half the window bytes; ring_attention widens each tile to BF16 on load, so attention computes with exactly
+# the rounded values, and every read that leaves the pool (read_request, the SDPA gather) widens them the same way.
+# Lossy: only the proposals change (rejection sampling keeps the output target-distributed), judged by accept length.
+# Ring layout only. B200 D-line: AL unchanged, the draft step slower (batch 128: 5.84 -> 9.30 ms).
+KV_DTYPES = {"bf16": torch.bfloat16, "fp8_e4m3": torch.float8_e4m3fn}
+KV_DTYPE = os.environ.get("ARC_DFLASH_KV_DTYPE", "bf16")
+if KV_DTYPE not in KV_DTYPES:
+    raise ValueError(f"ARC_DFLASH_KV_DTYPE must be one of {sorted(KV_DTYPES)}, got {KV_DTYPE!r}")
+FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
+
+
+def to_pool(x, dtype):
+    """K/V rows on their way into a pool of `dtype` (a cast that saturates instead of making NaN for e4m3)."""
+    if dtype == torch.bfloat16:
+        return x
+    return x.clamp(-FP8_MAX, FP8_MAX).to(dtype)
+
+
+# arc-forge ARC_DFLASH_FUSE_ONCE (opt-in, default 0; context "inject"): the injected step's input fusions in one pass
+# -- fc_embedding / fc_hidden over [committed rows, anchor] with [their predecessor GRs, the cursor GR] -- instead of
+# one fusion for the committed rows and another for the whole proposal block (each re-reading both fc weights, the
+# 10240-wide fc_hidden over the mask rows too). A mask row's fusion does not depend on the request: fc_embedding of
+# the normed mask embedding, plus (mask_gr "copy") the cursor GR's fc_hidden or (mask_gr "none") fc_hidden of a zero
+# GR, exactly 0. The same rows through the same linears; only the GEMMs' row counts change.
+FUSE_ONCE = os.environ.get("ARC_DFLASH_FUSE_ONCE", "0")
+if FUSE_ONCE not in ("0", "1"):
+    raise ValueError(f"ARC_DFLASH_FUSE_ONCE must be 0 or 1, got {FUSE_ONCE!r}")
+
+
 @torch.no_grad()
 def fast_propose(model, hidden, anchor, temperature):
     """sampling.propose_path with the top-16 taken on the BF16 logits: casting [rows, vocab] to FP32 first is a
@@ -88,6 +119,9 @@ class StatePool:
                                       "context 'inject'); use the ring pool (ARC_DFLASH_POOL=ring)")
         self.model, self.c, self.slots, self.device, self.steps = model, c, slots, device, steps
         self.sparse_q = sparse_q
+        if KV_DTYPE != "bf16" and type(self) is StatePool:
+            raise ValueError(f"ARC_DFLASH_KV_DTYPE={KV_DTYPE} needs the ring pool (ARC_DFLASH_POOL=ring)")
+        self.kv_dtype = torch.bfloat16  # RingStatePool: ARC_DFLASH_KV_DTYPE's
         w, b, layers = c.window, c.block_size, c.num_layers
         kv = (layers, slots, c.num_key_value_heads, w, c.head_dim)
         bf16 = dict(dtype=torch.bfloat16, device=device)
@@ -404,8 +438,14 @@ class RingStatePool(StatePool):
         # the `steps` proposal rows (_step_injected), so that many spare columns.
         self.spare = self.steps if self.inject else self.width
         kv = (c.num_layers, slots, c.num_key_value_heads, w + 1 + self.spare, c.head_dim)
-        self.key = torch.zeros(kv, dtype=torch.bfloat16, device=device)
-        self.value = torch.zeros(kv, dtype=torch.bfloat16, device=device)
+        self.kv_dtype = KV_DTYPES[KV_DTYPE]
+        self.key = torch.zeros(kv, dtype=self.kv_dtype, device=device)
+        self.value = torch.zeros(kv, dtype=self.kv_dtype, device=device)
+        if FUSE_ONCE == "1":
+            if not self.inject:
+                raise ValueError("ARC_DFLASH_FUSE_ONCE is the injected step's fusion (drafter context 'inject')")
+            with torch.no_grad():  # a mask row's fusion without its GR term (FUSE_ONCE)
+                self.mask_fusion = model.fc_embedding(model.pre_fc_norm_embedding(model.mask_embedding[None]))[0]
         self.positions = torch.full((slots, w + 1), -1, dtype=torch.long, device=device)
         # the scratch slot's window "ends" at position 0, the cursor every padding row carries
         self.positions[self.scratch, 0] = 0
@@ -419,8 +459,8 @@ class RingStatePool(StatePool):
         # pool [L, slots, Hkv, columns, D] indexed on (layer, slot, column): the value is [L, B, n, Hkv, D]
         keys = torch.stack([layer.key for layer in layers]).transpose(2, 3)
         values = torch.stack([layer.value for layer in layers]).transpose(2, 3)
-        self.key[layer_ids, rows[None], :, col[None]] = keys
-        self.value[layer_ids, rows[None], :, col[None]] = values
+        self.key[layer_ids, rows[None], :, col[None]] = to_pool(keys, self.kv_dtype)
+        self.value[layer_ids, rows[None], :, col[None]] = to_pool(values, self.kv_dtype)
         fresh = torch.stack([b.gather(1, last.expand(-1, 1, b.shape[-1])) for layer in layers for b in layer.boundaries])
         fresh = fresh.view(len(layers), 4, *fresh.shape[1:])  # [L, 4, B, 1, H]
         self.boundary[:, :, idx] = torch.where(has, fresh, self.boundary[:, :, idx])
@@ -438,8 +478,8 @@ class RingStatePool(StatePool):
         self.positions[s, col] = torch.where(valid, pos, torch.full_like(pos, -1))
         self.positions[s, w].fill_(-1)
         for i, layer in enumerate(cache.layers):
-            self.key[i, s][:, col] = layer.key[0]
-            self.value[i, s][:, col] = layer.value[0]
+            self.key[i, s][:, col] = to_pool(layer.key[0], self.kv_dtype)
+            self.value[i, s][:, col] = to_pool(layer.value[0], self.kv_dtype)
             if self.inject:
                 if layer.boundaries:
                     raise RuntimeError("an injected context window carries no conv boundaries")
@@ -462,7 +502,8 @@ class RingStatePool(StatePool):
         ring = self.positions[s, :w]
         order = torch.argsort(ring)  # padding (-1) first, then ascending positions: decode_cache's layout
         layers = tuple(
-            LayerCache(self.key[i, s][:, order][None].clone(), self.value[i, s][:, order][None].clone(),
+            LayerCache(self.key[i, s][:, order][None].to(torch.bfloat16, copy=True),
+                       self.value[i, s][:, order][None].to(torch.bfloat16, copy=True),
                        () if self.inject else tuple(self.boundary[i, j, s : s + 1].clone() for j in range(4)))
             for i in range(self.c.num_layers)
         )
@@ -481,7 +522,7 @@ class RingStatePool(StatePool):
         if self.attention == "triton":  # ring_attention reads the pool by slot
             kv = [(RingWindow(self.key[i], idx, w + 1), RingWindow(self.value[i], idx, w + 1)) for i in range(c.num_layers)]
         else:  # gathered copies with spare columns (fast_drafter's SDPA path)
-            kv = [(self.key[i][idx], self.value[i][idx]) for i in range(c.num_layers)]
+            kv = [(self.key[i][idx].to(torch.bfloat16), self.value[i][idx].to(torch.bfloat16)) for i in range(c.num_layers)]
         prefix = CleanCache(
             ring_pos,
             tuple(
@@ -516,8 +557,8 @@ class RingStatePool(StatePool):
             self._commit_batched(block, idx, rows, col, last, has)
         else:
             for i, layer in enumerate(block.layers):
-                self.key[i][rows, :, col] = layer.key.transpose(1, 2)
-                self.value[i][rows, :, col] = layer.value.transpose(1, 2)
+                self.key[i][rows, :, col] = to_pool(layer.key.transpose(1, 2), self.kv_dtype)
+                self.value[i][rows, :, col] = to_pool(layer.value.transpose(1, 2), self.kv_dtype)
                 for j in range(4):
                     fresh = layer.boundaries[j].gather(1, last.expand(-1, 1, layer.boundaries[j].shape[-1]))
                     self.boundary[i, j][idx] = torch.where(has, fresh, self.boundary[i, j][idx])
@@ -556,35 +597,51 @@ class RingStatePool(StatePool):
         positions = first[:, None] + slot
         committed = slot < length[:, None]
         span = self.pending_gr[idx]  # [batch, block + 1, branches, hidden]: one predecessor per row, then the cursor's
-        fused = model.fuse(model.embed_tokens(self.pending_tokens[idx][:, :kc]), span[:, :kc])
+        cursor_gr = span.gather(1, length[:, None, None, None].expand(-1, 1, *span.shape[2:]))
+        if FUSE_ONCE == "1":
+            # [committed rows..., anchor] with [their predecessor GRs..., the cursor GR]: the committed rows' fusion
+            # and the proposal block's first row from one fc_embedding and one fc_hidden; the mask rows' constant
+            e = model.fc_embedding(model.pre_fc_norm_embedding(model.embed_tokens(
+                torch.cat((self.pending_tokens[idx][:, :kc], self.anchor[:batch, None]), 1))))
+            g = model.fc_hidden(model.pre_fc_norm_hidden(torch.cat((span[:, :kc], cursor_gr), 1).flatten(-2)))
+            fused = g[:, :kc] + e[:, :kc]
+            mask = self.mask_fusion.expand(batch, steps - 1, -1)
+            if c.mask_gr == "copy":
+                mask = g[:, kc:] + mask
+            proposal = torch.cat((g[:, kc:] + e[:, kc:], mask), 1)
+        else:
+            fused = model.fuse(model.embed_tokens(self.pending_tokens[idx][:, :kc]), span[:, :kc])
         col = torch.where(committed, positions % w, torch.full_like(positions, w))
         rows = idx[:, None]
         self.positions[rows, col] = torch.where(committed, positions, torch.full_like(positions, -1))
+        # every layer's injected K/V [layers, batch, kv heads, kc, dim] (model.MTP3.context_kv_stacked: per layer, or
+        # one GEMM under ARC_DFLASH_INJECT_KV=gemm)
+        keys, values = model.context_kv_stacked(fused, positions)
         if BATCHED_COMMIT == "1":
-            kv = [layer.context_kv(fused, positions) for layer in model.layers]
-            layer_ids = torch.arange(len(kv), device=self.device)[:, None, None]
+            layer_ids = torch.arange(c.num_layers, device=self.device)[:, None, None]
             # pool [L, slots, Hkv, columns, D] indexed on (layer, slot, column): the value is [L, B, kc, Hkv, D]
-            self.key[layer_ids, rows[None], :, col[None]] = torch.stack([k for k, _ in kv]).transpose(2, 3)
-            self.value[layer_ids, rows[None], :, col[None]] = torch.stack([v for _, v in kv]).transpose(2, 3)
+            self.key[layer_ids, rows[None], :, col[None]] = to_pool(keys.transpose(2, 3), self.kv_dtype)
+            self.value[layer_ids, rows[None], :, col[None]] = to_pool(values.transpose(2, 3), self.kv_dtype)
         else:
-            for i, layer in enumerate(model.layers):
-                k, v = layer.context_kv(fused, positions)
-                self.key[i][rows, :, col] = k.transpose(1, 2)
-                self.value[i][rows, :, col] = v.transpose(1, 2)
+            for i in range(c.num_layers):
+                self.key[i][rows, :, col] = to_pool(keys[i].transpose(1, 2), self.kv_dtype)
+                self.value[i][rows, :, col] = to_pool(values[i].transpose(1, 2), self.kv_dtype)
         self.positions[:, w] = -1
         block = (cursor + 1)[:, None] + torch.arange(steps, device=self.device)
-        embeds = torch.cat(
-            (model.embed_tokens(self.anchor[:batch])[:, None], model.mask_embedding.expand(batch, steps - 1, -1)), 1
-        )
-        cursor_gr = span.gather(1, length[:, None, None, None].expand(-1, 1, *span.shape[2:]))
-        grs = model.proposal_gr(cursor_gr.expand(-1, steps, -1, -1),
-                                (torch.arange(steps, device=self.device) == 0)[None])
         if self.attention == "triton":  # ring_attention reads the pool by slot
             kv = [(RingWindow(self.key[i], idx, w + 1), RingWindow(self.value[i], idx, w + 1)) for i in range(c.num_layers)]
         else:  # gathered copies with `steps` spare columns (fast_drafter's SDPA path)
-            kv = [(self.key[i][idx], self.value[i][idx]) for i in range(c.num_layers)]
+            kv = [(self.key[i][idx].to(torch.bfloat16), self.value[i][idx].to(torch.bfloat16)) for i in range(c.num_layers)]
         prefix = CleanCache(self.positions[idx], tuple(LayerCache(*kv[i], ()) for i in range(c.num_layers)))
-        hidden, _ = model(embeds, grs, block, prefix)
+        if FUSE_ONCE == "1":
+            hidden, _ = model.forward_fused(proposal, block, prefix)
+        else:
+            embeds = torch.cat(
+                (model.embed_tokens(self.anchor[:batch])[:, None], model.mask_embedding.expand(batch, steps - 1, -1)), 1
+            )
+            grs = model.proposal_gr(cursor_gr.expand(-1, steps, -1, -1),
+                                    (torch.arange(steps, device=self.device) == 0)[None])
+            hidden, _ = model(embeds, grs, block, prefix)
         self.pending_length.index_fill_(0, idx, 0)
         proposal = fast_propose(model, hidden, self.anchor[:batch], self.temperature[:batch])
         self._emit(batch, proposal)
