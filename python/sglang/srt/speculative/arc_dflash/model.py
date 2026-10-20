@@ -1,7 +1,8 @@
 """Qwen4 native GR/MoE MTP copies with causal SWA and detached clean caches.
 
 Tensor names follow the official HF checkpoint. GR/norm/attention equations
-follow transformers' Qwen4Exp and SGLang's native MTP fusion. No target KV.
+follow transformers' Qwen4Exp and SGLang's native MTP fusion. No target KV,
+except under Config.context "inject" (with the plain residual, PlainDecoder).
 Each batch item is one isolated sequence/block; positions are absolute.
 """
 
@@ -39,7 +40,8 @@ class Config:
     selector_top_k: int = 16
     selector_rank: int = 256
     # "moe": routed experts + router (the trained export); "dense_shared": one SwiGLU of width
-    # dense_intermediate_size in place of the routed experts and router, shared expert and its gate unchanged
+    # dense_intermediate_size in place of the routed experts and router, shared expert and its gate unchanged;
+    # "dense": one SwiGLU of width dense_intermediate_size and nothing else (mlp.{gate,up,down}_proj)
     ffn_type: str = "moe"
     dense_intermediate_size: int = 0
     # The proposal slots after the anchor (block slots 1 .. b-1, the mask embeddings): "copy" pairs each with the
@@ -47,6 +49,18 @@ class Config:
     # and pre_fc_norm_hidden(0) = 0 through the bias-free fc_hidden, so the fusion's GR term is exactly absent.
     # Committed slots and the anchor always read their own predecessor GR.
     mask_gr: str = "copy"
+    # arc-forge's attention sink (a learned per-head logit in the softmax): read so that an export stating it parses,
+    # refused when true -- this drafter's attention kernels have no sink term.
+    attention_sink: bool = False
+    # "hc": the native MTP's hc_count-branch hyper-connections (Decoder, GatedResidual). "plain" (arc-forge
+    # model.PlainDecoder): one residual stream with pre-norm RMSNorms; the target GR still enters with all its
+    # branches -- fc_hidden maps the flattened [hc_count * hidden] GR to the stream -- and the outputs are `norm`'s.
+    residual: str = "hc"
+    # "recompute": committed tokens run through the trunk; their K/V and the conv boundaries are the trunk's.
+    # "inject" (plain only): a committed token's K/V at each layer come from its input fusion through the layer's
+    # context_layernorm and its own k/v projections -- no trunk rows and no conv boundaries for context. The trunk
+    # runs the proposal block alone and its convs start from zero at the anchor slot.
+    context: str = "recompute"
 
     def __post_init__(self):
         if self.hidden_size % self.conv_group_size or self.window < 1:
@@ -59,12 +73,20 @@ class Config:
             raise ValueError("invalid GQA geometry")
         if not 1 <= self.num_experts_per_tok <= self.num_experts:
             raise ValueError("invalid routed expert count")
-        if self.ffn_type not in ("moe", "dense_shared"):
+        if self.ffn_type not in ("moe", "dense_shared", "dense"):
             raise ValueError(f"unknown ffn_type {self.ffn_type!r}")
-        if (self.ffn_type == "dense_shared") != (self.dense_intermediate_size > 0):
-            raise ValueError("dense_intermediate_size is set exactly when ffn_type is dense_shared")
+        if (self.ffn_type in ("dense_shared", "dense")) != (self.dense_intermediate_size > 0):
+            raise ValueError("dense_intermediate_size is set exactly when ffn_type is dense_shared or dense")
         if self.mask_gr not in ("copy", "none"):
             raise ValueError(f"unknown mask_gr {self.mask_gr!r}")
+        if self.attention_sink:
+            raise ValueError("attention_sink: the serving drafter's attention has no sink term")
+        if self.residual not in ("hc", "plain"):
+            raise ValueError(f"unknown residual {self.residual!r}")
+        if self.context not in ("recompute", "inject"):
+            raise ValueError(f"unknown context {self.context!r}")
+        if self.context == "inject" and self.residual != "plain":
+            raise ValueError("target-KV injection is implemented for the plain residual only")
         if not 1 <= self.selector_top_k <= self.vocab_size:
             raise ValueError("invalid selector top-K")
         rotary = int(self.head_dim * self.partial_rotary_factor)
@@ -404,6 +426,17 @@ class Attention(nn.Module):
         y = y.transpose(1, 2).flatten(-2) * torch.sigmoid(gate.flatten(-2))
         return self.o_proj(y), k, v
 
+    def key_value(self, x, positions):
+        """k (normed, rotated) and v [batch, kv heads, seq, dim] of inputs x [batch, seq, hidden]: `forward`'s own
+        k / v (and fast_drafter.attention_forward's), for the plain drafter's injected context (PlainDecoder.context_kv).
+        `forward` keeps its inline copy so the hyper-connection drafter's code is untouched."""
+        c = self.c
+        k = self.rotary(
+            self.k_norm(self.k_proj(x).unflatten(-1, (c.num_key_value_heads, c.head_dim))).transpose(1, 2), positions
+        )
+        v = self.v_proj(x).unflatten(-1, (c.num_key_value_heads, c.head_dim)).transpose(1, 2)
+        return k, v
+
 
 class MLP(nn.Module):
     def __init__(self, c, intermediate):
@@ -511,11 +544,22 @@ class DenseWithShared(nn.Module):
         return self.routed(x) + self.shared_expert(x) * torch.sigmoid(self.shared_expert_gate(x))
 
 
+def feed_forward(c):
+    """The FFN module of Config.ffn_type: MoE, DenseWithShared, or (dense) one MLP of dense_intermediate_size."""
+    if c.ffn_type == "moe":
+        return MoE(c)
+    if c.ffn_type == "dense_shared":
+        return DenseWithShared(c)
+    if c.ffn_type == "dense":
+        return MLP(c, c.dense_intermediate_size)
+    raise ValueError(f"unknown ffn_type {c.ffn_type!r}")
+
+
 class Decoder(nn.Module):
     def __init__(self, c):
         super().__init__()
         self.self_attn = Attention(c)
-        self.mlp = MoE(c) if c.ffn_type == "moe" else DenseWithShared(c)
+        self.mlp = feed_forward(c)
         self.attn_hyper_connection, self.mlp_hyper_connection = GatedResidual(c), GatedResidual(c)
         self.attention_conv, self.mlp_conv = GroupedConv(c), GroupedConv(c)
 
@@ -533,6 +577,51 @@ class Decoder(nn.Module):
         y = self.mlp_conv.convolve(raw_d, delta, 1, boundary[3])
         h = h + y.unsqueeze(-2) * gate.unsqueeze(-1)
         return h, LayerCache(k, v, (raw_a, raw_b, raw_c, raw_d))
+
+
+class PlainDecoder(nn.Module):
+    """arc-forge model.PlainDecoder (Config.residual "plain"): Decoder on one residual stream h [batch, seq, hidden]
+    -- pre-norm RMSNorms where Decoder has hyper-connections, the same attention, FFN and grouped convs in the same
+    order, and plain residual adds. Under context "inject" it also holds context_layernorm, the norm a committed
+    token's injected K/V are projected from (context_kv), and its prefix carries no conv boundaries: the convs start
+    from zero at the block's first slot."""
+
+    def __init__(self, c):
+        super().__init__()
+        self.c = c
+        self.self_attn = Attention(c)
+        self.mlp = feed_forward(c)
+        self.input_layernorm = RMSNorm(c.hidden_size, c.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(c.hidden_size, c.rms_norm_eps)
+        self.attention_conv, self.mlp_conv = GroupedConv(c), GroupedConv(c)
+        if c.context == "inject":
+            self.context_layernorm = RMSNorm(c.hidden_size, c.rms_norm_eps)
+
+    def forward(self, h, positions, prefix, prefix_positions):
+        if self.c.context == "inject":
+            # Injected context has no trunk rows, so nothing precedes the block's first slot in the convs.
+            if prefix is not None and prefix.boundaries:
+                raise ValueError("an injected context cache carries no conv boundaries")
+            boundary = (h.new_zeros(h.shape[0], 1, h.shape[-1]),) * 4
+        elif prefix is None:
+            boundary = (h.new_zeros(h.shape[0], 1, h.shape[-1]),) * 4
+        else:
+            if len(prefix.boundaries) != 4:
+                raise ValueError("a recomputed context cache carries the four conv boundaries")
+            boundary = tuple(x[:, -1:] for x in prefix.boundaries)
+        raw_a = self.input_layernorm(h)
+        x, delta = self.attention_conv.prepare(raw_a, boundary[0])
+        raw_b, k, v = self.self_attn(x, positions, prefix, prefix_positions)
+        h = h + self.attention_conv.convolve(raw_b, delta, 1, boundary[1])
+        raw_c = self.post_attention_layernorm(h)
+        x, delta = self.mlp_conv.prepare(raw_c, boundary[2])
+        raw_d = self.mlp(x)
+        h = h + self.mlp_conv.convolve(raw_d, delta, 1, boundary[3])
+        return h, LayerCache(k, v, (raw_a, raw_b, raw_c, raw_d))
+
+    def context_kv(self, fused, positions):
+        """Injected K/V [batch, kv heads, seq, dim] of committed tokens from their input fusion [batch, seq, hidden]."""
+        return self.self_attn.key_value(self.context_layernorm(fused), positions)
 
 
 class CandidateSelector(nn.Module):
@@ -604,14 +693,23 @@ class MTP3(nn.Module):
         # Native MTP normalizes across all 4 branches here, unlike GR's norms.
         self.pre_fc_norm_hidden = RMSNorm(c.hc_count * c.hidden_size, c.rms_norm_eps)
         self.fc_embedding = nn.Linear(c.hidden_size, c.hidden_size, bias=False)
-        self.fc_hidden = nn.Linear(c.hidden_size, c.hidden_size, bias=False)
-        self.layers = nn.ModuleList(Decoder(c) for _ in range(c.num_layers))
-        self.hyper_connection_mixer = GatedResidual(c, combine=False)
+        # The registration order of arc-forge model.MTP3 (the export's tensor names are what matter here).
+        if c.residual == "hc":
+            self.fc_hidden = nn.Linear(c.hidden_size, c.hidden_size, bias=False)
+            self.layers = nn.ModuleList(Decoder(c) for _ in range(c.num_layers))
+            self.hyper_connection_mixer = GatedResidual(c, combine=False)
+        else:
+            # All hc_count target branches into the one stream.
+            self.fc_hidden = nn.Linear(c.hc_count * c.hidden_size, c.hidden_size, bias=False)
+            self.layers = nn.ModuleList(PlainDecoder(c) for _ in range(c.num_layers))
+            self.norm = RMSNorm(c.hidden_size, c.rms_norm_eps)
         self.target_reducer = GatedResidual(c, combine=False).requires_grad_(False)
         self.candidate_selector = CandidateSelector(c)
 
     def forward(self, embeddings, predecessor_gr, positions, prefix=None):
         # predecessor_gr[i] pairs with embeddings[i]: the target GR one position back.
+        if self.config.residual == "plain":
+            return self._forward_plain(embeddings, predecessor_gr, positions, prefix)
         if predecessor_gr.shape != (*embeddings.shape[:-1], self.config.hc_count, self.config.hidden_size):
             raise ValueError("invalid final pre-collapse target GR shape")
         h = self.pre_fc_norm_hidden(predecessor_gr.flatten(-2)).unflatten(
@@ -625,6 +723,37 @@ class MTP3(nn.Module):
             )
             caches.append(cache)
         return self.hyper_connection_mixer(h), CleanCache(positions, tuple(caches))
+
+    # ---- residual "plain" (arc-forge model.MTP3.fuse / output / context, PlainDecoder) ----------------------------
+    def fuse(self, embeddings, predecessor_gr):
+        """Plain residual: the input fusion [..., hidden] of token embeddings [..., hidden] with their predecessor
+        target GR [..., branches, hidden] (fc_hidden over the flattened branches). The hyper-connection drafter keeps
+        its own inline fusion in `forward`."""
+        c = self.config
+        if c.residual != "plain":
+            raise RuntimeError("fuse() is the plain residual's input fusion")
+        if predecessor_gr.shape != (*embeddings.shape[:-1], c.hc_count, c.hidden_size):
+            raise ValueError("invalid final pre-collapse target GR shape")
+        gr = self.pre_fc_norm_hidden(predecessor_gr.flatten(-2))
+        return self.fc_hidden(gr) + self.fc_embedding(self.pre_fc_norm_embedding(embeddings))
+
+    def _forward_plain(self, embeddings, predecessor_gr, positions, prefix):
+        h = self.fuse(embeddings, predecessor_gr)
+        caches = []
+        for i, layer in enumerate(self.layers):
+            h, cache = layer(
+                h, positions, None if prefix is None else prefix.layers[i], None if prefix is None else prefix.positions
+            )
+            caches.append(cache)
+        return self.norm(h), CleanCache(positions, tuple(caches))
+
+    def context(self, embeddings, predecessor_gr, positions):
+        """Context "inject": the clean cache of committed tokens -- per layer the K/V of their input fusion
+        (PlainDecoder.context_kv), no trunk and no conv boundaries."""
+        if self.config.context != "inject":
+            raise RuntimeError("context() is the injected clean cache; this drafter recomputes its context")
+        fused = self.fuse(embeddings, predecessor_gr)
+        return CleanCache(positions, tuple(LayerCache(*layer.context_kv(fused, positions), ()) for layer in self.layers))
 
     def proposal_gr(self, grs, spoken):
         """The GR a proposal block's slots read, under Config.mask_gr. grs [batch, n, branches, hidden] as built for
@@ -659,6 +788,11 @@ class MTP3(nn.Module):
                 raise ValueError("position 0 has no predecessor GR; the draft context starts at position 1")
             if prefix is not None and not torch.equal(positions[:, 0], prefix.positions[:, -1] + 1):
                 raise ValueError("refresh must append each committed position exactly once")
+        if self.config.context == "inject":
+            # Committed tokens do not run the trunk: their cache is the injected K/V (no conv boundaries) and they
+            # have no hidden state.
+            new = self.context(self.embed_tokens(tokens), predecessor_gr, positions)
+            return None, append_cache(prefix, new, positions, None if retain_trace else self.config.window)
         # Deliberately the class function, not `self(...)`: serving replaces the
         # instance's `forward` with a compiled one specialized on shape, and a
         # prefill chunk is as long as the prompt leaves it. Compiling those is
@@ -722,6 +856,8 @@ class MTP3(nn.Module):
                 ~((prefix.positions >= positions[:, :1]) & (prefix.positions >= 0)).any(),
                 "prefix must exclude this block and every future position",
             )
+        if self.config.context == "inject":
+            return self._decode_step_injected(committed_tokens, anchor_tokens, gr_span, first, prefix, lengths)
         if lengths is None:
             embeds = torch.cat(
                 (
@@ -756,6 +892,32 @@ class MTP3(nn.Module):
         take = (lengths[:, None] + torch.arange(b - 1, device=first.device)).clamp(max=n - 1)
         proposal = hidden.gather(1, take[..., None].expand(-1, -1, hidden.shape[-1]))
         return proposal, keep_prefix_of_block(block, positions, k), positions[:, :k]
+
+    def _decode_step_injected(self, committed_tokens, anchor_tokens, gr_span, first, prefix, lengths):
+        """decode_step under context "inject" (arc-forge model.MTP3._decode_step_injected): the committed tokens'
+        injected K/V at first .. first + k - 1, then the trunk over the proposal block alone ([anchor, mask x (b-1)]
+        at first + commit count ..). Right padding past a row's `lengths` is invisible to its block (position -1 in
+        the attended cache) and returned for the caller to trim, as in the recomputed path. `width` pads nothing
+        here: the trunk always runs b rows. The serving step is state_pool.RingStatePool._step_injected."""
+        b = self.config.block_size
+        batch, k = committed_tokens.shape
+        slot = torch.arange(k, device=first.device)
+        committed_positions = first[:, None] + slot
+        committed = self.context(self.embed_tokens(committed_tokens), gr_span[:, :k], committed_positions)
+        edge = first.new_full((batch,), k) if lengths is None else lengths
+        if lengths is not None:
+            require((lengths <= k).all(), "a row cannot commit more tokens than the block holds")
+        visible = committed_positions.masked_fill(slot[None] >= edge[:, None], -1)
+        context = append_cache(prefix, committed, visible)
+        positions = (first + edge)[:, None] + torch.arange(b, device=first.device)
+        embeds = torch.cat(
+            (self.embed_tokens(anchor_tokens)[:, None], self.mask_embedding.expand(batch, b - 1, -1)), 1
+        )
+        # Every block slot reads the cursor GR (the target's newest state, at the row's own commit count).
+        cursor = gr_span.gather(1, edge[:, None, None, None].expand(-1, 1, *gr_span.shape[2:]))
+        grs = self.proposal_gr(cursor.expand(-1, b, -1, -1), (torch.arange(b, device=first.device) == 0)[None])
+        hidden, _ = self(embeds, grs, positions, context)
+        return hidden[:, :-1], committed, committed_positions
 
     def propose(self, anchor_tokens, predecessor_gr, anchors, prefix):
         """predecessor_gr is the target GR at anchor-1, the newest state the target has read.
