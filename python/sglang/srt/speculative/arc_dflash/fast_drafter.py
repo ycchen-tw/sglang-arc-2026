@@ -27,15 +27,23 @@ _SDPA_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.FLASH_ATTENTION]
 
 def attention_forward(self, x, positions, prefix, prefix_positions):
     c = self.c
-    nq, nkv = c.num_attention_heads * 2 * c.head_dim, c.num_key_value_heads * c.head_dim
     if self.qkv_proj is not None:  # ARC_DFLASH_MERGE: [q+gate | k | v] rows of one linear
+        nq, nkv = c.num_attention_heads * 2 * c.head_dim, c.num_key_value_heads * c.head_dim
         qg, k, v = self.qkv_proj(x).split((nq, nkv, nkv), -1)
+        q, gate = qg.unflatten(-1, (c.num_attention_heads, 2 * c.head_dim)).chunk(2, -1)
+        q = self.rotary(self.q_norm(q).transpose(1, 2), positions)
+        k = self.rotary(self.k_norm(k.unflatten(-1, (c.num_key_value_heads, c.head_dim))).transpose(1, 2), positions)
+        v = v.unflatten(-1, (c.num_key_value_heads, c.head_dim)).transpose(1, 2)
     else:
-        qg, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
-    q, gate = qg.unflatten(-1, (c.num_attention_heads, 2 * c.head_dim)).chunk(2, -1)
-    q = self.rotary(self.q_norm(q).transpose(1, 2), positions)
-    k = self.rotary(self.k_norm(k.unflatten(-1, (c.num_key_value_heads, c.head_dim))).transpose(1, 2), positions)
-    v = v.unflatten(-1, (c.num_key_value_heads, c.head_dim)).transpose(1, 2)
+        # The separate projections in the base tree's order: a block-FP8 linear is a graph break (compile_layers), so
+        # the call order is the compiled graphs' segmentation -- projecting q, k, v up front split the HC drafter's
+        # layers into other graphs (44 -> 36) and moved ARC_DFLASH_COMPILE=det's rounding off the base tree's.
+        q, gate = self.q_proj(x).unflatten(-1, (c.num_attention_heads, 2 * c.head_dim)).chunk(2, -1)
+        q = self.rotary(self.q_norm(q).transpose(1, 2), positions)
+        k = self.rotary(
+            self.k_norm(self.k_proj(x).unflatten(-1, (c.num_key_value_heads, c.head_dim))).transpose(1, 2), positions
+        )
+        v = self.v_proj(x).unflatten(-1, (c.num_key_value_heads, c.head_dim)).transpose(1, 2)
     if prefix is not None and isinstance(prefix.key, ring_attention.RingWindow):
         # straight from the ring pool (no gathered copy, no spare columns)
         y = ring_attention.attend(q, k, v, positions, prefix.key, prefix.value, prefix_positions, c.window)
