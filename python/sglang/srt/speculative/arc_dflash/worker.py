@@ -34,6 +34,13 @@ build_dense_drafter loads it as is, with the linears stored in block FP8 on fp8.
 Triton on sm_89). On a group of N > 1 the dense FFN is replicated (no collective) and, with ARC_DFLASH_ATTN_TP=1, the
 attention heads are split as for the MoE drafter (q/k/v rows and o_proj columns sliced at load, 128-aligned so FP8
 blocks stay whole; o_proj all-reduced). ARC_DFLASH_KEEP / CALIB / MOE / ROUTER_STATS must be unset.
+The plain drafter (arc-forge convert_plain.py: config residual "plain", context "inject", ffn_type "dense"; FP8 linears
+layers.*.mlp.{gate,up,down}_proj and the attention projections) loads through the same dense loader; its config alone
+selects it (model.PlainDecoder, MTP3.context, state_pool.RingStatePool._step_injected). Committed tokens only write
+their injected K/V into the window (no trunk, no conv boundaries); the trunk runs the proposal block. On an
+attention-TP group the attention heads are split as for the hyper-connection drafter (the injected K/V come from the
+same sliced k/v projections, PlainDecoder.context_kv); ARC_DFLASH_W4A8 applies as there (scope mlp = the dense
+.mlp.{gate,up,down}_proj); ARC_DFLASH_POOL=shift raises for it.
 
 Draft state per request is a fixed SWA window (`window` = 1024 tokens x layers, plus the newest conv boundary) in a
 slot pool sized per DP group (max_running_requests / attention DP + 16 slots). The request's state is dropped when it
@@ -143,6 +150,9 @@ def build_drafter(directory: Path, device, target_model, model_dir: Path, keep, 
         raise ValueError(f"{directory}: incomplete export")
     if c.block_size != 8:
         raise ValueError(f"drafter block {c.block_size}: this worker is written for the exported B8 drafter")
+    if c.residual != "hc":
+        raise NotImplementedError(f"{directory}: residual {c.residual!r} with ffn_type {c.ffn_type!r}; the plain "
+                                  "drafter is served from a dense export only (build_dense_drafter)")
     rank, size = group.rank_in_group, group.world_size
     if backend == "cutlass" and size != 1:
         raise ValueError(f"ARC_DFLASH_MOE=cutlass runs on one rank; the attention-TP group has {size} (use marlin)")
@@ -259,9 +269,20 @@ def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, 
     manifest = json.loads((directory / "initialization_manifest.json").read_text())
     if not manifest.get("complete"):
         raise ValueError(f"{directory}: incomplete export")
-    if c.ffn_type != "dense_shared" or c.block_size != 8:
+    if c.ffn_type not in ("dense_shared", "dense") or c.block_size != 8:
         raise ValueError(f"{directory}: not a dense B8 drafter (ffn_type {c.ffn_type}, block {c.block_size})")
     rank, size = group.rank_in_group, group.world_size
+    if c.residual != "hc" or c.ffn_type != "dense_shared":
+        # The plain / injected-context drafter (or a dense FFN without the shared expert): the attention-TP group's
+        # head split applies as is -- each attention module gets the local head counts and the pool the local KV
+        # heads, and PlainDecoder.context_kv projects through the same sliced k/v (first validated on one GPU; an
+        # attention-TP group of more ranks is first run on L4 TP2). ARC_DFLASH_W4A8 replaces the FP8 linears as for
+        # the hyper-connection drafter; its "mlp" scope is .mlp.routed. there and the plain drafter's .mlp.{gate,up,
+        # down}_proj here (ffn_type dense).
+        if size != 1 and c.num_key_value_heads % size and size % c.num_key_value_heads == 0:
+            raise NotImplementedError(f"{directory}: residual {c.residual!r} on {size} ranks would tile "
+                                      f"{c.num_key_value_heads} KV heads (kv_rep > 1), not validated for the "
+                                      "injected context")
     shard = size > 1 and os.environ.get("ARC_DFLASH_ATTN_TP", "1") == "1"
     kv_rep = 1  # ranks sharing one KV head
     if shard:
@@ -333,7 +354,8 @@ def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, 
                     if cut is not None:
                         value, scale = narrow_fp8(value, scale, cut)
                     parent, _, child = name.rpartition(".")
-                    if w4a8 is not None and (w4a8[3] == "all" or ".mlp.routed." in name):
+                    mlp = ".mlp.routed." in name or (c.ffn_type == "dense" and ".mlp." in name)
+                    if w4a8 is not None and (w4a8[3] == "all" or mlp):
                         # every rank computes a whole (unsliced) linear on the same input: bitwise equal or the
                         # group's proposals diverge; a rank's attention slice feeds only its o_proj all-reduce part
                         module = HummingW4A8Linear(dequant_block_fp8(value, scale), w4a8,
@@ -478,7 +500,8 @@ class DFlashDraftWorker:
         self.check_agree = os.environ.get("ARC_DFLASH_CHECK_AGREE") == "1"
         directory = Path(drafter_dir())
         raw = json.loads((directory / "config.json").read_text())
-        dense = raw.get("ffn_type", "moe") == "dense_shared"
+        # dense_shared: the hyper-connection dense export; dense: the plain drafter's (arc-forge convert_plain.py)
+        dense = raw.get("ffn_type", "moe") in ("dense_shared", "dense")
         if dense:
             for name in ("ARC_DFLASH_KEEP", "ARC_DFLASH_CALIB", "ARC_DFLASH_MOE", "ARC_DFLASH_ROUTER_STATS"):
                 if os.environ.get(name):
@@ -582,19 +605,34 @@ class DFlashDraftWorker:
             type(self.model.lm_head).__name__, self._weight_load_time, self.prefill_tail, self.use_rejection_sampling,
             "sparse" if self.sparse_q else "dense", self.width, self.model.compile_mode,
         )
+        c = self.model.config
+        # what was built, read off the modules and the pool (not the config strings alone)
+        layer = self.model.layers[0]
+        logger.info(
+            "DFlash drafter architecture: residual %s (%s, fc_hidden %s, output %s), context %s (pool conv boundaries "
+            "%s, trunk rows per step %d), ffn %s (%s)",
+            c.residual, type(layer).__name__, tuple(self.model.fc_hidden.weight.shape),
+            "norm" if c.residual == "plain" else "hyper_connection_mixer", c.context,
+            "none" if self.pool.boundary is None else tuple(self.pool.boundary.shape),
+            self.steps if c.context == "inject" else self.pool.width if layout == "ring" else 2 * c.block_size,
+            c.ffn_type, type(layer.mlp).__name__,
+        )
         self._init_exact_state()
         if self.exact_prefill:
             logger.info(
-                "DFlash exact prefill: a prompt's window from its last %d positions (%d layers x (window %d + 3)) in "
-                "forwards of <= %d; session park %s", self.receptive, self.model.config.num_layers,
-                self.model.config.window, self.prefill_chunk, "on" if self.session_park else "off",
+                "DFlash exact prefill: a prompt's window from its last %d positions (%s) in forwards of <= %d; session "
+                "park %s", self.receptive,
+                f"window {c.window}: injected context" if c.context == "inject"
+                else f"{c.num_layers} layers x (window {c.window} + 3)",
+                self.prefill_chunk, "on" if self.session_park else "off",
             )
 
     def _init_exact_state(self):
         c = self.model.config
         # How far back a window depends on the history: per layer the attention window plus one row for each of the
-        # three convolutions that read the row before (model.Decoder); arc-forge fast_train.receptive_field.
-        self.receptive = c.num_layers * (c.window + 3)
+        # three convolutions that read the row before (model.Decoder); arc-forge fast_train.receptive_field. Context
+        # "inject": a committed row's K/V depend on its own token and predecessor GR only, so the window.
+        self.receptive = c.window if c.context == "inject" else c.num_layers * (c.window + 3)
         # rid -> Req, SESSION_PARK only: session requests whose last prefill chunk completed their prompt, the ones a
         # finish parks (a request decodes only from here)
         self.live_reqs = {}
@@ -986,7 +1024,8 @@ class DFlashDraftWorker:
         positions[0, -1] = position
         kv = torch.zeros((1, c.num_key_value_heads, c.window, c.head_dim), dtype=torch.bfloat16, device=self.device)
         boundary = torch.zeros((1, 1, c.hidden_size), dtype=torch.bfloat16, device=self.device)
-        cache = CleanCache(positions, tuple(LayerCache(kv, kv, (boundary,) * 4) for _ in range(c.num_layers)))
+        boundaries = () if c.context == "inject" else (boundary,) * 4  # an injected context has no conv boundaries
+        cache = CleanCache(positions, tuple(LayerCache(kv, kv, boundaries) for _ in range(c.num_layers)))
         return serving.DraftRequest(cache, last_gr, torch.tensor([position], device=self.device))
 
     # ---- decode ------------------------------------------------------------------------------------------------
