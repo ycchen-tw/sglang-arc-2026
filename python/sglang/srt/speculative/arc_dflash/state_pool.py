@@ -44,6 +44,25 @@ if BATCHED_COMMIT not in ("0", "1"):
     raise ValueError(f"ARC_DFLASH_BATCHED_COMMIT must be 0 or 1, got {BATCHED_COMMIT!r}")
 
 
+# arc-forge ARC_DFLASH_KV_DTYPE (opt-in, default bf16): the dtype of the ring pool's window K/V. fp8_e4m3 stores them
+# as e4m3 with no scale (clamped to +-448, as sglang's fp8_e4m3 KV without checkpoint scales), half the window bytes;
+# ring_attention widens each tile to BF16 on load, so attention computes with exactly the rounded values, and every
+# read that leaves the pool (read_request, the SDPA gather) widens them the same way. Lossy: only the proposals change
+# (rejection sampling keeps the output target-distributed), judged by accept length. Ring layout only.
+KV_DTYPES = {"bf16": torch.bfloat16, "fp8_e4m3": torch.float8_e4m3fn}
+KV_DTYPE = os.environ.get("ARC_DFLASH_KV_DTYPE", "bf16")
+if KV_DTYPE not in KV_DTYPES:
+    raise ValueError(f"ARC_DFLASH_KV_DTYPE must be one of {sorted(KV_DTYPES)}, got {KV_DTYPE!r}")
+FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
+
+
+def to_pool(x, dtype):
+    """K/V rows on their way into a pool of `dtype` (a cast that saturates instead of making NaN for e4m3)."""
+    if dtype == torch.bfloat16:
+        return x
+    return x.clamp(-FP8_MAX, FP8_MAX).to(dtype)
+
+
 @torch.no_grad()
 def fast_propose(model, hidden, anchor, temperature):
     """sampling.propose_path with the top-16 taken on the BF16 logits: casting [rows, vocab] to FP32 first is a
@@ -74,18 +93,28 @@ def fast_propose(model, hidden, anchor, temperature):
 
 
 class StatePool:
+    # Config.context "inject" (the plain drafter's injected context) is implemented by RingStatePool only
+    supports_inject = False
+
     def __init__(self, model, slots: int, max_batch: int, device, *, steps: int = 7, sparse_q: bool = False):
         c = model.config
         if not 1 <= steps < c.block_size:
             raise ValueError(f"{steps} proposals per cycle; the drafter's block holds {c.block_size - 1}")
+        # context "inject": a slot holds the injected K/V window and no conv boundaries (self.boundary is None)
+        self.inject = c.context == "inject"
+        if self.inject and not self.supports_inject:
+            raise NotImplementedError(f"{type(self).__name__} does not implement the injected context (drafter config "
+                                      "context 'inject'); use the ring pool (ARC_DFLASH_POOL=ring)")
         self.model, self.c, self.slots, self.device, self.steps = model, c, slots, device, steps
         self.sparse_q = sparse_q
+        if KV_DTYPE != "bf16" and type(self) is StatePool:
+            raise ValueError(f"ARC_DFLASH_KV_DTYPE={KV_DTYPE} needs the ring pool (ARC_DFLASH_POOL=ring)")
         w, b, layers = c.window, c.block_size, c.num_layers
         kv = (layers, slots, c.num_key_value_heads, w, c.head_dim)
         bf16 = dict(dtype=torch.bfloat16, device=device)
         self.key = torch.zeros(kv, **bf16)
         self.value = torch.zeros(kv, **bf16)
-        self.boundary = torch.zeros((layers, 4, slots, 1, c.hidden_size), **bf16)
+        self.boundary = None if self.inject else torch.zeros((layers, 4, slots, 1, c.hidden_size), **bf16)
         self.positions = torch.full((slots, w), -1, dtype=torch.long, device=device)
         self.last_gr = torch.zeros((slots, c.hc_count, c.hidden_size), **bf16)
         self.last_position = torch.zeros(slots, dtype=torch.long, device=device)
@@ -118,8 +147,9 @@ class StatePool:
 
     def bytes(self):
         q = (self.cand_out, self.cand_probs_out) if self.sparse_q else (self.probs_out,)
+        boundary = () if self.inject else (self.boundary,)
         return sum(t.numel() * t.element_size() for t in (
-            self.key, self.value, self.boundary, self.positions, self.last_gr, self.last_position,
+            self.key, self.value, *boundary, self.positions, self.last_gr, self.last_position,
             self.pending_tokens, self.pending_gr, self.pending_length, *q))
 
     # ---- slots -------------------------------------------------------------------------------------------------
@@ -374,7 +404,12 @@ class RingStatePool(StatePool):
     out, concatenating, re-gathering and scattering it back (five full-window copies per layer, ~5 ms at 55
     requests). Column `window` is a garbage column: uncommitted block rows are routed there with position -1, so
     the scatter needs no mask and nothing it holds is ever attendable.
+
+    Config.context "inject" (the plain drafter): the window holds each committed token's injected K/V and no conv
+    boundaries; a step commits first and then runs the trunk over the proposal block alone (_step_injected).
     """
+
+    supports_inject = True
 
     def __init__(self, model, slots: int, max_batch: int, device, *, steps: int = 7, width: int | None = None,
                  sparse_q: bool = False):
@@ -393,11 +428,13 @@ class RingStatePool(StatePool):
             raise ValueError(f"step width {self.width} for {steps} proposals: need 2 x steps + 1 .. 2 x block")
         # columns: `window` ring entries, one garbage column, then `width` spare columns that each step's
         # gathered copy fills with the block's own K/V (fast_drafter.attention_forward), so attention never
-        # concatenates; the spare columns of the pool itself are never read
-        self.spare = self.width
+        # concatenates; the spare columns of the pool itself are never read. Context "inject": the trunk's block is
+        # the `steps` proposal rows (_step_injected), so that many spare columns.
+        self.spare = self.steps if self.inject else self.width
         kv = (c.num_layers, slots, c.num_key_value_heads, w + 1 + self.spare, c.head_dim)
-        self.key = torch.zeros(kv, dtype=torch.bfloat16, device=device)
-        self.value = torch.zeros(kv, dtype=torch.bfloat16, device=device)
+        self.kv_dtype = KV_DTYPES[KV_DTYPE]
+        self.key = torch.zeros(kv, dtype=self.kv_dtype, device=device)
+        self.value = torch.zeros(kv, dtype=self.kv_dtype, device=device)
         self.positions = torch.full((slots, w + 1), -1, dtype=torch.long, device=device)
         # the scratch slot's window "ends" at position 0, the cursor every padding row carries
         self.positions[self.scratch, 0] = 0
@@ -411,8 +448,8 @@ class RingStatePool(StatePool):
         # pool [L, slots, Hkv, columns, D] indexed on (layer, slot, column): the value is [L, B, n, Hkv, D]
         keys = torch.stack([layer.key for layer in layers]).transpose(2, 3)
         values = torch.stack([layer.value for layer in layers]).transpose(2, 3)
-        self.key[layer_ids, rows[None], :, col[None]] = keys
-        self.value[layer_ids, rows[None], :, col[None]] = values
+        self.key[layer_ids, rows[None], :, col[None]] = to_pool(keys, self.kv_dtype)
+        self.value[layer_ids, rows[None], :, col[None]] = to_pool(values, self.kv_dtype)
         fresh = torch.stack([b.gather(1, last.expand(-1, 1, b.shape[-1])) for layer in layers for b in layer.boundaries])
         fresh = fresh.view(len(layers), 4, *fresh.shape[1:])  # [L, 4, B, 1, H]
         self.boundary[:, :, idx] = torch.where(has, fresh, self.boundary[:, :, idx])
@@ -430,8 +467,12 @@ class RingStatePool(StatePool):
         self.positions[s, col] = torch.where(valid, pos, torch.full_like(pos, -1))
         self.positions[s, w].fill_(-1)
         for i, layer in enumerate(cache.layers):
-            self.key[i, s][:, col] = layer.key[0]
-            self.value[i, s][:, col] = layer.value[0]
+            self.key[i, s][:, col] = to_pool(layer.key[0], self.kv_dtype)
+            self.value[i, s][:, col] = to_pool(layer.value[0], self.kv_dtype)
+            if self.inject:
+                if layer.boundaries:
+                    raise RuntimeError("an injected context window carries no conv boundaries")
+                continue
             for j in range(4):
                 self.boundary[i, j, s] = layer.boundaries[j][0, -1:]
         self.last_gr[s] = request.last_gr[0]
@@ -450,8 +491,9 @@ class RingStatePool(StatePool):
         ring = self.positions[s, :w]
         order = torch.argsort(ring)  # padding (-1) first, then ascending positions: decode_cache's layout
         layers = tuple(
-            LayerCache(self.key[i, s][:, order][None].clone(), self.value[i, s][:, order][None].clone(),
-                       tuple(self.boundary[i, j, s : s + 1].clone() for j in range(4)))
+            LayerCache(self.key[i, s][:, order][None].to(torch.bfloat16, copy=True),
+                       self.value[i, s][:, order][None].to(torch.bfloat16, copy=True),
+                       () if self.inject else tuple(self.boundary[i, j, s : s + 1].clone() for j in range(4)))
             for i in range(self.c.num_layers)
         )
         return serving.DraftRequest(CleanCache(ring[order][None].clone(), layers),
@@ -459,6 +501,8 @@ class RingStatePool(StatePool):
 
     def _step(self, batch):
         """model.decode_step (per-row lengths) over ring windows, then commit only the committed rows."""
+        if self.inject:
+            return self._step_injected(batch)
         model, c = self.model, self.c
         b, w = c.block_size, c.window
         n = self.width
@@ -467,7 +511,7 @@ class RingStatePool(StatePool):
         if self.attention == "triton":  # ring_attention reads the pool by slot
             kv = [(RingWindow(self.key[i], idx, w + 1), RingWindow(self.value[i], idx, w + 1)) for i in range(c.num_layers)]
         else:  # gathered copies with spare columns (fast_drafter's SDPA path)
-            kv = [(self.key[i][idx], self.value[i][idx]) for i in range(c.num_layers)]
+            kv = [(self.key[i][idx].to(torch.bfloat16), self.value[i][idx].to(torch.bfloat16)) for i in range(c.num_layers)]
         prefix = CleanCache(
             ring_pos,
             tuple(
@@ -502,12 +546,75 @@ class RingStatePool(StatePool):
             self._commit_batched(block, idx, rows, col, last, has)
         else:
             for i, layer in enumerate(block.layers):
-                self.key[i][rows, :, col] = layer.key.transpose(1, 2)
-                self.value[i][rows, :, col] = layer.value.transpose(1, 2)
+                self.key[i][rows, :, col] = to_pool(layer.key.transpose(1, 2), self.kv_dtype)
+                self.value[i][rows, :, col] = to_pool(layer.value.transpose(1, 2), self.kv_dtype)
                 for j in range(4):
                     fresh = layer.boundaries[j].gather(1, last.expand(-1, 1, layer.boundaries[j].shape[-1]))
                     self.boundary[i, j][idx] = torch.where(has, fresh, self.boundary[i, j][idx])
         self.positions[:, w] = -1
         self.pending_length.index_fill_(0, idx, 0)
         proposal = fast_propose(model, proposal_hidden, self.anchor[:batch], self.temperature[:batch])
+        self._emit(batch, proposal)
+
+    def _step_injected(self, batch):
+        """Context "inject" (model.MTP3._decode_step_injected over ring windows): commit, then propose.
+
+        1. The pending block's committed rows (the first `length` of the last verify's [bonus, drafts...]) become
+           context: per layer their injected K/V (model.MTP3.context: the fusion of each token's embedding with its
+           predecessor GR, the layer's context_layernorm and k/v projections) go to their ring columns, the other
+           rows to the garbage column at position -1. No trunk rows, no conv boundaries.
+        2. The proposal block [anchor, mask x (steps - 1)] at cursor + 1 .., every slot on the cursor GR (the
+           pending GR at the row's commit count), runs the trunk on the ring (which now ends at the cursor) and its
+           own keys; its convs start from zero (PlainDecoder.forward).
+        Committing first is safe: a committed position p overwrites ring column p % window, i.e. position p - window,
+        at least window + 1 behind the anchor and so outside every block query's window. The trunk runs `steps` rows
+        where model.decode_step runs the block's b and drops the last: attention is causal by position and the convs
+        read the row before, so rows past the last proposal verify reads never reach the ones it does.
+        """
+        model, c = self.model, self.c
+        w, steps = c.window, self.steps
+        kc = steps + 1  # a verify of width K = steps + 1 commits at most K tokens
+        idx = self.idx[:batch]
+        length = self.pending_length[idx]
+        cursor = self.last_position[idx]
+        first = cursor + 1 - length
+        ring_pos = self.positions[idx]
+        require((first >= 1).all(), "position 0 has no predecessor GR")
+        require((ring_pos.max(1).values + 1 == first).all(), "the ring must end where the block starts")
+        require((length <= kc).all(), "a row cannot commit more tokens than a verify block holds")
+        slot = torch.arange(kc, device=self.device)
+        positions = first[:, None] + slot
+        committed = slot < length[:, None]
+        span = self.pending_gr[idx]  # [batch, block + 1, branches, hidden]: one predecessor per row, then the cursor's
+        fused = model.fuse(model.embed_tokens(self.pending_tokens[idx][:, :kc]), span[:, :kc])
+        col = torch.where(committed, positions % w, torch.full_like(positions, w))
+        rows = idx[:, None]
+        self.positions[rows, col] = torch.where(committed, positions, torch.full_like(positions, -1))
+        if BATCHED_COMMIT == "1":
+            kv = [layer.context_kv(fused, positions) for layer in model.layers]
+            layer_ids = torch.arange(len(kv), device=self.device)[:, None, None]
+            # pool [L, slots, Hkv, columns, D] indexed on (layer, slot, column): the value is [L, B, kc, Hkv, D]
+            self.key[layer_ids, rows[None], :, col[None]] = to_pool(torch.stack([k for k, _ in kv]).transpose(2, 3), self.kv_dtype)
+            self.value[layer_ids, rows[None], :, col[None]] = to_pool(torch.stack([v for _, v in kv]).transpose(2, 3), self.kv_dtype)
+        else:
+            for i, layer in enumerate(model.layers):
+                k, v = layer.context_kv(fused, positions)
+                self.key[i][rows, :, col] = to_pool(k.transpose(1, 2), self.kv_dtype)
+                self.value[i][rows, :, col] = to_pool(v.transpose(1, 2), self.kv_dtype)
+        self.positions[:, w] = -1
+        block = (cursor + 1)[:, None] + torch.arange(steps, device=self.device)
+        embeds = torch.cat(
+            (model.embed_tokens(self.anchor[:batch])[:, None], model.mask_embedding.expand(batch, steps - 1, -1)), 1
+        )
+        cursor_gr = span.gather(1, length[:, None, None, None].expand(-1, 1, *span.shape[2:]))
+        grs = model.proposal_gr(cursor_gr.expand(-1, steps, -1, -1),
+                                (torch.arange(steps, device=self.device) == 0)[None])
+        if self.attention == "triton":  # ring_attention reads the pool by slot
+            kv = [(RingWindow(self.key[i], idx, w + 1), RingWindow(self.value[i], idx, w + 1)) for i in range(c.num_layers)]
+        else:  # gathered copies with `steps` spare columns (fast_drafter's SDPA path)
+            kv = [(self.key[i][idx].to(torch.bfloat16), self.value[i][idx].to(torch.bfloat16)) for i in range(c.num_layers)]
+        prefix = CleanCache(self.positions[idx], tuple(LayerCache(*kv[i], ()) for i in range(c.num_layers)))
+        hidden, _ = model(embeds, grs, block, prefix)
+        self.pending_length.index_fill_(0, idx, 0)
+        proposal = fast_propose(model, hidden, self.anchor[:batch], self.temperature[:batch])
         self._emit(batch, proposal)
