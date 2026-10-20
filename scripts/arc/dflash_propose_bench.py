@@ -188,8 +188,12 @@ def _fill(pool, seed: int):
     p = (lengths[:, None] - w) + torch.arange(w, device="cuda")
     pool.positions[:n] = -1
     pool.positions[:n].scatter_(1, p % w, p)
-    pool.key.normal_(generator=g)
-    pool.value.normal_(generator=g)
+    for kv in (pool.key, pool.value):
+        if kv.dtype == torch.bfloat16:
+            kv.normal_(generator=g)
+        else:  # ARC_DFLASH_KV_DTYPE=fp8_e4m3: no normal_ for e4m3; BF16 draws cast per layer, as the commit casts
+            for layer in kv:
+                layer.copy_(torch.randn(layer.shape, device="cuda", dtype=torch.bfloat16, generator=g))
     if not pool.inject:  # an injected-context pool keeps no conv boundaries
         pool.boundary.normal_(generator=g)
     pending = torch.randint(1, 5, (n,), device="cuda", generator=g)
