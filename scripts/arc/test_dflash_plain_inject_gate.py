@@ -53,7 +53,7 @@ def main(a):
     one = SimpleNamespace(rank_in_group=0, world_size=1, ranks=[0])
     target = _StubTarget()
     drafter = Path(a.drafter)
-    model = Wk.build_dense_drafter(drafter, device, target, drafter, one, refresh_entry=False)
+    model = Wk.build_dense_drafter(drafter, device, target, drafter, one)
     model.lm_head = heads.PairHead([(target.lm_head.weight, 0)], VOCAB, one)
     c = model.config
     if c.residual != "plain" or c.context != "inject":
