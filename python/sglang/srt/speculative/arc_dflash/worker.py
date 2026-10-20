@@ -252,6 +252,62 @@ def build_drafter(directory: Path, device, target_model, model_dir: Path, keep, 
     return model.eval().requires_grad_(False)
 
 
+def _rebuild_held(model, held, merge, inject_gemm, serve_fp8, shard):
+    """build_dense_drafter's ARC_DFLASH_MERGE / ARC_DFLASH_INJECT_KV=gemm modules from the stored linears it held
+    back (name -> (weight, block scales or None), this rank's slice), layer by layer: merge -- Attention.qkv_proj,
+    MLP.gate_up_proj and (unless inject_gemm) Attention.kv_proj in place of the separate projections, which are
+    removed; else k_proj / v_proj as served. inject_gemm -- MTP3.context_kv_weight / context_k_scale."""
+    from .fp8 import dequant_block_fp8
+
+    def linear(names, served_name):
+        parts = [held[n] for n in names]
+        if all(scale is None for _, scale in parts):  # stored BF16
+            weight = torch.cat([w for w, _ in parts])
+            module = nn.Linear(weight.shape[1], weight.shape[0], bias=False, device="meta")
+            module.weight = nn.Parameter(weight, requires_grad=False)
+            return module
+        if any(scale is None for _, scale in parts):
+            raise RuntimeError(f"{names}: stored partly FP8, partly BF16; cannot serve them as one linear")
+        sliced = shard and ".self_attn." in served_name
+        return serve_fp8(served_name, torch.cat([w for w, _ in parts]), torch.cat([s for _, s in parts]), sliced)
+
+    def bf16(name):
+        weight, scale = held[name]
+        return weight if scale is None else dequant_block_fp8(weight, scale)
+
+    kv_rows, k_scales = [], []
+    for i, layer in enumerate(model.layers):
+        a, m = f"layers.{i}.self_attn", f"layers.{i}.mlp"
+        attention = layer.self_attn
+        if inject_gemm:
+            # context_layernorm(x) = rms(x) * (1 + w) elementwise; the (1 + w) is a per-input-column scale of the
+            # k / v rows. FP32 product, one BF16 rounding.
+            column = 1 + layer.context_layernorm.weight.float()
+            kv_rows += [(bf16(f"{a}.{p}").float() * column).to(torch.bfloat16) for p in ("k_proj", "v_proj")]
+            k_scales.append(1 + attention.k_norm.weight.float())
+        if merge:
+            attention.qkv_proj = linear([f"{a}.q_proj", f"{a}.k_proj", f"{a}.v_proj"], f"{a}.qkv_proj")
+            if not inject_gemm:
+                attention.kv_proj = linear([f"{a}.k_proj", f"{a}.v_proj"], f"{a}.kv_proj")
+            for proj in ("q_proj", "k_proj", "v_proj"):
+                delattr(attention, proj)
+            layer.mlp.gate_up_proj = linear([f"{m}.gate_proj", f"{m}.up_proj"], f"{m}.gate_up_proj")
+            delattr(layer.mlp, "gate_proj")
+            delattr(layer.mlp, "up_proj")
+            names = [f"{a}.{p}" for p in ("q_proj", "k_proj", "v_proj")] + [f"{m}.gate_proj", f"{m}.up_proj"]
+        else:  # inject_gemm alone: the trunk keeps its separate k / v projections
+            for proj in ("k_proj", "v_proj"):
+                setattr(attention, proj, linear([f"{a}.{proj}"], f"{a}.{proj}"))
+            names = [f"{a}.k_proj", f"{a}.v_proj"]
+        for name in names:
+            del held[name]
+    if held:
+        raise RuntimeError(f"stored linears held back and not rebuilt: {sorted(held)[:4]}")
+    if inject_gemm:
+        model.context_kv_weight = torch.cat(kv_rows).contiguous()
+        model.context_k_scale = torch.stack(k_scales)[:, None, :].contiguous()
+
+
 def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, group, *, refresh_entry: bool):
     """A dense-routed drafter export: every tensor loaded as stored, embedding from the target and the target's
     lm_head. A `<module>.weight` stored as e4m3 must come with `<module>.weight_scale_inv` and becomes an
@@ -330,6 +386,47 @@ def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, 
         return weight.narrow(axis, start, count).clone(), scale.narrow(axis, start // BLOCK, count // BLOCK).clone()
 
     w4a8 = w4a8_spec()
+    # arc-forge ARC_DFLASH_MERGE (opt-in, default 0; the plain / injected-context dense drafter): per layer q | k | v
+    # as one linear (Attention.qkv_proj), gate | up as one (MLP.gate_up_proj) and, for the injected context, k | v as
+    # one (Attention.kv_proj): the stored linears' rows concatenated (block FP8: values and block scales along N, the
+    # same per-token-group activation quantization; W4A8: the dequantized rows, quantized per row as before; BF16:
+    # the weights). The GEMMs compute the same sums; only the kernel's tiling changes.
+    # ARC_DFLASH_INJECT_KV=gemm (opt-in, default layers): every layer's injected k | v from one BF16 GEMM over the
+    # shared fusion (model.MTP3.context_kv_stacked), each layer's context_layernorm (1 + w) folded into its rows.
+    merge = os.environ.get("ARC_DFLASH_MERGE", "0")
+    if merge not in ("0", "1"):
+        raise ValueError(f"ARC_DFLASH_MERGE must be 0 or 1, got {merge!r}")
+    inject_kv = os.environ.get("ARC_DFLASH_INJECT_KV", "layers")
+    if inject_kv not in ("layers", "gemm"):
+        raise ValueError(f"ARC_DFLASH_INJECT_KV must be layers or gemm, got {inject_kv!r}")
+    if (merge == "1" or inject_kv == "gemm") and (c.residual, c.context, c.ffn_type) != ("plain", "inject", "dense"):
+        raise ValueError(f"{directory}: ARC_DFLASH_MERGE / ARC_DFLASH_INJECT_KV=gemm are for the plain / injected-"
+                         f"context dense drafter, not residual {c.residual!r} context {c.context!r} ffn {c.ffn_type!r}")
+    # the stored linears these rebuild after the load loop: name -> (weight, block scales or None for BF16), this
+    # rank's slice
+    held_projs = (("q_proj", "k_proj", "v_proj", "gate_proj", "up_proj") if merge == "1"
+                  else ("k_proj", "v_proj") if inject_kv == "gemm" else ())
+    held = {}
+
+    def held_name(name):
+        parts = name.split(".")
+        return (len(parts) == 4 and parts[0] == "layers" and parts[2] in ("self_attn", "mlp")
+                and parts[3] in held_projs)
+
+    def serve_fp8(name, value, scale, sliced):
+        """A stored block-FP8 linear as served: Humming W4A8 under ARC_DFLASH_W4A8 (its scope), else Fp8BlockLinear."""
+        mlp = ".mlp.routed." in name or (c.ffn_type == "dense" and ".mlp." in name)
+        if w4a8 is not None and (w4a8[3] == "all" or mlp):
+            # every rank computes a whole (unsliced) linear on the same input: bitwise equal or the group's proposals
+            # diverge; a rank's attention slice feeds only its o_proj all-reduce part
+            module = HummingW4A8Linear(dequant_block_fp8(value, scale), w4a8, batch_invariant=size > 1 and not sliced)
+            w4a8_modules.append(name)
+            if module.batch_invariant:
+                w4a8_invariant.append(name)
+        else:
+            module = Fp8BlockLinear(value, scale)
+            served_fp8.append(name)
+        return module
 
     if quant is not None and quant.get("method") != "block_fp8":
         raise ValueError(f"{directory}: quantization {quant.get('method')!r}; this loader reads block_fp8 only")
@@ -361,21 +458,14 @@ def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, 
                     scale = f.get_tensor(name + ".weight_scale_inv")
                     if cut is not None:
                         value, scale = narrow_fp8(value, scale, cut)
-                    parent, _, child = name.rpartition(".")
-                    mlp = ".mlp.routed." in name or (c.ffn_type == "dense" and ".mlp." in name)
-                    if w4a8 is not None and (w4a8[3] == "all" or mlp):
-                        # every rank computes a whole (unsliced) linear on the same input: bitwise equal or the
-                        # group's proposals diverge; a rank's attention slice feeds only its o_proj all-reduce part
-                        module = HummingW4A8Linear(dequant_block_fp8(value, scale), w4a8,
-                                                   batch_invariant=size > 1 and cut is None)
-                        w4a8_modules.append(name)
-                        if module.batch_invariant:
-                            w4a8_invariant.append(name)
-                    else:
-                        module = Fp8BlockLinear(value, scale)
-                        served_fp8.append(name)
-                    setattr(model.get_submodule(parent), child, module)
                     fp8_modules.append(name)  # stored as FP8: the config's quantization record
+                    if held_name(name):  # rebuilt after the loop (no module now: fp8._LINEARS keeps what it registers)
+                        held[name] = (value, scale)
+                    else:
+                        parent, _, child = name.rpartition(".")
+                        setattr(model.get_submodule(parent), child, serve_fp8(name, value, scale, cut is not None))
+                elif name is not None and held_name(name):
+                    held[name] = (narrow(value, cut) if cut is not None else value, None)
                 elif cut is not None:  # a BF16 attention projection: this rank's slice replaces the whole matrix
                     linear = model.get_submodule(name)
                     linear.weight = nn.Parameter(narrow(value, cut).contiguous(), requires_grad=False)
@@ -384,6 +474,8 @@ def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, 
                     with torch.no_grad():
                         model.get_parameter(key).copy_(value)
                 loaded.add(key)
+    if held:
+        _rebuild_held(model, held, merge == "1", inject_kv == "gemm", serve_fp8, shard)
     with torch.device("meta"):
         expected = {n for n, _ in MTP3(c).named_parameters()}
     missing = expected - loaded - {"embed_tokens.weight", "lm_head.weight"}
@@ -410,6 +502,11 @@ def build_dense_drafter(directory: Path, device, target_model, model_dir: Path, 
             attention.c = replace(c, num_attention_heads=heads, num_key_value_heads=kv)
             want = {"q_proj": (heads * 2 * dim, c.hidden_size), "k_proj": (kv * dim, c.hidden_size),
                     "v_proj": (kv * dim, c.hidden_size), "o_proj": (c.hidden_size, heads * dim)}
+            if merge == "1":  # ARC_DFLASH_MERGE: the trunk's q | k | v, and k | v unless the context is one GEMM
+                del want["q_proj"], want["k_proj"], want["v_proj"]
+                want["qkv_proj"] = ((heads * 2 + 2 * kv) * dim, c.hidden_size)
+                if inject_kv != "gemm":
+                    want["kv_proj"] = (2 * kv * dim, c.hidden_size)
             for proj, shape in want.items():
                 module = getattr(attention, proj)
                 got = ((module.out_features, module.in_features) if isinstance(module, HummingW4A8Linear)
@@ -628,6 +725,21 @@ class DFlashDraftWorker:
             self.steps if c.context == "inject" else self.pool.width if layout == "ring" else 2 * c.block_size,
             c.ffn_type, type(layer.mlp).__name__,
         )
+        if c.residual == "plain":
+            from . import fp8, state_pool
+
+            attention = layer.self_attn
+            logger.info(
+                "DFlash plain drafter serving: linears %s, injected K/V %s, pool K/V %s, fusion %s, FP8 op %s",
+                "merged (qkv %s, gate_up %s, kv %s)" % (type(attention.qkv_proj).__name__,
+                                                       type(layer.mlp.gate_up_proj).__name__,
+                                                       type(attention.kv_proj).__name__)
+                if attention.qkv_proj is not None else "as stored",
+                "one GEMM %s" % (tuple(self.model.context_kv_weight.shape),)
+                if self.model.context_kv_weight is not None else "per layer",
+                self.pool.kv_dtype, "once" if state_pool.FUSE_ONCE == "1" else "per use",
+                "custom op" if fp8.FP8_OP == "1" else "graph break",
+            )
         self._init_exact_state()
         if self.exact_prefill:
             logger.info(

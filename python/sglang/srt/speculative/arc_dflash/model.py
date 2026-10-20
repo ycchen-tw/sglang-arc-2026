@@ -406,6 +406,11 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(c.hidden_size, c.num_key_value_heads * c.head_dim, bias=False)
         self.o_proj = nn.Linear(c.num_attention_heads * c.head_dim, c.hidden_size, bias=False)
         self.q_norm, self.k_norm = (RMSNorm(c.head_dim, c.rms_norm_eps) for _ in range(2))
+        # ARC_DFLASH_MERGE (worker.build_dense_drafter, the served plain drafter only): q | k | v as one linear for the
+        # trunk (fast_drafter.attention_forward) and k | v as one for the injected context (key_value), in place of
+        # q_proj / k_proj / v_proj, which are then gone. None: the separate projections above.
+        self.qkv_proj = None
+        self.kv_proj = None
 
     def rotary(self, x, positions):
         dim = int(self.c.head_dim * self.c.partial_rotary_factor)
@@ -418,12 +423,15 @@ class Attention(nn.Module):
 
     def forward(self, x, positions, prefix, prefix_positions):
         c = self.c
-        q, gate = self.q_proj(x).unflatten(-1, (c.num_attention_heads, 2 * c.head_dim)).chunk(2, -1)
+        if self.qkv_proj is not None:  # ARC_DFLASH_MERGE: [q+gate | k | v] rows of one linear
+            nq, nkv = c.num_attention_heads * 2 * c.head_dim, c.num_key_value_heads * c.head_dim
+            qg, k, v = self.qkv_proj(x).split((nq, nkv, nkv), -1)
+        else:
+            qg, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        q, gate = qg.unflatten(-1, (c.num_attention_heads, 2 * c.head_dim)).chunk(2, -1)
         q = self.rotary(self.q_norm(q).transpose(1, 2), positions)
-        k = self.rotary(
-            self.k_norm(self.k_proj(x).unflatten(-1, (c.num_key_value_heads, c.head_dim))).transpose(1, 2), positions
-        )
-        v = self.v_proj(x).unflatten(-1, (c.num_key_value_heads, c.head_dim)).transpose(1, 2)
+        k = self.rotary(self.k_norm(k.unflatten(-1, (c.num_key_value_heads, c.head_dim))).transpose(1, 2), positions)
+        v = v.unflatten(-1, (c.num_key_value_heads, c.head_dim)).transpose(1, 2)
         keys, values, key_positions = k, v, positions
         if prefix is not None:
             keys, values = torch.cat((prefix.key, k), 2), torch.cat((prefix.value, v), 2)
@@ -466,11 +474,12 @@ class Attention(nn.Module):
         k / v (and fast_drafter.attention_forward's), for the plain drafter's injected context (PlainDecoder.context_kv).
         `forward` keeps its inline copy so the hyper-connection drafter's code is untouched."""
         c = self.c
-        k = self.rotary(
-            self.k_norm(self.k_proj(x).unflatten(-1, (c.num_key_value_heads, c.head_dim))).transpose(1, 2), positions
-        )
-        v = self.v_proj(x).unflatten(-1, (c.num_key_value_heads, c.head_dim)).transpose(1, 2)
-        return k, v
+        if self.kv_proj is not None:  # ARC_DFLASH_MERGE: [k | v] rows of one linear
+            k, v = self.kv_proj(x).unflatten(-1, (2, c.num_key_value_heads, c.head_dim)).unbind(-3)
+        else:
+            k = self.k_proj(x).unflatten(-1, (c.num_key_value_heads, c.head_dim))
+            v = self.v_proj(x).unflatten(-1, (c.num_key_value_heads, c.head_dim))
+        return self.rotary(self.k_norm(k).transpose(1, 2), positions), v.transpose(1, 2)
 
 
 class MLP(nn.Module):
@@ -479,8 +488,14 @@ class MLP(nn.Module):
         self.gate_proj = nn.Linear(c.hidden_size, intermediate, bias=False)
         self.up_proj = nn.Linear(c.hidden_size, intermediate, bias=False)
         self.down_proj = nn.Linear(intermediate, c.hidden_size, bias=False)
+        # ARC_DFLASH_MERGE (worker.build_dense_drafter, the served plain drafter only): [gate | up] as one linear in
+        # place of gate_proj / up_proj, which are then gone
+        self.gate_up_proj = None
 
     def forward(self, x):
+        if self.gate_up_proj is not None:
+            gate, up = self.gate_up_proj(x).chunk(2, -1)
+            return self.down_proj(F.silu(gate) * up)
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
@@ -760,6 +775,12 @@ class MTP3(nn.Module):
         # adopted windows and folds hand the layers the prefixes and lengths that ran the shared entry past dynamo's
         # recompile limit). Off: the refresh as before, the layers' own entry on the caller's prefix and length.
         self.refresh_entry = False
+        # ARC_DFLASH_INJECT_KV=gemm (worker.build_dense_drafter, plain / inject only): every layer's injected k | v
+        # projection with its context_layernorm's (1 + w) folded into the input columns, stacked [layers x 2 x kv
+        # heads x head_dim, hidden] in BF16, and each layer's k_norm (1 + w) [layers, 1, head_dim] in FP32: one GEMM
+        # for all layers (context_kv_stacked). None: PlainDecoder.context_kv per layer.
+        self.context_kv_weight = None
+        self.context_k_scale = None
 
     def forward(self, embeddings, predecessor_gr, positions, prefix=None, *, refresh=False):
         # predecessor_gr[i] pairs with embeddings[i]: the target GR one position back. `refresh`: MTP3.refresh's
@@ -794,7 +815,14 @@ class MTP3(nn.Module):
         return self.fc_hidden(gr) + self.fc_embedding(self.pre_fc_norm_embedding(embeddings))
 
     def _forward_plain(self, embeddings, predecessor_gr, positions, prefix, *, refresh):
-        h = self.fuse(embeddings, predecessor_gr)
+        return self.forward_fused(self.fuse(embeddings, predecessor_gr), positions, prefix, refresh=refresh)
+
+    def forward_fused(self, h, positions, prefix=None, *, refresh=False):
+        """The plain trunk from an input fusion h [batch, seq, hidden] already built (fuse): RingStatePool's injected
+        step under ARC_DFLASH_FUSE_ONCE builds the proposal block's fusion together with the committed rows'.
+        `refresh`: MTP3.refresh's call, through the layers' refresh entry (PlainDecoder.refresh_forward)."""
+        if self.config.residual != "plain":
+            raise RuntimeError("forward_fused() is the plain residual's trunk")
         caches = []
         for i, layer in enumerate(self.layers):
             h, cache = (layer.refresh_forward if refresh else layer)(
@@ -808,8 +836,31 @@ class MTP3(nn.Module):
         (PlainDecoder.context_kv), no trunk and no conv boundaries."""
         if self.config.context != "inject":
             raise RuntimeError("context() is the injected clean cache; this drafter recomputes its context")
-        fused = self.fuse(embeddings, predecessor_gr)
-        return CleanCache(positions, tuple(LayerCache(*layer.context_kv(fused, positions), ()) for layer in self.layers))
+        keys, values = self.context_kv_stacked(self.fuse(embeddings, predecessor_gr), positions)
+        return CleanCache(positions, tuple(LayerCache(keys[i], values[i], ()) for i in range(len(self.layers))))
+
+    def context_kv_stacked(self, fused, positions):
+        """Injected K/V of every layer for committed tokens with input fusion `fused` [batch, seq, hidden]: (keys,
+        values), each [layers, batch, kv heads, seq, head_dim] (keys normed and rotated). Under ARC_DFLASH_INJECT_KV=
+        gemm one linear over context_kv_weight: the layers share the fusion and differ only in context_layernorm's
+        (1 + w), a per-input-column scale folded into their k / v rows, so RMS-normalize once and project once (the
+        BF16 weights are the stored FP8 values times that scale, rounded once; the activation is not FP8-quantized
+        as the per-layer FP8 path does). Else PlainDecoder.context_kv per layer."""
+        if self.context_kv_weight is None:
+            kv = [layer.context_kv(fused, positions) for layer in self.layers]
+            return torch.stack([k for k, _ in kv]), torch.stack([v for _, v in kv])
+        c, layers = self.config, len(self.layers)
+        heads = self.context_kv_weight.shape[0] // (layers * 2 * c.head_dim)
+        z = fused.float()
+        z = (z * torch.rsqrt(z.square().mean(-1, keepdim=True) + c.rms_norm_eps)).to(fused.dtype)
+        k, v = F.linear(z, self.context_kv_weight).unflatten(-1, (layers, 2, heads, c.head_dim)).unbind(-3)
+        # k_norm per layer (RMSNorm over head_dim with its (1 + w)); [batch, seq, layers, heads, dim] throughout
+        kf = k.float()
+        k = (kf * torch.rsqrt(kf.square().mean(-1, keepdim=True) + c.rms_norm_eps) * self.context_k_scale).to(fused.dtype)
+        # rotary on [batch, layers x heads, seq, dim] (the same positions for every layer), then [layers, batch, ...]
+        k = self.layers[0].self_attn.rotary(k.permute(0, 2, 3, 1, 4).flatten(1, 2), positions)
+        k = k.unflatten(1, (layers, heads)).transpose(0, 1)
+        return k, v.permute(2, 0, 3, 1, 4)
 
     def proposal_gr(self, grs, spoken):
         """The GR a proposal block's slots read, under Config.mask_gr. grs [batch, n, branches, hidden] as built for

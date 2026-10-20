@@ -72,13 +72,13 @@ def _method(device):
 # arc-forge ARC_DFLASH_FP8_OP (opt-in, default 0): Fp8BlockLinear runs as the custom op arc_dflash::fp8_block_linear,
 # opaque to dynamo but no graph break, so inductor keeps fusing the elementwise work around the linear as it does
 # around a BF16 nn.Linear (fast_drafter.compile_layers). Off, the linear is compiler.disable'd and every one of the
-# 7 per layer splits the compiled layer (B200 batch 128: one extra 0.55 ms pointwise kernel among the resumes).
+# per-layer linears splits the compiled layer (B200 batch 128: one extra 0.55 ms pointwise kernel among the resumes).
 # The GEMM is the same call either way; inductor's fusion moves the neighbours' rounding, not the linear's.
 FP8_OP = os.environ.get("ARC_DFLASH_FP8_OP", "0")
 if FP8_OP not in ("0", "1"):
     raise ValueError(f"ARC_DFLASH_FP8_OP must be 0 or 1, got {FP8_OP!r}")
 # The op takes the module's (processed) weight tensor and finds the module by its address: an int id argument would
-# be value-guarded, and the 5 layers share one compiled code object -> a recompile per layer up to
+# be value-guarded, and the layers share one compiled code object -> a recompile per layer up to
 # torch._dynamo's recompile_limit (8), after which dynamo silently runs the layers eager.
 _LINEARS: dict = {}  # weight.data_ptr() -> Fp8BlockLinear
 
