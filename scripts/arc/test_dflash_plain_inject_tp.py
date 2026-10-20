@@ -67,6 +67,11 @@ def main(a):
     from sglang.srt.speculative.arc_dflash.state_pool import RingStatePool
 
     device = torch.device("cuda", gpu)
+    if torch.cuda.get_device_capability(device) == (12, 0):
+        # the server's fp8_utils.initialize_fp8_gemm_config: CUTLASS on sm_120 (a bare process would pick DeepGEMM)
+        from sglang.srt.layers.quantization import fp8_utils
+
+        fp8_utils.FP8_GEMM_RUNNER_BACKEND = fp8_utils.Fp8GemmRunnerBackend.CUTLASS
     one = SimpleNamespace(rank_in_group=0, world_size=1, ranks=[0])
     pair = PairGroup()
     torch.manual_seed(0)

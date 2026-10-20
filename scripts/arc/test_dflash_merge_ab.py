@@ -9,12 +9,14 @@ K/V) against the same export under ARC_DFLASH_MERGE=1 (q | k | v, gate | up, k |
 Both flags are read when build_dense_drafter runs, so one process builds both drafters (the module-level flags --
 ARC_DFLASH_FP8_OP, _FUSE_ONCE, _KV_DTYPE, the decode opt-ins -- apply to both). Requests with prompts of
 5 .. 2,500 positions are refreshed into each pool, then cycles of defer_commit + the eager pool step:
-  - the committed injected K/V in the two pools (relative L2): the merged k | v linear computes the same sums as
-    the separate ones (block FP8: the same block scales and per-token-group activation quantization); the GEMM
-    under --inject-gemm rounds the folded context_layernorm weights to BF16 once and skips the activation's FP8
-    quantization, so a larger but small distance,
-  - the proposal hidden states (relative L2 / worst-row cosine) and the share of proposal tokens both draw under
-    one seed.
+  - the verdict: the committed injected K/V in the two pools (relative L2), layer by layer and slot by slot -- a
+    wrong row block, scale or layer order is O(1) here. The merged k | v linear computes the same sums as the
+    separate ones (G4 FP8: bitwise); the GEMM under --inject-gemm rounds the folded context_layernorm weights to
+    BF16 once and skips the FP8 activation quantization the per-layer FP8 path does (G4 FP8 deploy: 2.5e-2),
+  - reported only: the proposal hidden states (relative L2 / worst-row cosine) and the share of proposal tokens
+    both draw under one seed. On these random inputs the 8-layer trunk is chaotic -- BF16 against FP32 alone is
+    0.23 relative (test_dflash_plain_inject_gate.py) -- so a GEMM tiling change is 0.06 and the inject GEMM's
+    2.5% on the context 0.46: no verdict here; accept length on real sessions is the judge.
 """
 
 import argparse
@@ -143,13 +145,11 @@ def main(a):
     # a bug (a wrong row block, scale or layer order) is O(1); these bound rounding. Merge only: the same sums, a
     # different tiling at most. Inject gemm on an FP8 export: the per-layer path's FP8 activation quantization is gone.
     max_kv = 0.1 if a.inject_gemm else 1e-2
-    max_rel = a.max_rel if a.max_rel is not None else 0.15 if a.inject_gemm else 0.05
-    min_cos = a.min_cos if a.min_cos is not None else 0.95 if a.inject_gemm else 0.99
     print(f"merged vs stored ({'+ inject gemm' if a.inject_gemm else 'merge only'}, W4A8 "
           f"{os.environ.get('ARC_DFLASH_W4A8') or 'off'}, compile {models['merged'].compile_mode}): committed K/V rel "
           f"{worst['kv']:.2e} (max {max_kv:.0e}); proposal hidden rel {worst['rel']:.4f}, worst-row cos "
-          f"{worst['cos']:.5f}; same tokens under one seed {share:.3f}", flush=True)
-    ok = worst["kv"] < max_kv and worst["rel"] < max_rel and worst["cos"] > min_cos
+          f"{worst['cos']:.5f}; same tokens under one seed {share:.3f} (reported, no verdict)", flush=True)
+    ok = worst["kv"] < max_kv
     print("MERGE_AB_OK" if ok else "MERGE_AB_FAIL", flush=True)
     return 0 if ok else 1
 
@@ -159,6 +159,4 @@ if __name__ == "__main__":
     ap.add_argument("--drafter", required=True)
     ap.add_argument("--cycles", type=int, default=12)
     ap.add_argument("--inject-gemm", action="store_true", help="also ARC_DFLASH_INJECT_KV=gemm on the merged build")
-    ap.add_argument("--max-rel", type=float, help="proposal hidden, relative L2 (default 0.05; 0.15 with --inject-gemm)")
-    ap.add_argument("--min-cos", type=float, help="proposal hidden, worst row (default 0.99; 0.95 with --inject-gemm)")
     raise SystemExit(main(ap.parse_args()))
