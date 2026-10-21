@@ -503,24 +503,34 @@ class HummingRunnerCore(MoeRunnerCore):
         configs = self.get_humming_gemm_configs(HummingGemmType.INDEXED)
         valid_shape_m = self.estimate_local_valid_shape_m(topk_ids)
 
-        for min_shape_m, max_shape_m, config in configs["w13_tuning_config"]:
-            if valid_shape_m > min_shape_m and valid_shape_m <= max_shape_m:
-                moe_block_size = config["block_shape"][0]
-                break
-        else:
+        def block_size_of(sublayer_configs):
+            for min_shape_m, max_shape_m, config in sublayer_configs:
+                if valid_shape_m > min_shape_m and valid_shape_m <= max_shape_m:
+                    return config["block_shape"][0]
             raise ValueError(f"cannot found moe_block_size for shape {valid_shape_m}")
 
-        sorted_ids, expert_ids, num_tokens_padded = moe_align_block_size(
-            topk_ids=topk_ids,
-            block_size=moe_block_size,
-            num_experts=self.num_experts,
-            ignore_invalid_expert=True,
-        )
+        def align(block_size):
+            sorted_ids, expert_ids, num_tokens_padded = moe_align_block_size(
+                topk_ids=topk_ids,
+                block_size=block_size,
+                num_experts=self.num_experts,
+                ignore_invalid_expert=True,
+            )
+            return {
+                "sorted_ids": sorted_ids,
+                "expert_ids": expert_ids,
+                "num_tokens_padded": num_tokens_padded,
+            }
+
+        # The token list is padded per expert to a multiple of the GEMM's block M. w2 reuses w13's list only
+        # when its schedule has the same block M at this row count; otherwise (Humming 0.1.18's SM100 UMMA
+        # prefill schedules, e.g. w13 120 / w2 112) it gets its own, or it would read a misaligned list.
+        w13_block_size = block_size_of(configs["w13_tuning_config"])
+        w2_block_size = block_size_of(configs["w2_tuning_config"])
+        w13_align = align(w13_block_size)
+        w2_align = w13_align if w2_block_size == w13_block_size else align(w2_block_size)
 
         moe_common_kwargs = {
-            "sorted_ids": sorted_ids,
-            "expert_ids": expert_ids,
-            "num_tokens_padded": num_tokens_padded,
             "compute_config": configs["compute_config_str"],
             "valid_shape_m": valid_shape_m,
         }
@@ -529,8 +539,13 @@ class HummingRunnerCore(MoeRunnerCore):
         moe_kwargs1 = {
             "top_k": top_k,
             "tuning_config": configs["w13_tuning_config_str"],
+            **w13_align,
         }
-        moe_kwargs2 = {"top_k": 1, "tuning_config": configs["w2_tuning_config_str"]}
+        moe_kwargs2 = {
+            "top_k": 1,
+            "tuning_config": configs["w2_tuning_config_str"],
+            **w2_align,
+        }
         moe_kwargs1.update(moe_common_kwargs)
         moe_kwargs2.update(moe_common_kwargs)
 
