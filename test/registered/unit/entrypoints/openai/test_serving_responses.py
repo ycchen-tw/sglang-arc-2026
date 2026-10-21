@@ -678,6 +678,99 @@ class InputItemNormalizationTestCase(CustomTestCase):
             },
         )
 
+    _MID_DEVELOPER_HISTORY = [
+        {"role": "developer", "content": "Lead rules."},
+        {"role": "user", "content": "Play."},
+        {"type": "function_call", "call_id": "c1", "name": "run", "arguments": "{}"},
+        {"role": "developer", "content": "Reminder A."},
+        {"type": "function_call_output", "call_id": "c1", "output": "moved"},
+        {"type": "function_call", "call_id": "c2", "name": "run", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c2", "output": "moved again"},
+        {"role": "developer", "content": "Reminder B."},
+        {"role": "assistant", "content": "next"},
+    ]
+
+    def _mid_developer_messages(self, inline: bool):
+        serving = make_serving()
+        request = ResponsesRequest(
+            model="x", instructions="Base.", input=self._MID_DEVELOPER_HISTORY, store=False
+        )
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_responses.ARC_RESPONSES_INLINE_DEVELOPER",
+            inline,
+        ):
+            return serving._construct_input_messages(request)
+
+    def test_mid_history_developer_joins_the_leading_system_by_default(self):
+        messages = self._mid_developer_messages(inline=False)
+        self.assertEqual(
+            [m["role"] for m in messages], ["system", "user", "assistant", "tool", "assistant", "tool", "assistant"]
+        )
+        self.assertEqual(
+            messages[0]["content"],
+            "Base.\n\nDeveloper instructions:\nLead rules.\n\nDeveloper instructions:\nReminder A."
+            "\n\nDeveloper instructions:\nReminder B.",
+        )
+
+    def test_inline_developer_renders_in_place_after_the_turn_s_tool_outputs(self):
+        messages = self._mid_developer_messages(inline=True)
+        self.assertEqual(
+            [(m["role"], m.get("content")) for m in messages],
+            [
+                ("system", "Base.\n\nDeveloper instructions:\nLead rules."),
+                ("user", "Play."),
+                ("assistant", None),
+                ("tool", "moved"),
+                ("user", "Developer instructions:\nReminder A."),
+                ("assistant", None),
+                ("tool", "moved again"),
+                ("user", "Developer instructions:\nReminder B."),
+                ("assistant", "next"),
+            ],
+        )
+        self.assertEqual(messages[2]["tool_calls"][0]["id"], "c1")
+
+    def test_inline_developer_waits_out_a_split_assistant_turn_and_flushes_at_the_end(self):
+        serving = make_serving()
+        request = ResponsesRequest(
+            model="x",
+            input=[
+                {"role": "user", "content": "Play."},
+                {"role": "assistant", "content": "thinking aloud"},
+                {"role": "developer", "content": "Reminder."},
+                {"type": "function_call", "call_id": "c1", "name": "run", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": "moved"},
+                {"role": "developer", "content": "Last."},
+            ],
+            store=False,
+        )
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_responses.ARC_RESPONSES_INLINE_DEVELOPER",
+            True,
+        ):
+            messages = serving._construct_input_messages(request)
+        self.assertEqual([m["role"] for m in messages], ["user", "assistant", "tool", "user", "user"])
+        self.assertEqual(messages[1]["tool_calls"][0]["id"], "c1")
+        self.assertEqual(
+            [m["content"] for m in messages[3:]],
+            ["Developer instructions:\nReminder.", "Developer instructions:\nLast."],
+        )
+
+    def test_inline_developer_flag_values(self):
+        from sglang.srt.entrypoints.openai import serving_responses
+
+        for raw, want in ((None, False), ("0", False), ("1", True)):
+            env = {} if raw is None else {"ARC_RESPONSES_INLINE_DEVELOPER": raw}
+            with patch.dict("os.environ", env, clear=False):
+                if raw is None:
+                    import os
+
+                    os.environ.pop("ARC_RESPONSES_INLINE_DEVELOPER", None)
+                self.assertIs(serving_responses._arc_responses_inline_developer(), want)
+        with patch.dict("os.environ", {"ARC_RESPONSES_INLINE_DEVELOPER": "yes"}):
+            with self.assertRaises(ValueError):
+                serving_responses._arc_responses_inline_developer()
+
     def test_developer_role_becomes_labelled_system(self):
         normalized = OpenAIServingResponses._normalize_response_message_for_chat(
             {"role": "developer", "content": "Be terse."}

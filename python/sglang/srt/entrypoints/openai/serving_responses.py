@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from contextlib import AsyncExitStack
 from http import HTTPStatus
@@ -148,6 +149,40 @@ def _should_emit_normal_text_as_message(
     if any_tool_call_in_progress and not text.strip():
         return False
     return True
+
+
+
+def _arc_responses_inline_developer() -> bool:
+    """ARC_RESPONSES_INLINE_DEVELOPER (opt-in; unset or 0 = upstream behaviour).
+
+    Chat templates without a ``developer`` role (Qwen3.x: system/user/assistant/tool, and a
+    ``system`` that is not first raises) make ``_construct_input_messages`` fold every
+    developer message into the one leading system block. For a developer message in the
+    middle of the history -- a client's mid-turn reminder, a hook's added context -- that is
+    the wrong place twice over: the model reads it at the very top of the prompt, far from
+    the turn it is about, and the leading block changes, so the whole prompt after it misses
+    the prefix cache (codex token_budget reminders on a gen-2 ARC harness, 2026-10-20: 2 of
+    424 context windows ended by the model's own new_context, 72% of prefill was recompute).
+
+    With 1, a developer message that comes after the first non-system message renders where
+    it is, as a labelled ``user`` message; one that falls inside an assistant turn (between a
+    tool call and its outputs) waits until the turn's tool outputs are in. Developer messages
+    before the conversation starts still join the leading system block."""
+    raw = os.environ.get("ARC_RESPONSES_INLINE_DEVELOPER")
+    if raw is None or raw == "0":
+        return False
+    if raw == "1":
+        return True
+    raise ValueError(f"ARC_RESPONSES_INLINE_DEVELOPER must be 0 or 1, got {raw!r}")
+
+
+ARC_RESPONSES_INLINE_DEVELOPER = _arc_responses_inline_developer()
+
+
+def _input_item_role(item: Any) -> Optional[str]:
+    if isinstance(item, dict):
+        return item.get("role")
+    return getattr(item, "role", None)
 
 
 class OpenAIServingResponses(OpenAIServingChat):
@@ -1549,10 +1584,34 @@ class OpenAIServingResponses(OpenAIServingChat):
                 }
             )
 
+        inline = ARC_RESPONSES_INLINE_DEVELOPER
+        started = False  # a non-system message has been seen
+        pending: list = []  # inline developer messages waiting for their turn's tool outputs
         for input_item in self._response_input_history(request):
             normalized = self._normalize_response_message_for_chat(input_item)
-            if normalized is not None:
-                messages.append(normalized)
+            if normalized is None:
+                continue
+            role = normalized.get("role") if isinstance(normalized, dict) else None
+            if inline and started and _input_item_role(input_item) == "developer":
+                # labelled by _normalize_response_message_for_chat
+                pending.append({"role": "user", "content": normalized["content"]})
+                continue
+            if pending and (
+                role == "user"
+                or (
+                    role == "assistant"
+                    and not (
+                        isinstance(messages[-1], dict)
+                        and messages[-1].get("role") == "assistant"
+                    )
+                )
+            ):
+                messages.extend(pending)
+                pending = []
+            if role != "system":
+                started = True
+            messages.append(normalized)
+        messages.extend(pending)
 
         # One Responses-API assistant turn maps to multiple input items
         # (message + function_call(s)); collapse them into one chat message
@@ -1560,7 +1619,9 @@ class OpenAIServingResponses(OpenAIServingChat):
         messages = self._merge_consecutive_assistant_messages(messages)
 
         # Most chat templates expect a single leading ``system`` message;
-        # coalesce any ``instructions`` + interleaved ``developer`` entries.
+        # coalesce any ``instructions`` + interleaved ``developer`` entries
+        # (with ARC_RESPONSES_INLINE_DEVELOPER only the ones before the
+        # conversation starts are left as system).
         system_chunks: list[str] = []
         other_msgs: list = []
         for m in messages:
