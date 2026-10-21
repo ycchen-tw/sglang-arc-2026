@@ -54,6 +54,10 @@ try:
 except ModuleNotFoundError:
     _humming_available = False
 
+# HummingRunnerCore._prepare_indexed_gemm_kwargs aligns w2's token list to w2's own block M when it differs from
+# w13's. Loaders that run Humming schedules with per-sublayer block M (0.1.18's SM100 defaults) check for this.
+INDEXED_W2_OWN_ALIGNMENT = True
+
 
 def get_standard_humming_moe_gemm_type() -> HummingGemmType:
     env_gemm_type_str = envs.SGLANG_HUMMING_MOE_GEMM_TYPE.get().lower()
