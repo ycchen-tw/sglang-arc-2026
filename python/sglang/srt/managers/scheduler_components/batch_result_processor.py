@@ -1110,7 +1110,7 @@ class SchedulerBatchResultProcessor:
             req.update_finish_state(new_accept_len)
 
             if sampling_mask_finish_reason is not None:
-                self._handle_sampling_mask_abort(req)
+                self._handle_sampling_mask_abort(req, batch, result, i)
                 continue
 
             self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
@@ -1367,8 +1367,20 @@ class SchedulerBatchResultProcessor:
             "InternalServerError",
         )
 
-    def _handle_sampling_mask_abort(self, req: Req) -> None:
-        """Release a request whose sampled token must not be committed."""
+    def _handle_sampling_mask_abort(
+        self, req: Req, batch: ScheduleBatch, result: GenerationBatchResult, i: int
+    ) -> None:
+        """Release a request whose sampled token must not be committed.
+
+        A spec request finishes here as on _handle_finish_state_updated_req's path: exact_end
+        records the finish (an abort: no snapshot), which the overlap scheduler's overshoot
+        verify of it looks up next tick (without it on_overshoot raised and killed the scheduler,
+        10-24 arc2 RL), and the drafter frees the request's draft state."""
+        if not batch.spec_algorithm.is_none():
+            if get_serving().session_exact_resume:
+                exact_end.on_spec_finish(req, result, i, self.req_to_token_pool)
+            if isinstance(self.draft_worker, BaseSpecWorker):
+                self.draft_worker.note_request_finished(rid=req.rid, natural_stop=False)
         if req.multimodal_inputs is not None and req.session is None:
             req.multimodal_inputs.release_features()
         if get_disagg().disaggregation_decode_enable_offload_kvcache:

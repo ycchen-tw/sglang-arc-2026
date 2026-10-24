@@ -1,3 +1,4 @@
+import dataclasses
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -327,6 +328,102 @@ class TestSamplingMaskStatusErrors(CustomTestCase):
         )
         self.assertEqual(invalid.status_code, 500)
         self.assertEqual(invalid.err_type, "InternalServerError")
+
+
+class _SpecAbortReq:
+    """A session request in a spec decode batch whose verify the sampling mask rejects."""
+
+    def __init__(self):
+        self.rid = "resp_spec_abort"
+        self.session_id = "session"
+        self.origin_input_ids = [1, 2, 3]
+        self.output_ids = [7]
+        self.finished_len = None
+        self.finished_reason = None
+        self.to_finish = None
+        self.retraction_count = 0
+        self.grammar = None
+        self.arc_think_armed_at = -1
+        self.exact_end_verifies = 1
+        self.kv = SimpleNamespace(kv_committed_len=5, exact_end_slot=None, exact_end_unarmed="unarmed")
+        self.is_retracted = False
+        self.return_logprob = False
+        self.return_hidden_states = None
+        self.return_sampling_mask = True
+        self.beam_group = None
+        self.multimodal_inputs = None
+        self.time_stats = Mock()
+
+    def finished(self):
+        return self.finished_reason is not None
+
+    def update_finish_state(self, new_accept_len):
+        if self.to_finish is not None:
+            self.finished_reason = self.to_finish
+
+
+class TestSpecSamplingMaskAbortExactEnd(CustomTestCase):
+    def test_overshoot_after_a_spec_sampling_mask_abort_finds_its_finish(self):
+        """10-24 arc2 RL: an INVALID sampling mask aborted a spec request; the overlap scheduler's
+        overshoot verify of it then raised "whose finish was never seen" and killed the scheduler."""
+        from sglang.srt.speculative import exact_end
+        from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+
+        state = SimpleNamespace()
+        state.stats = exact_end.Stats(state)
+        processor = dataclasses.replace(
+            _make_processor(self),
+            enable_overlap=True,
+            draft_worker=Mock(spec=BaseSpecWorker),
+            req_to_token_pool=SimpleNamespace(exact_end_spec=state),
+        )
+        # after _make_processor's override, which would put the default back
+        override = get_context().override_server_args(session_exact_resume=True)
+        override.install()
+        self.addCleanup(override.restore)
+        req = _SpecAbortReq()
+        batch = SimpleNamespace(
+            reqs=[req],
+            return_logprob=False,
+            spec_algorithm=SimpleNamespace(is_none=lambda: False),
+            batch_size=lambda: 1,
+        )
+
+        def verify(status):
+            result = GenerationBatchResult(
+                forward_weight_version="default",
+                logits_output=LogitsProcessorOutput(
+                    next_token_logits=None,
+                    next_token_sampling_mask_status=[status],
+                ),
+                next_token_ids=torch.tensor([8, 9]),
+                accept_lens=torch.tensor([2]),
+            )
+            result.exact_end_pos = torch.tensor([-1])
+            result.exact_end_verify_ct = [1]
+            result.speculative_num_draft_tokens = 4
+            return result
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.batch_result_processor.release_kv_cache"
+        ) as release, patch.object(
+            SchedulerBatchResultProcessor,
+            "_normalize_decode_outputs",
+            return_value=([[8, 9]], None),
+        ):
+            processor.process_batch_result_decode(batch, verify(SamplingMaskStatus.INVALID))
+            # the overshoot tick: the request is finished, its verify still comes back
+            processor.process_batch_result_decode(batch, verify(SamplingMaskStatus.OK))
+
+        self.assertEqual(req.output_ids, [7])
+        self.assertEqual(req.to_finish.status_code, 500)
+        self.assertIsNone(req.exact_end)
+        self.assertEqual(req.exact_end_fallback, exact_end.FALLBACK_ABORT)
+        self.assertEqual(len(state.stats.finished[req.rid]["windows"]), 2)
+        processor.draft_worker.note_request_finished.assert_called_once_with(
+            rid=req.rid, natural_stop=False
+        )
+        release.assert_called_once_with(req, processor.tree_cache, is_insert=False)
 
 
 class TestDecodeHiddenStateRetention(CustomTestCase):
