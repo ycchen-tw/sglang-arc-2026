@@ -3025,12 +3025,18 @@ class Scheduler(
                 self._reject_sampling_mask_request(req, error_msg)
                 return
 
-        if req.return_sampling_mask and not self.spec_algorithm.is_none():
+        if (
+            req.return_sampling_mask
+            and not self.spec_algorithm.is_none()
+            and not self.spec_algorithm.is_dflash()
+        ):
             # Spec workers do not emit one sampling support per accepted token, so
             # the returned mask would not align 1:1 with generated tokens. Reject
             # the combination instead of silently returning a misaligned mask.
+            # arc-forge: the DFLASH v2 verify does (arc_dflash/sampling_mask.py).
             error_msg = (
-                "return_sampling_mask is not supported with speculative decoding."
+                "return_sampling_mask is not supported with speculative decoding "
+                "other than DFLASH."
             )
             self._reject_sampling_mask_request(req, error_msg)
             return

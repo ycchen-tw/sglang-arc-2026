@@ -94,6 +94,43 @@ def _arc_responses_default_temperature() -> Optional[float]:
 
 ARC_RESPONSES_DEFAULT_TEMPERATURE = _arc_responses_default_temperature()
 
+
+def _arc_responses_default_top_p() -> Optional[float]:
+    """ARC_RESPONSES_DEFAULT_TOP_P (opt-in; unset = upstream behaviour): the top_p a /v1/responses request that
+    sends none samples with, in place of the class default 1.0 (codex never sends one; an RL rollout through it
+    samples with top-p this way). A value the request sends, and --sampling-defaults model's generation_config,
+    still take precedence."""
+    raw = os.environ.get("ARC_RESPONSES_DEFAULT_TOP_P")
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(f"ARC_RESPONSES_DEFAULT_TOP_P must be a number, got {raw!r}") from None
+    if not (0 < value <= 1):
+        raise ValueError(f"ARC_RESPONSES_DEFAULT_TOP_P must be in (0, 1], got {raw!r}")
+    return value
+
+
+def _arc_responses_default_top_k() -> Optional[int]:
+    """ARC_RESPONSES_DEFAULT_TOP_K (opt-in; unset = upstream behaviour): the top_k a /v1/responses request that
+    sends none samples with (codex never sends one). A value the request sends, and --sampling-defaults model's
+    generation_config, still take precedence; -1 = no top-k."""
+    raw = os.environ.get("ARC_RESPONSES_DEFAULT_TOP_K")
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"ARC_RESPONSES_DEFAULT_TOP_K must be an integer, got {raw!r}") from None
+    if not (value == -1 or value >= 1):
+        raise ValueError(f"ARC_RESPONSES_DEFAULT_TOP_K must be -1 or >= 1, got {raw!r}")
+    return value
+
+
+ARC_RESPONSES_DEFAULT_TOP_P = _arc_responses_default_top_p()
+ARC_RESPONSES_DEFAULT_TOP_K = _arc_responses_default_top_k()
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL_NAME = "default"
@@ -1882,7 +1919,12 @@ class ResponsesRequest(BaseModel):
 
         top_p = self.top_p
         if top_p is None:
-            top_p = default_params.get("top_p", self._DEFAULT_SAMPLING_PARAMS["top_p"])
+            top_p = default_params.get(
+                "top_p",
+                self._DEFAULT_SAMPLING_PARAMS["top_p"]
+                if ARC_RESPONSES_DEFAULT_TOP_P is None
+                else ARC_RESPONSES_DEFAULT_TOP_P,
+            )
 
         # Omit None entries so they fall through to ``--preferred-sampling-params``
         # rather than overriding it with a literal default.
@@ -1894,8 +1936,11 @@ class ResponsesRequest(BaseModel):
             "presence_penalty": self.presence_penalty,
             "stop": self.stop if stop is None else stop,
         }
-        if self.top_k is not None:
-            params["top_k"] = self.top_k
+        top_k = self.top_k
+        if top_k is None and ARC_RESPONSES_DEFAULT_TOP_K is not None:
+            top_k = default_params.get("top_k", ARC_RESPONSES_DEFAULT_TOP_K)
+        if top_k is not None:
+            params["top_k"] = top_k
         if self.min_p is not None:
             params["min_p"] = self.min_p
         if self.repetition_penalty is not None:

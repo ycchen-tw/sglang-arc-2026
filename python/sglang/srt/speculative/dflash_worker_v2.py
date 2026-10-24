@@ -18,6 +18,8 @@ from sglang.kernels.ops.speculative.dflash import (
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     accept_sampling,
 )
+from sglang.srt.speculative.arc_dflash.sampling_mask import spec_sampling_mask_output
+from sglang.srt.speculative.arc_dflash import target_vocab as arc_target_vocab
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
@@ -1420,8 +1422,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         q_rows: torch.Tensor,
         sampling_info,
         draft_input,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Scatter the selector's sparse q into a dense one for DSpark's kernel."""
+        return_target_probs: bool = False,
+    ) -> Tuple[torch.Tensor, ...]:
+        """Scatter the selector's sparse q into a dense one for DSpark's kernel.
+        ``return_target_probs``: also return the (bs, D, V) target distribution accepted against."""
         bs, block = candidates.shape
         gamma = block - 1
         vocab = int(next_token_logits.shape[-1])
@@ -1436,7 +1440,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_probs = buffer[:bs]
         try:
             draft_probs.scatter_(-1, candidate_ids, q_rows.float())
-            accept_len, bonus, _ = accept_sampling(
+            accepted = accept_sampling(
                 candidates=candidates,
                 target_logits=next_token_logits,
                 draft_probs=draft_probs,
@@ -1445,12 +1449,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                 gamma=gamma,
                 verify_num_draft_tokens=block,
                 cutoff_verify_lens=None,
+                return_target_probs=return_target_probs,
             )
+            accept_len, bonus = accepted[0], accepted[1]
         finally:
             # Here, not before the next write: candidate_ids may be a view of a
             # buffer the next draft step overwrites. In finally because the next
             # call scatters different ids and reads q across the whole vocabulary.
             draft_probs.scatter_(-1, candidate_ids, 0.0)
+        if return_target_probs:
+            return accept_len.to(torch.int32), bonus.to(torch.int64), accepted[3]
         return accept_len.to(torch.int32), bonus.to(torch.int64)
 
     def _greedy_sample_from_quantized_head(
@@ -2072,16 +2080,37 @@ class DFlashWorkerV2(BaseSpecWorker):
     ):
         new_seq_lens = None
         target_predict = None
+        # arc-forge: return_sampling_mask needs the truncated target distribution of
+        # the chain (arc_dflash/sampling_mask.py); only the selector sampling path keeps it.
+        want_masks = (
+            sampling_info is not None
+            and sampling_info.sampling_mask_batch_indices is not None
+        )
+        if want_masks and arc_target_vocab.active():
+            raise RuntimeError(
+                "return_sampling_mask under DFLASH does not support ARC_TARGET_VOCAB "
+                "(the verify's ids would be compact ids, not token ids)."
+            )
+        if want_masks and self._selector_sample is None:
+            raise RuntimeError(
+                "return_sampling_mask under DFLASH needs the selector sampling verify "
+                "(a drafter with a candidate selector, non-greedy sampling)."
+            )
+        target_probs = None
         if self._selector_sample is not None:
             selector_candidate_ids, selector_q_rows = self._selector_sample
-            accept_len, bonus = self._selector_sampling_accept(
+            accepted = self._selector_sampling_accept(
                 candidates=candidates,
                 next_token_logits=next_token_logits,
                 candidate_ids=selector_candidate_ids,
                 q_rows=selector_q_rows,
                 sampling_info=sampling_info,
                 draft_input=draft_input,
+                return_target_probs=want_masks,
             )
+            accept_len, bonus = accepted[0], accepted[1]
+            if want_masks:
+                target_probs = accepted[2]
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, accept_len)
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, bonus)
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
@@ -2141,7 +2170,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                     target_predict=target_predict,
                 )
                 out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
-        return accept_len, commit_lens, bonus, out_tokens, new_seq_lens, target_predict
+        if want_masks:
+            return (
+                accept_len, commit_lens, bonus, out_tokens, new_seq_lens, target_predict,
+                spec_sampling_mask_output(
+                    target_probs,
+                    out_tokens,
+                    sampling_info.sampling_mask_batch_indices,
+                    get_exec().features.sampling_mask_max_tokens,
+                ),
+            )
+        return accept_len, commit_lens, bonus, out_tokens, new_seq_lens, target_predict, None
 
     def _validate_phase1_sampling_support(self, batch: ScheduleBatch) -> None:
         sampling_info = batch.sampling_info
@@ -2682,6 +2721,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             out_tokens,
             new_seq_lens,
             target_predict,
+            sampling_mask_output,
         ) = self._accept_block(
             candidates=candidates,
             next_token_logits=logits_output.next_token_logits,
@@ -2726,6 +2766,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                 out_tokens.reshape(-1),
                 chain_stride=block_size,
             )
+        if sampling_mask_output is not None:
+            if SIMULATE_ACC_LEN > 0:
+                raise RuntimeError("return_sampling_mask does not support simulated acceptance")
+            logits_output.sampling_mask_output = sampling_mask_output
 
         if self._need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None

@@ -1087,6 +1087,14 @@ class SchedulerBatchResultProcessor:
             if req.return_sampling_mask:
                 statuses = logits_output.next_token_sampling_mask_status
                 status = None if statuses is None else statuses[i]
+                if isinstance(status, list):
+                    # per block position (DFLASH verify): the committed ones decide
+                    if not is_spec or len(status) < len(next_token_id):
+                        raise RuntimeError(
+                            f"{len(status)} sampling-mask rows for {len(next_token_id)} "
+                            "committed tokens"
+                        )
+                    status = max(status[: len(next_token_id)], default=SamplingMaskStatus.OK)
                 sampling_mask_finish_reason = self.get_sampling_mask_finish_reason(
                     status=status
                 )
@@ -1118,9 +1126,13 @@ class SchedulerBatchResultProcessor:
                 )
 
             if req.return_sampling_mask:
-                # return_sampling_mask + speculative decoding is rejected at
-                # request entry, so this remains one support mask per token.
-                self.add_sampling_mask_return_values(i, req, logits_output)
+                if is_spec:
+                    # arc-forge: DFLASH, one support mask per committed token
+                    self.add_spec_sampling_mask_return_values(
+                        i, req, logits_output, len(next_token_id)
+                    )
+                else:
+                    self.add_sampling_mask_return_values(i, req, logits_output)
 
             if req.return_hidden_states and logits_output.hidden_states is not None:
                 # hidden_states is [bs * stride, hidden_dim], one row per emitted
@@ -1254,6 +1266,24 @@ class SchedulerBatchResultProcessor:
             None if logprobs is None else logprobs[i]
         )
 
+    def add_spec_sampling_mask_return_values(
+        self,
+        i: int,
+        req: Req,
+        output: LogitsProcessorOutput,
+        n_committed: int,
+    ) -> None:
+        """The support of each committed token of a speculative verify (arc-forge, DFLASH)."""
+        masks = output.next_token_sampling_mask_idx[i]
+        logprobs = output.next_token_sampling_logprobs[i]
+        if not isinstance(masks, list) or len(masks) < n_committed:
+            raise RuntimeError(
+                f"speculative sampling masks {type(masks).__name__} do not cover "
+                f"{n_committed} committed tokens"
+            )
+        req.output_token_sampling_mask.extend(masks[:n_committed])
+        req.output_token_sampling_logprobs.extend(logprobs[:n_committed])
+
     @staticmethod
     def materialize_sampling_mask_output(
         reqs: List[Req],
@@ -1268,7 +1298,8 @@ class SchedulerBatchResultProcessor:
         lengths = sampling_output.lengths.tolist()
         selected_logprobs = sampling_output.selected_logprobs.tolist()
         statuses = sampling_output.statuses.tolist()
-        assert len(batch_indices) == len(lengths)
+        rows_per_request = sampling_output.rows_per_request
+        assert len(batch_indices) * rows_per_request == len(lengths)
 
         batch_size = len(reqs)
         masks = [None] * batch_size
@@ -1276,15 +1307,30 @@ class SchedulerBatchResultProcessor:
         status_by_batch = [None] * batch_size
         token_ids = sampling_output.token_ids.cpu()
         packed_width = token_ids.shape[1]
-        for row, batch_index in enumerate(batch_indices):
+
+        def one_row(row):
             status = int(statuses[row])
             length = int(lengths[row])
             if status == SamplingMaskStatus.OK and not (0 <= length <= packed_width):
                 status = SamplingMaskStatus.INVALID
-            status_by_batch[batch_index] = status
-            if status == SamplingMaskStatus.OK:
-                masks[batch_index] = token_ids[row, :length].tolist()
-                logprobs[batch_index] = float(selected_logprobs[row])
+            if status != SamplingMaskStatus.OK:
+                return status, None, None
+            return status, token_ids[row, :length].tolist(), float(selected_logprobs[row])
+
+        for index, batch_index in enumerate(batch_indices):
+            if rows_per_request == 1:
+                (
+                    status_by_batch[batch_index],
+                    masks[batch_index],
+                    logprobs[batch_index],
+                ) = one_row(index)
+            else:
+                # arc-forge: a speculative verify's block positions, one row each; the
+                # decode loop keeps the rows of the tokens it commits.
+                rows = [one_row(index * rows_per_request + j) for j in range(rows_per_request)]
+                status_by_batch[batch_index] = [r[0] for r in rows]
+                masks[batch_index] = [r[1] for r in rows]
+                logprobs[batch_index] = [r[2] for r in rows]
 
         output.next_token_sampling_mask_idx = masks
         output.next_token_sampling_logprobs = logprobs

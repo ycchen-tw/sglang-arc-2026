@@ -358,6 +358,13 @@ class Serving(msgspec.Struct):
         "Record the routed experts of every new token in the ledger. Requires "
         "--enable-return-routed-experts.",
     ] = False
+    session_ledger_sampling_mask: A[
+        bool,
+        "Record every sampled token's sampling support (top-k / top-p kept ids) and "
+        "its support-renormalized logprob in the ledger, for requests that sample "
+        "with T > 0 and top-k or top-p (forces return_sampling_mask on them; the "
+        "client response is unchanged). Bound top_k by --sampling-mask-max-tokens.",
+    ] = False
     session_ledger_max_bytes: A[
         int,
         "Memory budget of the in-memory session records (int32 ids); the least "

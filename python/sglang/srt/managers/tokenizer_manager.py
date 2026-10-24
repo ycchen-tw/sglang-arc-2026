@@ -309,6 +309,7 @@ class ReqState:
     # session ledger turned return_logprob / return_routed_experts on for this request (the client did not ask)
     ledger_logprobs: bool = False
     ledger_routing: bool = False
+    ledger_sampling_mask: bool = False
 
     # Cached flat-format prompt top logprob fields; rebuilt only when more
     # prefill chunks arrive, so streaming decode chunks reuse the payload.
@@ -571,6 +572,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 or serving.session_ledger_all
                 or serving.session_ledger_logprobs
                 or serving.session_ledger_routing
+                or serving.session_ledger_sampling_mask
             ):
                 raise ValueError("--session-ledger-* needs --session-replay")
             return
@@ -602,6 +604,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             empty_think=serving.session_replay_empty_think,
             exact_resume=serving.session_exact_resume,
             own_last_turn=serving.session_replay_own_last_turn,
+            sampling_mask=serving.session_ledger_sampling_mask,
         )
 
     def _session_ledger_intake(self, obj, tokenized_obj) -> None:
@@ -613,6 +616,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         state = self.rid_to_state[obj.rid]
         state.ledger_logprobs = self.session_ledger.forced_logprobs
         state.ledger_routing = self.session_ledger.forced_routing
+        state.ledger_sampling_mask = self.session_ledger.forced_sampling_mask
         self.session_ledger.sweep(self.rid_to_state)
 
     def init_model_config(self):
@@ -2509,6 +2513,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     meta_info["output_token_sampling_mask_length"] = len(
                         state.output_token_sampling_mask
                     )
+            elif state.ledger_sampling_mask:
+                # session ledger only: keep the supports, nothing goes to the client
+                output_sampling_mask = recv_obj.output_token_sampling_mask
+                if output_sampling_mask is not None:
+                    state.output_token_sampling_mask.extend(output_sampling_mask[i])
+                    output_sampling_logprobs = recv_obj.output_token_sampling_logprobs
+                    if output_sampling_logprobs is not None:
+                        state.output_token_sampling_logprobs.extend(
+                            output_sampling_logprobs[i]
+                        )
 
             if not isinstance(recv_obj, BatchEmbeddingOutput):
                 meta_info.update(

@@ -56,6 +56,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.managers.replay_own_turn import (
     OwnTurn,
     OwnTurnEntry,
@@ -648,6 +649,34 @@ SAMPLING_FIELDS = ("temperature", "top_p", "top_k", "min_p", "frequency_penalty"
                    "skip_special_tokens", "sampling_seed", "n")
 
 
+def truncated_sampling(sp) -> bool:
+    """Does this (normalized) SamplingParams sample from a truncated distribution: T > 0 with top-k or top-p."""
+    return sp.temperature > 0 and (sp.top_p < 1 or sp.top_k < TOP_K_ALL)
+
+
+def truncated_sampling_dict(sampling: dict) -> bool:
+    """``truncated_sampling`` of an append's recorded ``sampling`` dict."""
+    return sampling["temperature"] > 0 and (sampling["top_p"] < 1 or sampling["top_k"] < TOP_K_ALL)
+
+
+def _sampling_mask_record(masks, logprobs, gen: np.ndarray):
+    """--session-ledger-sampling-mask: the support of every sampled token, as ``{"lens": b64 <i4 (n,),
+    "ids": b64 <i4 (sum lens,), "logprobs": b64 <f4 (n,)}`` -- ``ids`` the supports concatenated in sampling
+    order, ``logprobs`` log mu(token | support) (renormalized over the support). Returns (record, None) or
+    (None, why) when the server did not return one support per sampled token or a support misses its token."""
+    if len(masks) != len(gen) or len(logprobs) != len(gen):
+        return None, f"{len(masks)} supports / {len(logprobs)} support logprobs for {len(gen)} ids"
+    lens, ids = [], []
+    for j, (support, token) in enumerate(zip(masks, gen.tolist())):
+        if support is None or token not in support:
+            return None, f"token {j} ({token}) has support {support!r}"
+        lens.append(len(support))
+        ids.extend(support)
+    if any(v is None for v in logprobs):
+        return None, "a support logprob is missing"
+    return {"lens": _b64_i32(lens), "ids": _b64_i32(ids), "logprobs": _b64_f32(logprobs)}, None
+
+
 def _sampling_dict(sp) -> dict:
     """The effective sampling parameters (after preferred params and normalize()); SamplingParams is a
     msgspec Struct, its fields are __struct_fields__."""
@@ -684,14 +713,15 @@ class SessionLedger:
         empty_think: bool = False,
         exact_resume: bool = False,
         own_last_turn: bool = False,
+        sampling_mask: bool = False,
     ):
         if tokenizer is None:
             raise ValueError("--session-replay needs the tokenizer (do not use --skip-tokenizer-init)")
         if tokenizer_worker_num != 1:
             raise ValueError(f"--session-replay needs --tokenizer-worker-num 1 (got {tokenizer_worker_num}): "
                              "a session's requests must all reach the same ledger")
-        if ledger_dir is None and (record_all or logprobs or routing):
-            raise ValueError("--session-ledger-all/-logprobs/-routing need --session-ledger-dir")
+        if ledger_dir is None and (record_all or logprobs or routing or sampling_mask):
+            raise ValueError("--session-ledger-all/-logprobs/-routing/-sampling-mask need --session-ledger-dir")
         if routing and not routing_server_enabled:
             raise ValueError("--session-ledger-routing needs --enable-return-routed-experts")
         if not isinstance(max_bytes, int) or max_bytes < 1 << 20:
@@ -720,6 +750,9 @@ class SessionLedger:
         self.exact_resume = exact_resume
         self.logprobs = logprobs
         self.routing = routing
+        # --session-ledger-sampling-mask: a request that samples from a truncated distribution (T > 0 with top-k or
+        # top-p) also records each sampled token's support and its support-renormalized logprob (see _write_append)
+        self.sampling_mask = sampling_mask
         self.max_bytes = max_bytes
         self.sessions: "OrderedDict[str, _Session]" = OrderedDict()
         self.pending: Dict[str, _Pending] = {}
@@ -732,6 +765,7 @@ class SessionLedger:
         # set by on_intake for the TokenizerManager: did the ledger turn these on for this request
         self.forced_logprobs = False
         self.forced_routing = False
+        self.forced_sampling_mask = False
         self._shut = False
         self.instance = None
         self.root = None
@@ -746,20 +780,22 @@ class SessionLedger:
                         pid=os.getpid(), port=port, replay_end=self.replay_end, eos=self.eos.tolist(),
                         image_pad=self.image_pad, video_pad=self.video_pad,
                         ledger={"all": record_all, "logprobs": logprobs, "routing": routing, "max_bytes": max_bytes,
-                                "empty_think": empty_think, "own_last_turn": own_last_turn})
+                                "empty_think": empty_think, "own_last_turn": own_last_turn,
+                                "sampling_mask": sampling_mask})
             with open(os.path.join(self.root, "server.json"), "w") as f:
                 json.dump(meta, f, indent=1, sort_keys=True, default=str)
             self.writer = _Writer(self.root)
             self.writer.put({"ev": "start", "v": LEDGER_VERSION, "instance": self.instance, "t": time.time()})
             atexit.register(self.shutdown)
         logger.info("SESSION_LEDGER on: replay=1 empty_think=%d own_last_turn=%d dir=%s all=%d logprobs=%d "
-                    "routing=%d", empty_think, own_last_turn, self.root, record_all, logprobs, routing)
+                    "routing=%d sampling_mask=%d", empty_think, own_last_turn, self.root, record_all, logprobs,
+                    routing, sampling_mask)
 
     # ------------------------------------------------------------------ intake
 
     def on_intake(self, obj, tok, max_input_len: int) -> None:
         """After tokenization, before the request goes to the scheduler."""
-        self.forced_logprobs = self.forced_routing = False
+        self.forced_logprobs = self.forced_routing = self.forced_sampling_mask = False
         sid = obj.session_id
         if sid is None and not (self.writer is not None and self.record_all):
             return
@@ -826,6 +862,9 @@ class SessionLedger:
             tok.return_logprob = True
             tok.logprob_start_len = -1  # the scheduler resolves it to len(input): output positions only
             self.forced_logprobs = True
+        if self.sampling_mask and truncated_sampling(tok.sampling_params) and not tok.return_sampling_mask:
+            tok.return_sampling_mask = True
+            self.forced_sampling_mask = True
         # the previous generation's last token was never forwarded: its routing is computed now
         routing_start = max(prefix_len - 1, 0)
         if self.routing:
@@ -1012,6 +1051,16 @@ class SessionLedger:
                 ev["logprobs_error"] = f"{len(vals)} logprobs for {len(gen)} ids"
             else:
                 ev["logprobs"] = _b64_f32(vals)
+        if self.sampling_mask:
+            ev["sampling_mask"] = None
+            if truncated_sampling_dict(p.sampling):
+                mask, why = _sampling_mask_record(state.output_token_sampling_mask,
+                                                  state.output_token_sampling_logprobs, gen)
+                if why is not None:
+                    self.counters["sampling_mask_error"] += 1
+                    ev["sampling_mask_error"] = why
+                else:
+                    ev["sampling_mask"] = mask
         routing_bytes = None
         if self.routing:
             server_error = meta_info.get("routed_experts_error")

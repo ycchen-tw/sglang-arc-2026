@@ -101,6 +101,10 @@ class SamplingMaskOutput:
     lengths: torch.Tensor
     selected_logprobs: torch.Tensor
     statuses: torch.Tensor
+    # arc-forge: rows per opted-in request. 1 = one sampled token (the sampler); a
+    # speculative verify (DFlash) emits one row per block position, request-major,
+    # and the result processor keeps the rows of the tokens it commits.
+    rows_per_request: int = 1
 
     def map_device_tensors(self, fn) -> None:
         self.token_ids = fn(self.token_ids)
