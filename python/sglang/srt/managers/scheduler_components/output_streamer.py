@@ -637,7 +637,12 @@ class _GenerationStreamAccumulator:
         if self.return_sampling_mask:
             if req.return_sampling_mask:
                 send_output_sampling_mask_offset = req.send_output_sampling_mask_offset
-                sampling_mask_end = len(req.output_token_sampling_mask)
+                # arc-forge: a speculative verify can commit past the finish (max_new_tokens, a
+                # stop): keep the supports of the tokens sent, as the logprobs above do
+                sampling_mask_end = min(
+                    len(req.output_token_sampling_mask),
+                    len(output_ids_) if req.is_retracted else max(len(output_ids_), 1),
+                )
                 self.output_token_sampling_mask.append(
                     req.output_token_sampling_mask[
                         send_output_sampling_mask_offset:sampling_mask_end
