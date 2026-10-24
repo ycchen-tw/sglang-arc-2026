@@ -20,7 +20,7 @@ from sglang.srt.mem_cache.allocation_sizing import (
     get_alloc_reserve_per_decode,
     page_aligned_decode_alloc_lens,
 )
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -762,6 +762,8 @@ def eagle_sample(
             raise RuntimeError("ARC_SHARDED_VERIFY does not support SGLANG_SIMULATE_ACC_LEN")
         sharded = sharded_verify.sample(verify_input, batch, logits_output, grammar_mask)
         if sharded is not None:
+            if sampling_info.sampling_mask_batch_indices is not None:
+                raise RuntimeError("return_sampling_mask: ARC_SHARDED_VERIFY sampled without the target distribution")
             predict, num_correct_drafts, accept_index = sharded
             return predict, num_correct_drafts + 1, accept_index
         next_token_logits = logits_output.next_token_logits
@@ -1026,6 +1028,20 @@ def eagle_sample(
                 threshold_acc=get_spec().speculative_accept_threshold_acc,
                 deterministic=True,
             )
+        # arc-forge return_sampling_mask (the DFlash drafter's RL ledger): the support of each committed token is
+        # the positive part of the truncated target row it was drawn from (arc_dflash/sampling_mask.py)
+        if sampling_info.sampling_mask_batch_indices is not None:
+            if fused_softmax:
+                raise RuntimeError("return_sampling_mask needs top-k: the fused softmax path keeps no target distribution")
+            if get_tp_group().world_size > 1:
+                raise RuntimeError("return_sampling_mask under speculative decoding is TP1 only (the supports are packed "
+                                   "before the TP broadcast of the accepted tokens)")
+            from sglang.srt.speculative.arc_dflash.sampling_mask import eagle_sampling_mask_output
+
+            logits_output.sampling_mask_output = eagle_sampling_mask_output(
+                target_probs, predict, accept_index, sampling_info.sampling_mask_batch_indices,
+                get_exec().features.sampling_mask_max_tokens,
+            )
         del (
             expanded_temperature,
             target_probs,
@@ -1048,6 +1064,19 @@ def eagle_sample(
             tp_group.broadcast(predict, src=0)
             tp_group.broadcast(accept_index, src=0)
             tp_group.broadcast(num_correct_drafts, src=0)
+
+    if sampling_info.sampling_mask_batch_indices is not None:
+        if SIMULATE_ACC_LEN > 0:
+            raise RuntimeError("return_sampling_mask does not support SGLANG_SIMULATE_ACC_LEN")
+        if logits_output.sampling_mask_output is None:
+            # only the greedy branch reaches here without packing the supports above
+            if not sampling_info.is_all_greedy:
+                raise RuntimeError("return_sampling_mask: this verify branch keeps no target distribution")
+            from sglang.srt.speculative.arc_dflash.sampling_mask import eagle_greedy_sampling_mask_output
+
+            logits_output.sampling_mask_output = eagle_greedy_sampling_mask_output(
+                predict, accept_index, sampling_info.sampling_mask_batch_indices
+            )
 
     if SIMULATE_ACC_LEN > 0:
         # Do simulation. The helper builds (and returns) a replacement

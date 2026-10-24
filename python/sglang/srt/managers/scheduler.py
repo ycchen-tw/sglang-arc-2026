@@ -325,6 +325,7 @@ from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.eagle_utils import (
     get_draft_recurrent_hidden_state_spec_from_config,
 )
+from sglang.srt.speculative.arc_dflash import enabled as arc_dflash_enabled
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.uno_validation import validate_uno_request
 from sglang.srt.state_capturer.indexer_topk import destroy_global_indexer_capturer
@@ -3029,14 +3030,16 @@ class Scheduler(
             req.return_sampling_mask
             and not self.spec_algorithm.is_none()
             and not self.spec_algorithm.is_dflash()
+            and not (self.spec_algorithm.is_eagle() and arc_dflash_enabled())
         ):
             # Spec workers do not emit one sampling support per accepted token, so
             # the returned mask would not align 1:1 with generated tokens. Reject
             # the combination instead of silently returning a misaligned mask.
-            # arc-forge: the DFLASH v2 verify does (arc_dflash/sampling_mask.py).
+            # arc-forge: the DFLASH v2 verify and the EAGLE v2 verify with the DFlash drafter
+            # (ARC_DFLASH_DRAFTER) do (arc_dflash/sampling_mask.py).
             error_msg = (
                 "return_sampling_mask is not supported with speculative decoding "
-                "other than DFLASH."
+                "other than DFLASH or the DFlash drafter (ARC_DFLASH_DRAFTER)."
             )
             self._reject_sampling_mask_request(req, error_msg)
             return

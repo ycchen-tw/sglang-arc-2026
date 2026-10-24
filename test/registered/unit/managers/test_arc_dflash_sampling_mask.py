@@ -19,7 +19,11 @@ from sglang.srt.managers import session_ledger as sl
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
-from sglang.srt.speculative.arc_dflash.sampling_mask import spec_sampling_mask_output
+from sglang.srt.speculative.arc_dflash.sampling_mask import (
+    eagle_greedy_sampling_mask_output,
+    eagle_sampling_mask_output,
+    spec_sampling_mask_output,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -70,6 +74,33 @@ class TestSpecSamplingMaskOutput(unittest.TestCase):
             spec_sampling_mask_output(torch.zeros(2, 3, 5), torch.zeros(2, 2, dtype=torch.long), torch.tensor([0]), 4)
         with self.assertRaises(ValueError):
             spec_sampling_mask_output(torch.zeros(1, 1, 5), torch.zeros(1, 1, dtype=torch.long), torch.tensor([0]), 0)
+
+
+class TestEagleRows(unittest.TestCase):
+    def test_rows_follow_accept_index(self):
+        # bs 2, D 3: request 0 commits positions 0 and 1 (flat rows 0, 1), request 1 commits rows 3, 4, 5
+        probs = truncated([
+            [{1: 0.5, 2: 0.5}, {3: 1.0}, {4: 0.7, 5: 0.3}],
+            [{6: 0.9, 7: 0.1}, {8: 0.6, 9: 0.4}, {10: 1.0}],
+        ])
+        predict = torch.tensor([2, 3, 0, 7, 9, 10], dtype=torch.int32)
+        accept_index = torch.tensor([[0, 1, -1], [3, 4, 5]], dtype=torch.int32)
+        out = eagle_sampling_mask_output(probs, predict, accept_index, torch.tensor([0, 1]), max_tokens=4)
+        self.assertEqual(out.rows_per_request, 3)
+        self.assertEqual(out.lengths.tolist()[:2], [2, 1])
+        self.assertEqual(out.lengths.tolist()[3:], [2, 2, 1])
+        self.assertAlmostEqual(float(out.selected_logprobs[3]), math.log(0.1), places=6)
+        self.assertAlmostEqual(float(out.selected_logprobs[4]), math.log(0.4), places=6)
+        ok = SamplingMaskStatus.OK
+        self.assertEqual(out.statuses.tolist()[:2] + out.statuses.tolist()[3:], [ok] * 5)
+
+    def test_greedy_rows(self):
+        predict = torch.tensor([5, 6, 7, 8], dtype=torch.int32)
+        accept_index = torch.tensor([[0, 1], [2, -1]], dtype=torch.int32)
+        out = eagle_greedy_sampling_mask_output(predict, accept_index, torch.tensor([1]))
+        self.assertEqual(out.token_ids[:, 0].tolist()[:1], [7])
+        self.assertEqual(out.rows_per_request, 2)
+        self.assertEqual(out.selected_logprobs.tolist(), [0.0, 0.0])
 
 
 class TestMaterializeSpecRows(unittest.TestCase):

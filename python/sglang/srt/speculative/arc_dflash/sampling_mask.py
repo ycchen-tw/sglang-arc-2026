@@ -54,3 +54,43 @@ def spec_sampling_mask_output(
         statuses=statuses,
         rows_per_request=block,
     )
+
+
+def eagle_sampling_mask_output(
+    target_probs: torch.Tensor,
+    predict: torch.Tensor,
+    accept_index: torch.Tensor,
+    batch_rows: torch.Tensor,
+    max_tokens: int,
+) -> SamplingMaskOutput:
+    """``spec_sampling_mask_output`` for the EAGLE v2 verify (the DFlash drafter, ARC_DFLASH_DRAFTER): committed token
+    j of request b is ``predict[accept_index[b, j]]``, drawn from target row ``accept_index[b, j]`` of the flattened
+    (bs * D, V) truncated ``target_probs``; -1 entries (not committed) pack whatever row 0 holds, never kept."""
+    if accept_index.dim() != 2 or target_probs.dim() != 3:
+        raise ValueError(f"accept_index {tuple(accept_index.shape)} / target_probs {tuple(target_probs.shape)}")
+    vocab = target_probs.shape[-1]
+    flat = target_probs.reshape(-1, vocab)
+    rows = accept_index.index_select(0, batch_rows).to(torch.int64).clamp(min=0)
+    sel, width = rows.shape
+    probs = flat.index_select(0, rows.reshape(-1)).view(sel, width, vocab)
+    tokens = predict.to(torch.int64).index_select(0, rows.reshape(-1)).view(sel, width)
+    return spec_sampling_mask_output(
+        probs, tokens, torch.arange(sel, device=rows.device), max_tokens
+    )
+
+
+def eagle_greedy_sampling_mask_output(
+    predict: torch.Tensor, accept_index: torch.Tensor, batch_rows: torch.Tensor
+) -> SamplingMaskOutput:
+    """A greedy batch's supports: each committed token alone, logprob 0 (the sampler's greedy rule)."""
+    rows = accept_index.index_select(0, batch_rows).to(torch.int64).clamp(min=0)
+    sel, width = rows.shape
+    tokens = predict.to(torch.int32).index_select(0, rows.reshape(-1))
+    n = tokens.numel()
+    return SamplingMaskOutput(
+        token_ids=tokens.view(-1, 1),
+        lengths=torch.ones(n, dtype=torch.int32, device=tokens.device),
+        selected_logprobs=torch.zeros(n, dtype=torch.float32, device=tokens.device),
+        statuses=torch.full((n,), SamplingMaskStatus.OK, dtype=torch.int32, device=tokens.device),
+        rows_per_request=width,
+    )
