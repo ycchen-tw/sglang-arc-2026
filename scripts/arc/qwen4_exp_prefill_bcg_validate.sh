@@ -20,7 +20,7 @@
 # (serve_arm.sh refuses a used one). It never signals a process. serve_qwen38fn_0520.sh itself refuses to start
 # on a GPU that has someone else's process.
 set -euo pipefail
-ARC=/data/home/ycc/work/arc-forge/.claude/worktrees/bridge-cse_015gLJpSy4kASpr5VtocQrnY
+ARC=${ARC_FORGE:?set ARC_FORGE to an arc-forge checkout}
 FORK=$HOME/work/sglang-arc-2-b200perf-ext
 R=$HOME/work/runs/qwen38fn_b200_perf
 PY=$HOME/work/dsv4/venv-0520/bin/python
