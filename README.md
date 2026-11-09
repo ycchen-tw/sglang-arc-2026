@@ -1,3 +1,31 @@
+# sglang-arc-2026
+
+The sglang fork that served Qwen3.8-Flash-Next in our ARC Prize 2026 final submissions (ARC-AGI-2
+on Kaggle 4×L4, ARC-AGI-3 on one RTX PRO 6000). The submissions, the agent harness, the Kaggle
+build scripts and the training code are in [ycchen-tw/arc-2026](https://github.com/ycchen-tw/arc-2026).
+
+- **Base:** upstream `sgl-project/sglang` release/v0.5.20 at `94602c9c` (tag `upstream-v0.5.20-base`).
+  Our changes are the 296 commits on top of it.
+- **What changed and how to turn it on:** [`ARC.md`](ARC.md) maps every ARC change, its
+  environment variables and server flags.
+
+| Ref | Commit | What it is |
+|---|---|---|
+| tag `kaggle-final` | `a5c67c41cd` | The exact tree deployed in all four final submissions (Kaggle dataset `sglang-arc-2-tree-allmerge-1020` and the ARC-AGI-2 L4 payload; 4,943 files under `python/sglang/`). |
+| branch `arc-prize-2026` (default) | `kaggle-final` + docs | `ARC.md` translated to English and this section; no code changes. |
+| tag `train-tito-collect` | `5c99db5c` | Calibration and trajectory collection (TITO session ledger). |
+| tag `train-gean-reap` | `4b57f3c45` | Expert-saliency capture for the 512 → 320 expert pruning. |
+| tag `train-int3-gptq` | `cd15559a` | INT3 GPTQ calibration replay. |
+| tag `train-rl-int3` | `4f040c4e3` | In-place weight updates used by the INT3 RL trainer. |
+| branch `rl-rollout`, tags `rl-rollout-b200b` / `rl-rollout-aimo2` | `bdf43e50` / `f9cf529b` | RL rollout servers: `kaggle-final` + Humming indexed-MoE alignment fixes + per-token sampling-support records for top-k/top-p replay; `f9cf529b` adds inline developer messages. |
+
+All `train-*` commits are ancestors of `kaggle-final`.
+
+**License.** Apache-2.0, as upstream (see `LICENSE`). Our modifications are additionally
+released under MIT-0.
+
+---
+
 <div align="center" id="sglangtop">
 <img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="logo" width="400" margin="10px"></img>
 
