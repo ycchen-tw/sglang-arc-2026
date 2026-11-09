@@ -17,7 +17,7 @@ build scripts and the training code are in [ycchen-tw/arc-2026](https://github.c
 | tag `train-gean-reap` | `4b57f3c45` | Expert-saliency capture for the 512 → 320 expert pruning. |
 | tag `train-int3-gptq` | `cd15559a` | INT3 GPTQ calibration replay. |
 | tag `train-rl-int3` | `4f040c4e3` | In-place weight updates used by the INT3 RL trainer. |
-| branch `rl-rollout`, tags `rl-rollout-b200b` / `rl-rollout-aimo2` | `bdf43e50` / `f9cf529b` | RL rollout servers: `kaggle-final` + Humming indexed-MoE alignment fixes + per-token sampling-support records for top-k/top-p replay; `f9cf529b` adds inline developer messages. |
+| branch `rl-rollout`, tags `rl-rollout-node1` / `rl-rollout-node2` | `bdf43e50` / `f9cf529b` | RL rollout servers: `kaggle-final` + Humming indexed-MoE alignment fixes + per-token sampling-support records for top-k/top-p replay; `f9cf529b` adds inline developer messages. |
 
 All `train-*` commits are ancestors of `kaggle-final`.
 
